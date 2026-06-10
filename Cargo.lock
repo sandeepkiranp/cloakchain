@@ -547,7 +547,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "cloakkchain-program"
+name = "cloakkchain-program-coinproof"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "cloakkchain-lib",
+ "sha2",
+ "sp1-zkvm",
+]
+
+[[package]]
+name = "cloakkchain-program-spend"
 version = "0.1.0"
 dependencies = [
  "bincode",
