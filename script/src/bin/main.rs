@@ -57,27 +57,64 @@ impl Party {
     }
 }
 
-fn coin(seed: u8) -> Coin {
+fn coin(seed: u8, value: u64) -> Coin {
     let mut tag = [0u8; 32];
     tag[0] = seed;
     let mut rand = [0u8; 32];
     rand[1] = seed;
-    Coin { tag, rand }
+    Coin { tag, value, rand }
 }
 
-/// The 3-tx demo chain: genesis mints `coin_a` to Alice, Alice sends it to Bob,
-/// Bob sends it to Carol. Each entry is `(sender, transaction)`.
+/// The 3-tx demo chain: genesis mints a 100-unit coin to Alice. Alice sends 40
+/// units to Bob (keeping 60 as change). Bob sends his 40 units to Carol (keeping
+/// no change). Each entry is `(sender, transaction)`.
 fn demo_chain<'a>(
     alice: &'a Party,
     bob: &'a Party,
     carol: &'a Party,
     genesis: &'a Party,
 ) -> Vec<(&'a Party, Transaction)> {
-    let coin_a = coin(0xA1);
+    let genesis_coin = coin(0xA1, 100);
+    let alice_coin = coin(0xA2, 100);
+    let genesis_change = coin(0xA3, 0);
+    let bob_coin = coin(0xB1, 40);
+    let alice_change = coin(0xB2, 60);
+    let carol_coin = coin(0xC1, 40);
+    let bob_change = coin(0xC2, 0);
     vec![
-        (genesis, Transaction { id: 0, sender_pk: genesis.pk, recipient_pk: alice.pk, coin: coin_a.clone() }),
-        (alice, Transaction { id: 1, sender_pk: alice.pk, recipient_pk: bob.pk, coin: coin_a.clone() }),
-        (bob, Transaction { id: 2, sender_pk: bob.pk, recipient_pk: carol.pk, coin: coin_a.clone() }),
+        (
+            genesis,
+            Transaction {
+                id: 0,
+                sender_pk: genesis.pk,
+                recipient_pk: alice.pk,
+                input_coin: genesis_coin,
+                output_coin: alice_coin.clone(),
+                change_coin: genesis_change,
+            },
+        ),
+        (
+            alice,
+            Transaction {
+                id: 1,
+                sender_pk: alice.pk,
+                recipient_pk: bob.pk,
+                input_coin: alice_coin,
+                output_coin: bob_coin.clone(),
+                change_coin: alice_change,
+            },
+        ),
+        (
+            bob,
+            Transaction {
+                id: 2,
+                sender_pk: bob.pk,
+                recipient_pk: carol.pk,
+                input_coin: bob_coin,
+                output_coin: carol_coin,
+                change_coin: bob_change,
+            },
+        ),
     ]
 }
 
@@ -158,7 +195,9 @@ fn main() {
 
     let chain = demo_chain(&alice, &bob, &carol, &genesis);
     let entries: Vec<BoardEntry> = chain.iter().map(|(_, tx)| encrypt_tx(tx)).collect();
-    let cn = chain[0].1.coin.commitment();
+    let cn_genesis = chain[0].1.input_coin.commitment();
+    let cn_alice = chain[0].1.output_coin.commitment();
+    let cn_bob = chain[1].1.output_coin.commitment();
 
     if args.execute {
         let client = MockProver::new();
@@ -170,8 +209,8 @@ fn main() {
         println!("spend vkey:     {}", spend_pk.verifying_key().bytes32());
         println!("coinproof vkey: {}", coinproof_pk.verifying_key().bytes32());
 
-        // Genesis mints coin_a to Alice (slot 0) — no coin-proof needed.
-        let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn, &entries[..1], alice.pk, true, None);
+        // Genesis mints a 100-unit coin to Alice (slot 0) — no coin-proof needed.
+        let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn_genesis, &entries[..1], alice.pk, true, None);
         let (output, report) = client.execute(CLOAKKCHAIN_SPEND_ELF, stdin).run().unwrap();
         let pv: ValidPublicValues = bincode::deserialize(output.as_slice()).expect("decode");
         assert_eq!(pv.board_root, merkle_root_of(&entries[..1]), "genesis: board root mismatch");
@@ -183,8 +222,8 @@ fn main() {
             report.total_instruction_count()
         );
 
-        // Alice's coin-proof step 0 (base case, k == 0): she received coin_a here.
-        let stdin = build_coinproof_stdin(&coinproof_vkey, alice.pk, cn, &entries[..1], &registry, None);
+        // Alice's coin-proof step 0 (base case, k == 0): she received her 100-unit coin here.
+        let stdin = build_coinproof_stdin(&coinproof_vkey, alice.pk, cn_alice, &entries[..1], &registry, None);
         let (output, report) = client.execute(CLOAKKCHAIN_COINPROOF_ELF, stdin).run().unwrap();
         let alice_cp0: CoinProofPublicValues = bincode::deserialize(output.as_slice()).expect("decode");
         assert_eq!(alice_cp0.board_root, merkle_root_of(&entries[..1]), "alice cp0: board root mismatch");
@@ -198,7 +237,7 @@ fn main() {
         );
 
         // Bob's coin-proof step 0 (base case, k == 0): slot 0 isn't his.
-        let stdin = build_coinproof_stdin(&coinproof_vkey, bob.pk, cn, &entries[..1], &registry, None);
+        let stdin = build_coinproof_stdin(&coinproof_vkey, bob.pk, cn_bob, &entries[..1], &registry, None);
         let (output, report) = client.execute(CLOAKKCHAIN_COINPROOF_ELF, stdin).run().unwrap();
         let bob_cp0: CoinProofPublicValues = bincode::deserialize(output.as_slice()).expect("decode");
         assert_eq!(bob_cp0.board_root, merkle_root_of(&entries[..1]), "bob cp0: board root mismatch");
@@ -226,8 +265,8 @@ fn main() {
     println!("spend vkey:     {}", spend_pk.verifying_key().bytes32());
     println!("coinproof vkey: {}", coinproof_pk.verifying_key().bytes32());
 
-    // Genesis mints coin_a to Alice (slot 0).
-    let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn, &entries[..1], alice.pk, true, None);
+    // Genesis mints a 100-unit coin to Alice (slot 0).
+    let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn_genesis, &entries[..1], alice.pk, true, None);
     println!("Proving genesis mint...");
     let genesis_proof = client.prove(&spend_pk, stdin).compressed().run().expect("failed to prove genesis mint");
     client.verify(&genesis_proof, spend_pk.verifying_key(), None).expect("failed to verify genesis mint");
@@ -237,7 +276,7 @@ fn main() {
     println!("  -> {} mint proved & verified", genesis.name);
 
     // Alice's coin-proof step 0 (base case).
-    let stdin = build_coinproof_stdin(&coinproof_vkey, alice.pk, cn, &entries[..1], &registry, None);
+    let stdin = build_coinproof_stdin(&coinproof_vkey, alice.pk, cn_alice, &entries[..1], &registry, None);
     println!("Proving Alice's coin-proof step 0...");
     let alice_cp0_proof = client.prove(&coinproof_pk, stdin).compressed().run().expect("failed to prove alice cp0");
     client.verify(&alice_cp0_proof, coinproof_pk.verifying_key(), None).expect("failed to verify alice cp0");
@@ -247,8 +286,9 @@ fn main() {
     assert_eq!(alice_cp0.spent, false);
     println!("  -> Alice's coin-proof step 0 proved & verified (received_at={:?})", alice_cp0.received_at);
 
-    // Alice spends coin_a to Bob (slot 1), recursively verifying her coin-proof.
-    let mut stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &alice, cn, &entries[..2], bob.pk, false, Some(&alice_cp0));
+    // Alice spends her 100-unit coin to Bob (slot 1), recursively verifying her
+    // coin-proof. Bob receives 40 units; Alice keeps 60 as change.
+    let mut stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &alice, cn_alice, &entries[..2], bob.pk, false, Some(&alice_cp0));
     {
         let SP1Proof::Compressed(inner) = alice_cp0_proof.proof.clone() else {
             panic!("recursive proofs must be in compressed mode");
@@ -264,7 +304,7 @@ fn main() {
     println!("  -> Alice's spend proved & verified");
 
     // Bob's coin-proof step 0 (base case): slot 0 isn't his.
-    let stdin = build_coinproof_stdin(&coinproof_vkey, bob.pk, cn, &entries[..1], &registry, None);
+    let stdin = build_coinproof_stdin(&coinproof_vkey, bob.pk, cn_bob, &entries[..1], &registry, None);
     println!("Proving Bob's coin-proof step 0...");
     let bob_cp0_proof = client.prove(&coinproof_pk, stdin).compressed().run().expect("failed to prove bob cp0");
     client.verify(&bob_cp0_proof, coinproof_pk.verifying_key(), None).expect("failed to verify bob cp0");
@@ -273,8 +313,9 @@ fn main() {
     assert_eq!(bob_cp0.received_at, None);
     println!("  -> Bob's coin-proof step 0 proved & verified");
 
-    // Bob's coin-proof step 1, recursively verifying step 0: he received coin_a here.
-    let mut stdin = build_coinproof_stdin(&coinproof_vkey, bob.pk, cn, &entries[..2], &registry, Some(&bob_cp0));
+    // Bob's coin-proof step 1, recursively verifying step 0: he received his
+    // 40-unit coin here.
+    let mut stdin = build_coinproof_stdin(&coinproof_vkey, bob.pk, cn_bob, &entries[..2], &registry, Some(&bob_cp0));
     {
         let SP1Proof::Compressed(inner) = bob_cp0_proof.proof.clone() else {
             panic!("recursive proofs must be in compressed mode");
@@ -290,8 +331,9 @@ fn main() {
     assert_eq!(bob_cp1.spent, false);
     println!("  -> Bob's coin-proof step 1 proved & verified (received_at={:?})", bob_cp1.received_at);
 
-    // Bob spends coin_a to Carol (slot 2), recursively verifying his coin-proof.
-    let mut stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &bob, cn, &entries[..3], carol.pk, false, Some(&bob_cp1));
+    // Bob spends his 40-unit coin to Carol (slot 2), recursively verifying his
+    // coin-proof. Carol receives all 40 units; Bob keeps no change.
+    let mut stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &bob, cn_bob, &entries[..3], carol.pk, false, Some(&bob_cp1));
     {
         let SP1Proof::Compressed(inner) = bob_cp1_proof.proof.clone() else {
             panic!("recursive proofs must be in compressed mode");
