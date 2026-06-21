@@ -15,14 +15,16 @@ pub fn derive_pk(sk: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-/// A coin: tag `t`, value `v`, plus masking randomness `r`.
-/// Commitment cn = H(t || v || r) — same semantics as the paper's Pedersen
-/// commitment, without elliptic-curve arithmetic in the zkVM.
+/// A coin: tag `t`, value `v`, owner public key `pk`, plus masking randomness `r`.
+/// Commitment cn = H(t || v || r || pk) — binds the coin to its intended owner,
+/// so a coin created for Alice cannot be claimed by Bob even if he knows the
+/// tag/value/rand (analogous to how Zcash embeds the recipient address in cm).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Coin {
     pub tag: [u8; 32],
     pub value: u64,
     pub rand: [u8; 32],
+    pub owner_pk: [u8; 32],
 }
 
 impl Coin {
@@ -31,6 +33,7 @@ impl Coin {
         h.update(self.tag);
         h.update(self.value.to_le_bytes());
         h.update(self.rand);
+        h.update(self.owner_pk);
         let mut out = [0u8; 32];
         out.copy_from_slice(&h.finalize());
         out
@@ -60,15 +63,17 @@ impl Transaction {
     }
 
     /// `pk` receives the coin with commitment `cn` in this tx — either as the
-    /// payment (`pk == recipient_pk`) or as change (`pk == sender_pk`).
+    /// payment (output_coin.owner_pk == pk) or as change (change_coin.owner_pk == pk).
+    /// The commitment already encodes the owner, so this is a direct check against
+    /// the coin's embedded owner_pk rather than the tx-level sender/recipient fields.
     pub fn receives_coin(&self, pk: &[u8; 32], cn: &[u8; 32]) -> bool {
-        (self.recipient_pk == *pk && self.output_coin.commitment() == *cn)
-            || (self.sender_pk == *pk && self.change_coin.commitment() == *cn)
+        (self.output_coin.owner_pk == *pk && self.output_coin.commitment() == *cn)
+            || (self.change_coin.owner_pk == *pk && self.change_coin.commitment() == *cn)
     }
 
     /// `pk` spends the coin with commitment `cn` as the input of this tx.
     pub fn spends_coin(&self, pk: &[u8; 32], cn: &[u8; 32]) -> bool {
-        self.sender_pk == *pk && self.input_coin.commitment() == *cn
+        self.input_coin.owner_pk == *pk && self.input_coin.commitment() == *cn
     }
 }
 
@@ -117,8 +122,8 @@ struct Plaintext {
 /// `bincode` encoding of [`Plaintext`] is fixed-length (no `Vec`s or `Option`s
 /// inside `Transaction`/`Coin`), so every ciphertext on the board has this
 /// length: 8 (tag) + [8 (id) + 32*2 (sender_pk, recipient_pk) + 3 * (32 (tag) +
-/// 8 (value) + 32 (rand))] = 8 + [8 + 64 + 3*72] = 8 + 288 = 296 bytes.
-pub const CIPHERTEXT_LEN: usize = 296;
+/// 8 (value) + 32 (rand) + 32 (owner_pk))] = 8 + [8 + 64 + 3*104] = 8 + 384 = 392 bytes.
+pub const CIPHERTEXT_LEN: usize = 392;
 
 /// XOR-with-hash-keystream: `keystream = H(key||0) || H(key||1) || ...`,
 /// truncated to `len` bytes. Encryption and decryption are the same operation.
@@ -468,6 +473,9 @@ pub fn check_spend(
     if !tx_star.sent_by(&pk_p) {
         return Err("tx* must be sent by P");
     }
+    if tx_star.input_coin.owner_pk != pk_p {
+        return Err("input coin's owner does not match the spender");
+    }
     if tx_star.input_coin.commitment() != coin_commitment {
         return Err("tx* must spend the claimed coin");
     }
@@ -523,12 +531,12 @@ mod tests {
         (sk, derive_pk(&sk))
     }
 
-    fn coin(seed: u8, value: u64) -> Coin {
+    fn coin(seed: u8, value: u64, owner_pk: [u8; 32]) -> Coin {
         let mut tag = [0u8; 32];
         tag[0] = seed;
         let mut rand = [0u8; 32];
         rand[1] = seed;
-        Coin { tag, value, rand }
+        Coin { tag, value, rand, owner_pk }
     }
 
     fn tx(
@@ -578,9 +586,14 @@ mod tests {
 
     #[test]
     fn ciphertext_has_constant_length() {
-        let (_, alice_pk) = party(1);
         let (_, genesis_pk) = (GENESIS_SK, genesis_pk());
-        let tx0 = tx(0, genesis_pk, alice_pk, coin(0xA1, 100), coin(0xA2, 100), coin(0xA3, 0));
+        let (_, alice_pk) = party(1);
+        let tx0 = tx(
+            0, genesis_pk, alice_pk,
+            coin(0xA1, 100, genesis_pk),
+            coin(0xA2, 100, alice_pk),
+            coin(0xA3, 0, genesis_pk),
+        );
         let entry = encrypt_tx(&tx0);
         assert_eq!(entry.ciphertext.len(), CIPHERTEXT_LEN);
     }
@@ -590,7 +603,12 @@ mod tests {
         let (_, genesis_pk) = (GENESIS_SK, genesis_pk());
         let (_, alice_pk) = party(1);
         let (_, bob_pk) = party(2);
-        let tx0 = tx(0, genesis_pk, alice_pk, coin(0xA1, 100), coin(0xA2, 100), coin(0xA3, 0));
+        let tx0 = tx(
+            0, genesis_pk, alice_pk,
+            coin(0xA1, 100, genesis_pk),
+            coin(0xA2, 100, alice_pk),
+            coin(0xA3, 0, genesis_pk),
+        );
         let entry = encrypt_tx(&tx0);
 
         // Both genuine parties can decrypt it (pair_key is symmetric).
@@ -612,7 +630,12 @@ mod tests {
         let (_, carol_pk) = party(3);
         let registry = vec![genesis_pk, alice_pk, bob_pk, carol_pk];
 
-        let tx0 = tx(0, genesis_pk, alice_pk, coin(0xA1, 100), coin(0xA2, 100), coin(0xA3, 0));
+        let tx0 = tx(
+            0, genesis_pk, alice_pk,
+            coin(0xA1, 100, genesis_pk),
+            coin(0xA2, 100, alice_pk),
+            coin(0xA3, 0, genesis_pk),
+        );
         let entry = encrypt_tx(&tx0);
 
         assert_eq!(scan_entry(&alice_pk, &registry, &entry), Some(tx0.clone()));
@@ -629,12 +652,15 @@ mod tests {
         let (_carol_sk, carol_pk) = party(3);
         let registry = vec![genesis_pk, alice_pk, bob_pk, carol_pk];
 
-        let alice_coin = coin(0xA2, 100);
-        let bob_coin = coin(0xB1, 40);
+        let alice_coin = coin(0xA2, 100, alice_pk);
+        let bob_coin = coin(0xB1, 40, bob_pk);
 
-        let tx0 = tx(0, genesis_pk, alice_pk, coin(0xA1, 100), alice_coin.clone(), coin(0xA3, 0));
-        let tx1 = tx(1, alice_pk, bob_pk, alice_coin.clone(), bob_coin.clone(), coin(0xB2, 60));
-        let tx2 = tx(2, bob_pk, carol_pk, bob_coin.clone(), coin(0xC1, 40), coin(0xC2, 0));
+        let tx0 = tx(0, genesis_pk, alice_pk,
+            coin(0xA1, 100, genesis_pk), alice_coin.clone(), coin(0xA3, 0, genesis_pk));
+        let tx1 = tx(1, alice_pk, bob_pk,
+            alice_coin.clone(), bob_coin.clone(), coin(0xB2, 60, alice_pk));
+        let tx2 = tx(2, bob_pk, carol_pk,
+            bob_coin.clone(), coin(0xC1, 40, carol_pk), coin(0xC2, 0, bob_pk));
         let entries = vec![encrypt_tx(&tx0), encrypt_tx(&tx1), encrypt_tx(&tx2)];
 
         let cn_alice = alice_coin.commitment();
@@ -652,7 +678,6 @@ mod tests {
         assert_eq!(bob_cp[1].received_at, Some(1));
         assert_eq!(bob_cp[1].spent, false);
 
-        // Sanity: spends below also succeed using these coin-proofs.
         let _ = (genesis_sk, alice_sk, bob_sk);
     }
 
@@ -667,11 +692,12 @@ mod tests {
         let (_, carol_pk) = party(3);
         let registry = vec![genesis_pk, alice_pk, bob_pk, carol_pk];
 
-        let alice_coin = coin(0xA2, 100);
-        let bob_coin = coin(0xB1, 40);
-        let alice_change = coin(0xB2, 60);
+        let alice_coin = coin(0xA2, 100, alice_pk);
+        let bob_coin = coin(0xB1, 40, bob_pk);
+        let alice_change = coin(0xB2, 60, alice_pk);
 
-        let tx0 = tx(0, genesis_pk, alice_pk, coin(0xA1, 100), alice_coin.clone(), coin(0xA3, 0));
+        let tx0 = tx(0, genesis_pk, alice_pk,
+            coin(0xA1, 100, genesis_pk), alice_coin.clone(), coin(0xA3, 0, genesis_pk));
         let tx1 = tx(1, alice_pk, bob_pk, alice_coin.clone(), bob_coin, alice_change.clone());
         let entries = vec![encrypt_tx(&tx0), encrypt_tx(&tx1)];
 
@@ -724,15 +750,16 @@ mod tests {
         let (_, carol_pk) = party(3);
         let registry = vec![genesis_pk, alice_pk, bob_pk, carol_pk];
 
-        let genesis_coin = coin(0xA1, 100);
-        let alice_coin = coin(0xA2, 100);
-        let bob_coin = coin(0xB1, 40);
-        let alice_change = coin(0xB2, 60);
-        let carol_coin = coin(0xC1, 40);
-        let bob_change = coin(0xC2, 0);
+        let genesis_coin = coin(0xA1, 100, genesis_pk);
+        let alice_coin = coin(0xA2, 100, alice_pk);
+        let bob_coin = coin(0xB1, 40, bob_pk);
+        let alice_change = coin(0xB2, 60, alice_pk);
+        let carol_coin = coin(0xC1, 40, carol_pk);
+        let bob_change = coin(0xC2, 0, bob_pk);
 
         // Genesis mints 100 units to Alice (no change kept).
-        let tx0 = tx(0, genesis_pk, alice_pk, genesis_coin.clone(), alice_coin.clone(), coin(0xA3, 0));
+        let tx0 = tx(0, genesis_pk, alice_pk,
+            genesis_coin.clone(), alice_coin.clone(), coin(0xA3, 0, genesis_pk));
         // Alice sends 40 to Bob, keeping 60 as change.
         let tx1 = tx(1, alice_pk, bob_pk, alice_coin.clone(), bob_coin.clone(), alice_change);
         // Bob sends all 40 to Carol (no change kept).
@@ -761,8 +788,9 @@ mod tests {
     fn rejects_wrong_secret_key() {
         let (_, genesis_pk) = (GENESIS_SK, genesis_pk());
         let (alice_sk, alice_pk) = party(1);
-        let genesis_coin = coin(0xA1, 100);
-        let tx0 = tx(0, genesis_pk, alice_pk, genesis_coin.clone(), coin(0xA2, 100), coin(0xA3, 0));
+        let genesis_coin = coin(0xA1, 100, genesis_pk);
+        let tx0 = tx(0, genesis_pk, alice_pk,
+            genesis_coin.clone(), coin(0xA2, 100, alice_pk), coin(0xA3, 0, genesis_pk));
         let entries = vec![encrypt_tx(&tx0)];
 
         let err = spend(alice_sk, genesis_pk, genesis_coin.commitment(), &entries, alice_pk, true, None)
@@ -774,8 +802,9 @@ mod tests {
     fn rejects_minting_without_the_genesis_key() {
         let (alice_sk, alice_pk) = party(1);
         let (_, bob_pk) = party(2);
-        let alice_coin = coin(0xA1, 100);
-        let tx0 = tx(0, alice_pk, bob_pk, alice_coin.clone(), coin(0xB1, 100), coin(0xA3, 0));
+        let alice_coin = coin(0xA1, 100, alice_pk);
+        let tx0 = tx(0, alice_pk, bob_pk,
+            alice_coin.clone(), coin(0xB1, 100, bob_pk), coin(0xA3, 0, alice_pk));
         let entries = vec![encrypt_tx(&tx0)];
 
         let err = spend(alice_sk, alice_pk, alice_coin.commitment(), &entries, bob_pk, true, None)
@@ -790,15 +819,16 @@ mod tests {
         let (carol_sk, carol_pk) = party(3);
         let registry = vec![genesis_pk, alice_pk, carol_pk];
 
-        let genesis_coin = coin(0xA1, 100);
-        let alice_coin = coin(0xA2, 100);
-        // A coin Carol never received.
-        let carol_fake_input = coin(0xC1, 100);
+        let genesis_coin = coin(0xA1, 100, genesis_pk);
+        let alice_coin = coin(0xA2, 100, alice_pk);
+        // A coin Carol never received but claims to own.
+        let carol_fake_input = coin(0xC1, 100, carol_pk);
 
-        let tx0 = tx(0, genesis_pk, alice_pk, genesis_coin, alice_coin, coin(0xA3, 0));
+        let tx0 = tx(0, genesis_pk, alice_pk,
+            genesis_coin, alice_coin, coin(0xA3, 0, genesis_pk));
         // Carol fabricates a "spend" of a coin she never received.
-        let tx_fake =
-            tx(1, carol_pk, alice_pk, carol_fake_input.clone(), coin(0xC2, 100), coin(0xC3, 0));
+        let tx_fake = tx(1, carol_pk, alice_pk,
+            carol_fake_input.clone(), coin(0xC2, 100, alice_pk), coin(0xC3, 0, carol_pk));
         let entries = vec![encrypt_tx(&tx0), encrypt_tx(&tx_fake)];
         let cn_carol = carol_fake_input.commitment();
 
@@ -822,15 +852,18 @@ mod tests {
         let (_, carol_pk) = party(3);
         let registry = vec![genesis_pk, alice_pk, bob_pk, carol_pk];
 
-        let genesis_coin = coin(0xA1, 100);
-        let alice_coin = coin(0xA2, 100);
+        let genesis_coin = coin(0xA1, 100, genesis_pk);
+        let alice_coin = coin(0xA2, 100, alice_pk);
         let cn_genesis = genesis_coin.commitment();
         let cn_alice = alice_coin.commitment();
 
-        let tx0 = tx(0, genesis_pk, alice_pk, genesis_coin, alice_coin.clone(), coin(0xA3, 0));
-        let tx1 = tx(1, alice_pk, bob_pk, alice_coin.clone(), coin(0xB1, 60), coin(0xB2, 40));
+        let tx0 = tx(0, genesis_pk, alice_pk,
+            genesis_coin, alice_coin.clone(), coin(0xA3, 0, genesis_pk));
+        let tx1 = tx(1, alice_pk, bob_pk,
+            alice_coin.clone(), coin(0xB1, 60, bob_pk), coin(0xB2, 40, alice_pk));
         // Alice tries to spend the same coin again, to Carol this time.
-        let tx1b = tx(2, alice_pk, carol_pk, alice_coin.clone(), coin(0xC1, 100), coin(0xC2, 0));
+        let tx1b = tx(2, alice_pk, carol_pk,
+            alice_coin.clone(), coin(0xC1, 100, carol_pk), coin(0xC2, 0, alice_pk));
         let entries = vec![encrypt_tx(&tx0), encrypt_tx(&tx1), encrypt_tx(&tx1b)];
 
         spend(genesis_sk, genesis_pk, cn_genesis, &entries[..1], alice_pk, true, None).unwrap();
@@ -845,12 +878,7 @@ mod tests {
 
         // The double-spend (to Carol) is rejected: alice_cp[1].spent == true.
         let err = spend(
-            alice_sk,
-            alice_pk,
-            cn_alice,
-            &entries[..3],
-            carol_pk,
-            false,
+            alice_sk, alice_pk, cn_alice, &entries[..3], carol_pk, false,
             Some(alice_cp[1].clone()),
         )
         .unwrap_err();
@@ -864,15 +892,15 @@ mod tests {
     fn rejects_tampered_board_entry() {
         let (genesis_sk, genesis_pk) = (GENESIS_SK, genesis_pk());
         let (_, alice_pk) = party(1);
-        let genesis_coin = coin(0xA1, 100);
+        let genesis_coin = coin(0xA1, 100, genesis_pk);
 
-        let tx0_real =
-            tx(0, genesis_pk, alice_pk, genesis_coin.clone(), coin(0xA2, 100), coin(0xA3, 0));
+        let tx0_real = tx(0, genesis_pk, alice_pk,
+            genesis_coin.clone(), coin(0xA2, 100, alice_pk), coin(0xA3, 0, genesis_pk));
         let entry_real = encrypt_tx(&tx0_real);
         let real_root = merkle_root_of(&[entry_real]);
 
-        let tx0_fake =
-            tx(0, genesis_pk, alice_pk, genesis_coin.clone(), coin(0xB2, 100), coin(0xB3, 0));
+        let tx0_fake = tx(0, genesis_pk, alice_pk,
+            genesis_coin.clone(), coin(0xB2, 100, alice_pk), coin(0xB3, 0, genesis_pk));
         let entry_fake = encrypt_tx(&tx0_fake);
         let fake_proof = merkle_proof_for(&[entry_fake.clone()], 0);
 
@@ -899,10 +927,11 @@ mod tests {
     fn rejects_value_conservation_violation() {
         let (genesis_sk, genesis_pk) = (GENESIS_SK, genesis_pk());
         let (_, alice_pk) = party(1);
-        let genesis_coin = coin(0xA1, 100);
+        let genesis_coin = coin(0xA1, 100, genesis_pk);
 
         // Overdraft: output (100) + change (1) > input (100).
-        let tx0 = tx(0, genesis_pk, alice_pk, genesis_coin.clone(), coin(0xA2, 100), coin(0xA3, 1));
+        let tx0 = tx(0, genesis_pk, alice_pk,
+            genesis_coin.clone(), coin(0xA2, 100, alice_pk), coin(0xA3, 1, genesis_pk));
         let entries = vec![encrypt_tx(&tx0)];
 
         let err =

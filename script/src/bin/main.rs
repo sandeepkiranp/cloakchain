@@ -57,12 +57,12 @@ impl Party {
     }
 }
 
-fn coin(seed: u8, value: u64) -> Coin {
+fn coin(seed: u8, value: u64, owner_pk: [u8; 32]) -> Coin {
     let mut tag = [0u8; 32];
     tag[0] = seed;
     let mut rand = [0u8; 32];
     rand[1] = seed;
-    Coin { tag, value, rand }
+    Coin { tag, value, rand, owner_pk }
 }
 
 /// The 3-tx demo chain: genesis mints a 100-unit coin to Alice. Alice sends 40
@@ -74,13 +74,13 @@ fn demo_chain<'a>(
     carol: &'a Party,
     genesis: &'a Party,
 ) -> Vec<(&'a Party, Transaction)> {
-    let genesis_coin = coin(0xA1, 100);
-    let alice_coin = coin(0xA2, 100);
-    let genesis_change = coin(0xA3, 0);
-    let bob_coin = coin(0xB1, 40);
-    let alice_change = coin(0xB2, 60);
-    let carol_coin = coin(0xC1, 40);
-    let bob_change = coin(0xC2, 0);
+    let genesis_coin = coin(0xA1, 100, genesis.pk);
+    let alice_coin = coin(0xA2, 100, alice.pk);
+    let genesis_change = coin(0xA3, 0, genesis.pk);
+    let bob_coin = coin(0xB1, 40, bob.pk);
+    let alice_change = coin(0xB2, 60, alice.pk);
+    let carol_coin = coin(0xC1, 40, carol.pk);
+    let bob_change = coin(0xC2, 0, bob.pk);
     vec![
         (
             genesis,
