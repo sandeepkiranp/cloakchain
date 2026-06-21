@@ -24,9 +24,7 @@ pub fn main() {
     let sk_p: [u8; 32] = sp1_zkvm::io::read();
     let pk_p: [u8; 32] = sp1_zkvm::io::read();
     let coin_commitment: [u8; 32] = sp1_zkvm::io::read();
-    let board_root: [u8; 32] = sp1_zkvm::io::read();
     let entries: Vec<BoardEntry> = sp1_zkvm::io::read();
-    let merkle_proof: Vec<[u8; 32]> = sp1_zkvm::io::read();
     let recipient_pk: [u8; 32] = sp1_zkvm::io::read();
     let is_genesis: bool = sp1_zkvm::io::read();
     let coin_proof: Option<CoinProofPublicValues> =
@@ -38,9 +36,7 @@ pub fn main() {
         sk_p,
         pk_p,
         coin_commitment,
-        board_root,
         entries,
-        merkle_proof,
         recipient_pk,
         is_genesis,
         coin_proof.clone(),

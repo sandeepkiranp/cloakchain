@@ -42,8 +42,10 @@ impl Coin {
 
 /// A transaction: `S` spends `input_coin` and creates two new coins —
 /// `output_coin` (the payment to `R`) and `change_coin` (returned to `S`).
-/// Posted to the bulletin board only in encrypted form — see [`encrypt_tx`] /
-/// [`extract_msg`].
+/// `spend_proof` carries the serialised `ValidPublicValues` that prove this
+/// transaction is valid; it is empty until the sender attaches it after proving.
+/// The entire struct — proof included — is encrypted into a single ciphertext
+/// posted to the bulletin board. See [`encrypt_tx`] / [`extract_msg`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     pub id: u64,
@@ -52,6 +54,7 @@ pub struct Transaction {
     pub input_coin: Coin,
     pub output_coin: Coin,
     pub change_coin: Coin,
+    pub spend_proof: Vec<u8>,
 }
 
 impl Transaction {
@@ -119,11 +122,12 @@ struct Plaintext {
     tx: Transaction,
 }
 
-/// `bincode` encoding of [`Plaintext`] is fixed-length (no `Vec`s or `Option`s
-/// inside `Transaction`/`Coin`), so every ciphertext on the board has this
-/// length: 8 (tag) + [8 (id) + 32*2 (sender_pk, recipient_pk) + 3 * (32 (tag) +
-/// 8 (value) + 32 (rand) + 32 (owner_pk))] = 8 + [8 + 64 + 3*104] = 8 + 384 = 392 bytes.
-pub const CIPHERTEXT_LEN: usize = 392;
+/// `bincode` encoding of [`Plaintext`] when `spend_proof` is empty. Every
+/// freshly-encrypted entry has this length; entries grow once the sender
+/// attaches the proof. Arithmetic: 8 (magic tag) + [8 (id) + 32*2 (pks) +
+/// 3*(32+8+32+32) (coins) + 8 (spend_proof vec-length prefix)] =
+/// 8 + [8 + 64 + 312 + 8] = 8 + 392 = 400 bytes.
+pub const BASE_CIPHERTEXT_LEN: usize = 400;
 
 /// XOR-with-hash-keystream: `keystream = H(key||0) || H(key||1) || ...`,
 /// truncated to `len` bytes. Encryption and decryption are the same operation.
@@ -144,13 +148,17 @@ fn xor_with_keystream(key: &[u8; 32], data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// An opaque ciphertext posted to the bulletin board.
+/// An opaque ciphertext posted to the bulletin board. Decrypting it yields the
+/// full [`Transaction`], which includes the `spend_proof` field — so the proof
+/// travels inside the encryption and is invisible to non-participants.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardEntry {
     pub ciphertext: Vec<u8>,
 }
 
-/// Encrypt `tx` under the pairwise key shared by its sender and recipient.
+/// Encrypt `tx` (including its embedded `spend_proof`) under the pairwise key
+/// shared by sender and recipient. Call this once with an empty proof, then
+/// again after attaching the proof bytes to `tx.spend_proof`.
 pub fn encrypt_tx(tx: &Transaction) -> BoardEntry {
     let plaintext = Plaintext { tag: MAGIC_TAG, tx: tx.clone() };
     let bytes = bincode::serialize(&plaintext).expect("Plaintext is always serializable");
@@ -217,13 +225,15 @@ pub fn scan_entry(
 //      to the root), verified in-circuit, tying the witnessed ciphertext to
 //      the committed root.
 
-/// Leaf hash = SHA256(slot_as_u64_le || bincode(entry)).
-/// Including the slot index prevents permuting genuine entries across slots
-/// while keeping a valid root.
+/// Leaf hash = SHA256(slot_as_u64_le || ciphertext).
+/// The ciphertext already contains the proof (inside the encrypted
+/// `Transaction.spend_proof`), so this naturally covers everything once the
+/// proof is attached and the entry is re-encrypted. The slot index prevents
+/// permuting genuine entries across slots while keeping a valid root.
 pub fn merkle_leaf(slot: usize, entry: &BoardEntry) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update((slot as u64).to_le_bytes());
-    h.update(&bincode::serialize(entry).expect("BoardEntry is always serializable"));
+    h.update(&entry.ciphertext);
     let mut out = [0u8; 32];
     out.copy_from_slice(&h.finalize());
     out
@@ -310,6 +320,12 @@ pub fn merkle_verify(root: [u8; 32], slot: usize, entry: &BoardEntry, proof: &[[
 // ---- Public values -------------------------------------------------------
 
 /// The public values committed by the spend (`Valid`) relation.
+///
+/// `board_root` is the Merkle root of `entries[0..last]` — the board state
+/// *before* tx* was posted (the Zcash-style "anchor"). This breaks the
+/// circular dependency: the proof commits to a root that does not include itself,
+/// so the proof can be embedded inside tx* and re-encrypted without any
+/// self-reference.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidPublicValues {
     pub vkey: [u32; 8],
@@ -449,9 +465,7 @@ pub fn check_spend(
     sk_p: [u8; 32],
     pk_p: [u8; 32],
     coin_commitment: [u8; 32],
-    board_root: [u8; 32],
     entries: Vec<BoardEntry>,
-    merkle_proof: Vec<[u8; 32]>,
     recipient_pk: [u8; 32],
     is_genesis: bool,
     coin_proof: Option<CoinProofPublicValues>,
@@ -464,9 +478,10 @@ pub fn check_spend(
     }
     let last = entries.len() - 1;
 
-    if !merkle_verify(board_root, last, &entries[last], &merkle_proof) {
-        return Err("Merkle proof failed: tx* does not match committed board root");
-    }
+    // Zcash-style anchor: the board root covers entries[0..last] only — the
+    // history *before* tx*. This lets the proof be generated before tx* is
+    // re-encrypted with the proof embedded, so there is no circular dependency.
+    let anchor = merkle_root_of(&entries[..last]);
 
     let tx_star = extract_msg(&pk_p, &recipient_pk, &entries[last])
         .ok_or("tx* could not be decrypted as a transaction sent by P")?;
@@ -504,7 +519,7 @@ pub fn check_spend(
         if cp.board_size != last {
             return Err("coin-proof must cover exactly the board prefix before tx*");
         }
-        if cp.board_root != merkle_root_of(&entries[..last]) {
+        if cp.board_root != anchor {
             return Err("coin-proof's board root does not match the board prefix");
         }
         if cp.received_at.is_none() {
@@ -515,7 +530,7 @@ pub fn check_spend(
         }
     }
 
-    Ok(ValidPublicValues { vkey, pk_p, board_root, board_size: entries.len() })
+    Ok(ValidPublicValues { vkey, pk_p, board_root: anchor, board_size: entries.len() })
 }
 
 #[cfg(test)]
@@ -554,6 +569,7 @@ mod tests {
             input_coin: input,
             output_coin: output,
             change_coin: change,
+            spend_proof: vec![],
         }
     }
 
@@ -595,7 +611,9 @@ mod tests {
             coin(0xA3, 0, genesis_pk),
         );
         let entry = encrypt_tx(&tx0);
-        assert_eq!(entry.ciphertext.len(), CIPHERTEXT_LEN);
+        // With an empty spend_proof the ciphertext is exactly BASE_CIPHERTEXT_LEN.
+        // After a proof is attached and tx re-encrypted it grows by proof.len().
+        assert_eq!(entry.ciphertext.len(), BASE_CIPHERTEXT_LEN);
     }
 
     #[test]
@@ -724,18 +742,13 @@ mod tests {
         is_genesis: bool,
         coin_proof: Option<CoinProofPublicValues>,
     ) -> Result<ValidPublicValues, &'static str> {
-        let last = entries.len() - 1;
-        let board_root = merkle_root_of(entries);
-        let proof = merkle_proof_for(entries, last);
         check_spend(
             TEST_VKEY,
             TEST_COIN_PROOF_VKEY,
             sk,
             pk,
             coin_commitment,
-            board_root,
             entries.to_vec(),
-            proof,
             recipient_pk,
             is_genesis,
             coin_proof,
@@ -885,40 +898,49 @@ mod tests {
         assert_eq!(err, "P must not have spent this coin before (double spend)");
     }
 
-    /// An attacker swaps the ciphertext at slot 0 but keeps the genuine root.
-    /// The inclusion proof computed from the fake entry won't reconstruct the
-    /// genuine root, so `check_spend` rejects it.
+    /// An attacker tampers with a *prior* board entry (slot 0) while Alice is
+    /// spending at slot 1. Alice's coin-proof was computed over the real slot-0
+    /// entry, so its `board_root` matches the real anchor. But check_spend
+    /// recomputes the anchor from the tampered entries and finds a mismatch.
     #[test]
     fn rejects_tampered_board_entry() {
         let (genesis_sk, genesis_pk) = (GENESIS_SK, genesis_pk());
-        let (_, alice_pk) = party(1);
+        let (alice_sk, alice_pk) = party(1);
+        let (_, bob_pk) = party(2);
+        let registry = vec![genesis_pk, alice_pk, bob_pk];
+
         let genesis_coin = coin(0xA1, 100, genesis_pk);
+        let alice_coin = coin(0xA2, 100, alice_pk);
 
+        // Real board: tx0 = genesis mint, tx1 = Alice→Bob spend.
         let tx0_real = tx(0, genesis_pk, alice_pk,
-            genesis_coin.clone(), coin(0xA2, 100, alice_pk), coin(0xA3, 0, genesis_pk));
-        let entry_real = encrypt_tx(&tx0_real);
-        let real_root = merkle_root_of(&[entry_real]);
+            genesis_coin.clone(), alice_coin.clone(), coin(0xA3, 0, genesis_pk));
+        let tx1 = tx(1, alice_pk, bob_pk,
+            alice_coin.clone(), coin(0xB1, 100, bob_pk), coin(0xB2, 0, alice_pk));
+        let entry0_real = encrypt_tx(&tx0_real);
+        let entry1 = encrypt_tx(&tx1);
+        let entries_real = vec![entry0_real, entry1.clone()];
 
+        // Alice builds her coin-proof over the REAL board.
+        let cn_alice = alice_coin.commitment();
+        let alice_cp = coin_proof_chain(alice_pk, cn_alice, &entries_real[..1], &registry);
+
+        // Attacker swaps slot 0 with a fake entry.
         let tx0_fake = tx(0, genesis_pk, alice_pk,
-            genesis_coin.clone(), coin(0xB2, 100, alice_pk), coin(0xB3, 0, genesis_pk));
-        let entry_fake = encrypt_tx(&tx0_fake);
-        let fake_proof = merkle_proof_for(&[entry_fake.clone()], 0);
+            genesis_coin.clone(), coin(0xB3, 100, alice_pk), coin(0xB4, 0, genesis_pk));
+        let entry0_fake = encrypt_tx(&tx0_fake);
+        let entries_tampered = vec![entry0_fake, entry1];
 
-        let err = check_spend(
-            TEST_VKEY,
-            TEST_COIN_PROOF_VKEY,
-            genesis_sk,
-            genesis_pk,
-            genesis_coin.commitment(),
-            real_root,
-            vec![entry_fake],
-            fake_proof,
-            alice_pk,
-            true,
-            None,
+        // check_spend computes anchor = merkle_root_of(entries_tampered[..1])
+        // which differs from alice_cp[0].board_root (real anchor) → rejected.
+        let err = spend(
+            alice_sk, alice_pk, cn_alice, &entries_tampered, bob_pk, false,
+            Some(alice_cp[0].clone()),
         )
         .unwrap_err();
-        assert_eq!(err, "Merkle proof failed: tx* does not match committed board root");
+        assert_eq!(err, "coin-proof's board root does not match the board prefix");
+
+        let _ = genesis_sk;
     }
 
     /// `output.value + change.value` must equal `input.value` exactly — no
