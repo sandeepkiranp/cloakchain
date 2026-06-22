@@ -240,17 +240,17 @@ fn build_coinproof_stdin(
     stdin
 }
 
-/// Build the SP1Stdin for the spend relation, spending the coin at
-/// `entries.last()` (= `tx*`). The anchor is computed inside check_spend
-/// from `entries[..last]`. For non-genesis spends, `coin_proof` must cover
-/// `entries[..last]`.
+/// Build the SP1Stdin for the spend relation. `prior_entries` is the board
+/// before tx* (used for the anchor); `tx_star` is the spending transaction
+/// passed as plaintext — no encrypt/decrypt round-trip inside the zkVM.
+/// For non-genesis spends, `coin_proof` must cover `prior_entries`.
 fn build_spend_stdin(
     spend_vkey: &[u32; 8],
     coinproof_vkey: &[u32; 8],
     sender: &Party,
     coin_commitment: [u8; 32],
-    entries: &[BoardEntry],
-    recipient_pk: [u8; 32],
+    prior_entries: &[BoardEntry],
+    tx_star: &Transaction,
     is_genesis: bool,
     coin_proof: Option<&CoinProofPublicValues>,
 ) -> SP1Stdin {
@@ -260,8 +260,8 @@ fn build_spend_stdin(
     stdin.write(&sender.sk);
     stdin.write(&sender.pk);
     stdin.write(&coin_commitment);
-    stdin.write(&entries.to_vec());
-    stdin.write(&recipient_pk);
+    stdin.write(&prior_entries.to_vec());
+    stdin.write(tx_star);
     stdin.write(&is_genesis);
     if let Some(cp) = coin_proof {
         stdin.write(cp);
@@ -307,8 +307,8 @@ fn main() {
 
         let mut exec_stats: Vec<ExecStats> = Vec::new();
 
-        // Genesis mints a 100-unit coin to Alice (slot 0).
-        let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn_genesis, &entries[..1], alice.pk, true, None);
+        // Genesis mints a 100-unit coin to Alice (slot 0). Prior board is empty.
+        let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn_genesis, &entries[..0], &chain[0].1, true, None);
         let t = Instant::now();
         let (output, report) = client.execute(CLOAKKCHAIN_SPEND_ELF, stdin).run().unwrap();
         let exec_ms = t.elapsed().as_millis();
@@ -361,7 +361,7 @@ fn main() {
 
     // -- Genesis mint (slot 0, anchor = empty) --------------------------------
     println!("\nProving genesis mint...");
-    let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn_genesis, &entries[..1], alice.pk, true, None);
+    let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn_genesis, &entries[..0], &chain[0].1, true, None);
     let t = Instant::now();
     let genesis_proof = client.prove(&spend_pk, stdin).compressed().run().expect("failed to prove genesis mint");
     let prove_secs = t.elapsed().as_secs_f64();
@@ -393,7 +393,7 @@ fn main() {
 
     // -- Alice's spend (slot 1, recursive, anchor = entries[..1]) -------------
     println!("Proving Alice's spend...");
-    let mut stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &alice, cn_alice, &entries[..2], bob.pk, false, Some(&alice_cp0));
+    let mut stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &alice, cn_alice, &entries[..1], &chain[1].1, false, Some(&alice_cp0));
     {
         let SP1Proof::Compressed(inner) = alice_cp0_proof.proof.clone() else { panic!("compressed mode required") };
         stdin.write_proof(*inner, coinproof_pk.verifying_key().vk.clone());
@@ -447,7 +447,7 @@ fn main() {
 
     // -- Bob's spend (slot 2, recursive, anchor = entries[..2]) ---------------
     println!("Proving Bob's spend...");
-    let mut stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &bob, cn_bob, &entries[..3], carol.pk, false, Some(&bob_cp1));
+    let mut stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &bob, cn_bob, &entries[..2], &chain[2].1, false, Some(&bob_cp1));
     {
         let SP1Proof::Compressed(inner) = bob_cp1_proof.proof.clone() else { panic!("compressed mode required") };
         stdin.write_proof(*inner, coinproof_pk.verifying_key().vk.clone());

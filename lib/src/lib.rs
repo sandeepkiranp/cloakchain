@@ -454,38 +454,31 @@ pub fn check_coin_proof_step(
 /// Checks every condition of the `Valid` (spend) relation except actually
 /// verifying the recursive coin-proof's ZK proof.
 ///
-/// `entries` is the full board (`entries[0..=last]`); `merkle_proof` is the
-/// inclusion proof for `entries[last]` (the spend transaction `tx*`) against
-/// `board_root`. For non-genesis spends, `coin_proof` must be the latest
-/// coin-proof covering `entries[0..last]`, with `received_at = Some(_)` and
-/// `spent = false`.
+/// `prior_entries` is the board history *before* tx* (`entries[0..last]`);
+/// `tx_star` is the spending transaction passed directly as plaintext — no
+/// encrypt/decrypt round-trip needed since the sender already holds it.
+/// For non-genesis spends, `coin_proof` must be the latest coin-proof covering
+/// `prior_entries`, with `received_at = Some(_)` and `spent = false`.
 pub fn check_spend(
     vkey: [u32; 8],
     coin_proof_vkey: [u32; 8],
     sk_p: [u8; 32],
     pk_p: [u8; 32],
     coin_commitment: [u8; 32],
-    entries: Vec<BoardEntry>,
-    recipient_pk: [u8; 32],
+    prior_entries: Vec<BoardEntry>,
+    tx_star: Transaction,
     is_genesis: bool,
     coin_proof: Option<CoinProofPublicValues>,
 ) -> Result<ValidPublicValues, &'static str> {
     if derive_pk(&sk_p) != pk_p {
         return Err("pk_P must be the public key for sk_P");
     }
-    if entries.is_empty() {
-        return Err("board must contain at least one entry");
-    }
-    let last = entries.len() - 1;
 
-    // Zcash-style anchor: the board root covers entries[0..last] only — the
-    // history *before* tx*. This lets the proof be generated before tx* is
-    // re-encrypted with the proof embedded, so there is no circular dependency.
-    let anchor = merkle_root_of(&entries[..last]);
+    // Anchor = Merkle root of all entries before tx*. The proof commits to
+    // this past board state; tx* itself is not included (no circular dependency).
+    let anchor = merkle_root_of(&prior_entries);
 
-    let tx_star = extract_msg(&pk_p, &recipient_pk, &entries[last])
-        .ok_or("tx* could not be decrypted as a transaction sent by P")?;
-    if !tx_star.sent_by(&pk_p) {
+    if tx_star.sender_pk != pk_p {
         return Err("tx* must be sent by P");
     }
     if tx_star.input_coin.owner_pk != pk_p {
@@ -502,7 +495,7 @@ pub fn check_spend(
         if pk_p != genesis_pk() {
             return Err("only the genesis key may mint without provenance");
         }
-        if last != 0 {
+        if !prior_entries.is_empty() {
             return Err("a genesis mint has no prior history");
         }
     } else {
@@ -516,7 +509,7 @@ pub fn check_spend(
         if cp.coin_commitment != coin_commitment {
             return Err("coin-proof tracks a different coin");
         }
-        if cp.board_size != last {
+        if cp.board_size != prior_entries.len() {
             return Err("coin-proof must cover exactly the board prefix before tx*");
         }
         if cp.board_root != anchor {
@@ -530,7 +523,7 @@ pub fn check_spend(
         }
     }
 
-    Ok(ValidPublicValues { vkey, pk_p, board_root: anchor, board_size: entries.len() })
+    Ok(ValidPublicValues { vkey, pk_p, board_root: anchor, board_size: prior_entries.len() + 1 })
 }
 
 #[cfg(test)]
@@ -731,14 +724,14 @@ mod tests {
         let _ = (genesis_sk, bob_sk, carol_pk);
     }
 
-    /// Convenience: `check_spend` for the tx at `entries.len()-1`, given the
-    /// previous coin-proof (or `None` for genesis).
+    /// Convenience wrapper around `check_spend`. `prior_entries` is the board
+    /// before tx*; `tx_star` is the spending transaction as plaintext.
     fn spend(
         sk: [u8; 32],
         pk: [u8; 32],
         coin_commitment: [u8; 32],
-        entries: &[BoardEntry],
-        recipient_pk: [u8; 32],
+        prior_entries: &[BoardEntry],
+        tx_star: &Transaction,
         is_genesis: bool,
         coin_proof: Option<CoinProofPublicValues>,
     ) -> Result<ValidPublicValues, &'static str> {
@@ -748,8 +741,8 @@ mod tests {
             sk,
             pk,
             coin_commitment,
-            entries.to_vec(),
-            recipient_pk,
+            prior_entries.to_vec(),
+            tx_star.clone(),
             is_genesis,
             coin_proof,
         )
@@ -770,30 +763,25 @@ mod tests {
         let carol_coin = coin(0xC1, 40, carol_pk);
         let bob_change = coin(0xC2, 0, bob_pk);
 
-        // Genesis mints 100 units to Alice (no change kept).
         let tx0 = tx(0, genesis_pk, alice_pk,
             genesis_coin.clone(), alice_coin.clone(), coin(0xA3, 0, genesis_pk));
-        // Alice sends 40 to Bob, keeping 60 as change.
         let tx1 = tx(1, alice_pk, bob_pk, alice_coin.clone(), bob_coin.clone(), alice_change);
-        // Bob sends all 40 to Carol (no change kept).
         let tx2 = tx(2, bob_pk, carol_pk, bob_coin.clone(), carol_coin, bob_change);
+        // Encrypted entries are used only for coin-proof scanning.
         let entries = vec![encrypt_tx(&tx0), encrypt_tx(&tx1), encrypt_tx(&tx2)];
 
         let cn_genesis = genesis_coin.commitment();
         let cn_alice = alice_coin.commitment();
         let cn_bob = bob_coin.commitment();
 
-        // Genesis mints to Alice.
-        spend(genesis_sk, genesis_pk, cn_genesis, &entries[..1], alice_pk, true, None).unwrap();
+        spend(genesis_sk, genesis_pk, cn_genesis, &[], &tx0, true, None).unwrap();
 
-        // Alice's coin-proof over entries[0..1], then her spend to Bob.
         let alice_cp = coin_proof_chain(alice_pk, cn_alice, &entries[..1], &registry);
-        spend(alice_sk, alice_pk, cn_alice, &entries[..2], bob_pk, false, Some(alice_cp[0].clone()))
+        spend(alice_sk, alice_pk, cn_alice, &entries[..1], &tx1, false, Some(alice_cp[0].clone()))
             .unwrap();
 
-        // Bob's coin-proof over entries[0..2], then his spend to Carol.
         let bob_cp = coin_proof_chain(bob_pk, cn_bob, &entries[..2], &registry);
-        spend(bob_sk, bob_pk, cn_bob, &entries[..3], carol_pk, false, Some(bob_cp[1].clone()))
+        spend(bob_sk, bob_pk, cn_bob, &entries[..2], &tx2, false, Some(bob_cp[1].clone()))
             .unwrap();
     }
 
@@ -804,9 +792,8 @@ mod tests {
         let genesis_coin = coin(0xA1, 100, genesis_pk);
         let tx0 = tx(0, genesis_pk, alice_pk,
             genesis_coin.clone(), coin(0xA2, 100, alice_pk), coin(0xA3, 0, genesis_pk));
-        let entries = vec![encrypt_tx(&tx0)];
 
-        let err = spend(alice_sk, genesis_pk, genesis_coin.commitment(), &entries, alice_pk, true, None)
+        let err = spend(alice_sk, genesis_pk, genesis_coin.commitment(), &[], &tx0, true, None)
             .unwrap_err();
         assert_eq!(err, "pk_P must be the public key for sk_P");
     }
@@ -818,9 +805,8 @@ mod tests {
         let alice_coin = coin(0xA1, 100, alice_pk);
         let tx0 = tx(0, alice_pk, bob_pk,
             alice_coin.clone(), coin(0xB1, 100, bob_pk), coin(0xA3, 0, alice_pk));
-        let entries = vec![encrypt_tx(&tx0)];
 
-        let err = spend(alice_sk, alice_pk, alice_coin.commitment(), &entries, bob_pk, true, None)
+        let err = spend(alice_sk, alice_pk, alice_coin.commitment(), &[], &tx0, true, None)
             .unwrap_err();
         assert_eq!(err, "only the genesis key may mint without provenance");
     }
@@ -834,27 +820,24 @@ mod tests {
 
         let genesis_coin = coin(0xA1, 100, genesis_pk);
         let alice_coin = coin(0xA2, 100, alice_pk);
-        // A coin Carol never received but claims to own.
         let carol_fake_input = coin(0xC1, 100, carol_pk);
 
         let tx0 = tx(0, genesis_pk, alice_pk,
             genesis_coin, alice_coin, coin(0xA3, 0, genesis_pk));
-        // Carol fabricates a "spend" of a coin she never received.
         let tx_fake = tx(1, carol_pk, alice_pk,
             carol_fake_input.clone(), coin(0xC2, 100, alice_pk), coin(0xC3, 0, carol_pk));
-        let entries = vec![encrypt_tx(&tx0), encrypt_tx(&tx_fake)];
+        // Only the prior board (slot 0) is needed for coin-proof scanning.
+        let entries = vec![encrypt_tx(&tx0)];
         let cn_carol = carol_fake_input.commitment();
 
-        let carol_cp = coin_proof_chain(carol_pk, cn_carol, &entries[..1], &registry);
+        let carol_cp = coin_proof_chain(carol_pk, cn_carol, &entries, &registry);
         assert_eq!(carol_cp[0].received_at, None);
 
-        let err =
-            spend(carol_sk, carol_pk, cn_carol, &entries, alice_pk, false, Some(carol_cp[0].clone()))
-                .unwrap_err();
+        let err = spend(carol_sk, carol_pk, cn_carol, &entries, &tx_fake, false,
+            Some(carol_cp[0].clone())).unwrap_err();
         assert_eq!(err, "P must have received this coin at some prior slot");
 
-        let _ = genesis_sk;
-        let _ = alice_sk;
+        let _ = (genesis_sk, alice_sk);
     }
 
     #[test]
@@ -874,34 +857,27 @@ mod tests {
             genesis_coin, alice_coin.clone(), coin(0xA3, 0, genesis_pk));
         let tx1 = tx(1, alice_pk, bob_pk,
             alice_coin.clone(), coin(0xB1, 60, bob_pk), coin(0xB2, 40, alice_pk));
-        // Alice tries to spend the same coin again, to Carol this time.
         let tx1b = tx(2, alice_pk, carol_pk,
             alice_coin.clone(), coin(0xC1, 100, carol_pk), coin(0xC2, 0, alice_pk));
-        let entries = vec![encrypt_tx(&tx0), encrypt_tx(&tx1), encrypt_tx(&tx1b)];
+        let entries = vec![encrypt_tx(&tx0), encrypt_tx(&tx1)];
 
-        spend(genesis_sk, genesis_pk, cn_genesis, &entries[..1], alice_pk, true, None).unwrap();
+        spend(genesis_sk, genesis_pk, cn_genesis, &[], &tx0, true, None).unwrap();
 
-        let alice_cp = coin_proof_chain(alice_pk, cn_alice, &entries[..2], &registry);
+        let alice_cp = coin_proof_chain(alice_pk, cn_alice, &entries, &registry);
         assert_eq!(alice_cp[0].received_at, Some(0));
-        assert_eq!(alice_cp[1].spent, true); // tx1 already recorded as a spend
+        assert_eq!(alice_cp[1].spent, true);
 
-        // Alice's first spend (to Bob) succeeds using alice_cp[0].
-        spend(alice_sk, alice_pk, cn_alice, &entries[..2], bob_pk, false, Some(alice_cp[0].clone()))
+        spend(alice_sk, alice_pk, cn_alice, &entries[..1], &tx1, false, Some(alice_cp[0].clone()))
             .unwrap();
 
-        // The double-spend (to Carol) is rejected: alice_cp[1].spent == true.
-        let err = spend(
-            alice_sk, alice_pk, cn_alice, &entries[..3], carol_pk, false,
-            Some(alice_cp[1].clone()),
-        )
-        .unwrap_err();
+        let err = spend(alice_sk, alice_pk, cn_alice, &entries, &tx1b, false,
+            Some(alice_cp[1].clone())).unwrap_err();
         assert_eq!(err, "P must not have spent this coin before (double spend)");
     }
 
-    /// An attacker tampers with a *prior* board entry (slot 0) while Alice is
-    /// spending at slot 1. Alice's coin-proof was computed over the real slot-0
-    /// entry, so its `board_root` matches the real anchor. But check_spend
-    /// recomputes the anchor from the tampered entries and finds a mismatch.
+    /// Tampering with a prior board entry is caught by the anchor mismatch:
+    /// Alice's coin-proof was built over the real slot-0 entry, so its
+    /// board_root doesn't match the anchor recomputed from the tampered board.
     #[test]
     fn rejects_tampered_board_entry() {
         let (genesis_sk, genesis_pk) = (GENESIS_SK, genesis_pk());
@@ -912,39 +888,28 @@ mod tests {
         let genesis_coin = coin(0xA1, 100, genesis_pk);
         let alice_coin = coin(0xA2, 100, alice_pk);
 
-        // Real board: tx0 = genesis mint, tx1 = Alice→Bob spend.
         let tx0_real = tx(0, genesis_pk, alice_pk,
             genesis_coin.clone(), alice_coin.clone(), coin(0xA3, 0, genesis_pk));
         let tx1 = tx(1, alice_pk, bob_pk,
             alice_coin.clone(), coin(0xB1, 100, bob_pk), coin(0xB2, 0, alice_pk));
         let entry0_real = encrypt_tx(&tx0_real);
-        let entry1 = encrypt_tx(&tx1);
-        let entries_real = vec![entry0_real, entry1.clone()];
+        let entries_real = vec![entry0_real];
 
-        // Alice builds her coin-proof over the REAL board.
         let cn_alice = alice_coin.commitment();
-        let alice_cp = coin_proof_chain(alice_pk, cn_alice, &entries_real[..1], &registry);
+        let alice_cp = coin_proof_chain(alice_pk, cn_alice, &entries_real, &registry);
 
-        // Attacker swaps slot 0 with a fake entry.
         let tx0_fake = tx(0, genesis_pk, alice_pk,
             genesis_coin.clone(), coin(0xB3, 100, alice_pk), coin(0xB4, 0, genesis_pk));
         let entry0_fake = encrypt_tx(&tx0_fake);
-        let entries_tampered = vec![entry0_fake, entry1];
+        let entries_tampered = vec![entry0_fake];
 
-        // check_spend computes anchor = merkle_root_of(entries_tampered[..1])
-        // which differs from alice_cp[0].board_root (real anchor) → rejected.
-        let err = spend(
-            alice_sk, alice_pk, cn_alice, &entries_tampered, bob_pk, false,
-            Some(alice_cp[0].clone()),
-        )
-        .unwrap_err();
+        let err = spend(alice_sk, alice_pk, cn_alice, &entries_tampered, &tx1, false,
+            Some(alice_cp[0].clone())).unwrap_err();
         assert_eq!(err, "coin-proof's board root does not match the board prefix");
 
         let _ = genesis_sk;
     }
 
-    /// `output.value + change.value` must equal `input.value` exactly — no
-    /// value may be created (overdraft) or destroyed by a transfer.
     #[test]
     fn rejects_value_conservation_violation() {
         let (genesis_sk, genesis_pk) = (GENESIS_SK, genesis_pk());
@@ -954,11 +919,9 @@ mod tests {
         // Overdraft: output (100) + change (1) > input (100).
         let tx0 = tx(0, genesis_pk, alice_pk,
             genesis_coin.clone(), coin(0xA2, 100, alice_pk), coin(0xA3, 1, genesis_pk));
-        let entries = vec![encrypt_tx(&tx0)];
 
-        let err =
-            spend(genesis_sk, genesis_pk, genesis_coin.commitment(), &entries, alice_pk, true, None)
-                .unwrap_err();
+        let err = spend(genesis_sk, genesis_pk, genesis_coin.commitment(), &[], &tx0, true, None)
+            .unwrap_err();
         assert_eq!(err, "transaction violates value conservation: output + change must equal input");
     }
 }
