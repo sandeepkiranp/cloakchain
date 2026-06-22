@@ -1,41 +1,34 @@
 //! Host driver for the `cloakkchain` IVC `CoinProof` + `Valid` (spend) relations.
 //!
-//! Builds a small encrypted bulletin board — genesis mints a coin to Alice,
-//! Alice sends it to Bob, Bob sends it to Carol — and runs:
-//!
-//!   - `cloakkchain-program-coinproof`: one recursive step per board slot, per
-//!     unspent coin, tracking whether (and where) its owner received the coin
-//!     and whether they've already spent it.
-//!   - `cloakkchain-program-spend`: the actual transfer, which (for non-genesis
-//!     spends) recursively verifies the spender's latest coin-proof.
-//!
-//! ## Encrypted board
-//!
-//! Every board entry is `encrypt_tx(tx)` — opaque to everyone except the
-//! sender/recipient pair. Both relations decrypt in-circuit via
-//! `extract_msg`/`scan_entry`. After proving, the spend proof is embedded
-//! back into the transaction and the entry is re-encrypted so the proof
-//! travels inside the ciphertext on the board.
+//! Models a realistic wallet per party. Each wallet watches the board and
+//! updates its coin-proofs incrementally — one IVC step per new slot — instead
+//! of hard-coding a fixed Genesis→Alice→Bob→Carol sequence with named local
+//! variables. When a coin is first discovered (received as payment or change),
+//! the wallet retroactively bootstraps its IVC chain from slot 0.
 //!
 //! ```shell
 //! RUST_LOG=info cargo run --release -- --execute   # mock execution, no ZK proofs
 //! RUST_LOG=info cargo run --release -- --prove     # full recursive chain (expensive)
 //! ```
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use clap::Parser;
 use cloakkchain_lib::{
-    append_proof_for, derive_pk, encrypt_tx, genesis_pk, merkle_root_of, BoardEntry, Coin,
-    CoinProofPublicValues, Transaction, ValidPublicValues, GENESIS_SK,
+    append_proof_for, derive_pk, encrypt_tx, genesis_pk, merkle_root_of,
+    scan_entry as lib_scan_entry, BoardEntry, Coin, CoinProofPublicValues, Transaction,
+    ValidPublicValues, GENESIS_SK,
 };
 use sp1_sdk::{
     blocking::{MockProver, ProveRequest, Prover, ProverClient},
-    include_elf, Elf, HashableKey, ProvingKey, SP1Proof, SP1Stdin,
+    include_elf, Elf, HashableKey, ProvingKey, SP1Proof, SP1ProofWithPublicValues, SP1Stdin,
 };
 
 const CLOAKKCHAIN_SPEND_ELF: Elf = include_elf!("cloakkchain-program-spend");
 const CLOAKKCHAIN_COINPROOF_ELF: Elf = include_elf!("cloakkchain-program-coinproof");
+
+// ---- CLI args ---------------------------------------------------------------
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -45,6 +38,8 @@ struct Args {
     #[arg(long)]
     prove: bool,
 }
+
+// ---- Party ------------------------------------------------------------------
 
 struct Party {
     name: &'static str,
@@ -56,43 +51,269 @@ impl Party {
     fn new(name: &'static str, seed: u8) -> Self {
         let mut sk = [0u8; 32];
         sk[0] = seed;
-        Self { name, sk, pk: derive_pk(&sk) }
+        Self {
+            name,
+            sk,
+            pk: derive_pk(&sk),
+        }
     }
 }
 
-// ---- Statistics helpers -----------------------------------------------------
+// ---- Wallet -----------------------------------------------------------------
+//
+// Each party maintains a wallet: a map from coin_commitment to a CoinRecord
+// holding the latest IVC coin-proof for that coin. When a new board entry
+// arrives, the wallet:
+//   1. Steps all already-tracked coins forward one slot (O(1) per coin via the
+//      fixed-depth append proof).
+//   2. Scans the new entry for coins the owner received (output or change).
+//   3. Bootstraps any newly discovered coin's IVC chain from slot 0.
+//
+// When spending, the wallet looks up the latest proof for the desired coin and
+// hands it to the spend circuit.
 
-struct ExecStats {
-    name: &'static str,
-    board_size: usize,
-    exec_ms: u128,
-    cycles: u64,
+struct CoinRecord {
+    pv: CoinProofPublicValues,
+    proof: SP1ProofWithPublicValues,
 }
 
+impl CoinRecord {
+    fn slot_covered(&self) -> usize {
+        self.pv.board_size - 1
+    }
+}
+
+struct Wallet<'a> {
+    party: &'a Party,
+    coins: HashMap<[u8; 32], CoinRecord>,
+}
+
+impl<'a> Wallet<'a> {
+    fn new(party: &'a Party) -> Self {
+        Self {
+            party,
+            coins: HashMap::new(),
+        }
+    }
+
+    /// Advance every tracked coin by one IVC step, then discover and bootstrap
+    /// any new coins found in `all_entries[slot]`.
+    fn process_slot<C: Prover>(
+        &mut self,
+        slot: usize,
+        all_entries: &[BoardEntry],
+        registry: &[[u8; 32]],
+        coinproof_pk: &C::ProvingKey,
+        coinproof_vkey: &[u32; 8],
+        client: &C,
+        stats: &mut Vec<ProveStats>,
+    ) {
+        assert_eq!(
+            all_entries.len(),
+            slot + 1,
+            "all_entries must include exactly up to slot"
+        );
+        let entry = &all_entries[slot];
+        let ap = append_proof_for(all_entries);
+
+        // Step 1: advance all existing coins by one slot.
+        let tracked: Vec<[u8; 32]> = self.coins.keys().cloned().collect();
+        for cn in &tracked {
+            let record = self.coins.get(cn).unwrap();
+            if record.slot_covered() >= slot {
+                continue;
+            }
+
+            let inner_pv = record.pv.clone();
+            let SP1Proof::Compressed(inner_c) = record.proof.proof.clone() else {
+                panic!("coin records must use compressed proofs")
+            };
+
+            let mut stdin = build_coinproof_stdin(
+                coinproof_vkey,
+                self.party.pk,
+                *cn,
+                entry,
+                slot,
+                &ap,
+                registry,
+                Some(&inner_pv),
+            );
+            stdin.write_proof(*inner_c, coinproof_pk.verifying_key().vk.clone());
+
+            let label = format!("{} coin-proof slot {} (step)", self.party.name, slot);
+            let record =
+                self.run_coinproof_step(stdin, &label, slot + 1, coinproof_pk, client, stats);
+            self.coins.insert(*cn, record);
+        }
+
+        // Step 2: scan entry for newly received coins.
+        if let Some(tx) = lib_scan_entry(&self.party.pk, registry, entry) {
+            let candidates = [
+                (tx.output_coin.owner_pk == self.party.pk).then_some(tx.output_coin.commitment()),
+                (tx.change_coin.owner_pk == self.party.pk).then_some(tx.change_coin.commitment()),
+            ];
+            for cn in candidates.into_iter().flatten() {
+                if !self.coins.contains_key(&cn) {
+                    println!(
+                        "  [{}] discovered new coin at slot {} — bootstrapping IVC from slot 0",
+                        self.party.name, slot
+                    );
+                    self.bootstrap(
+                        cn,
+                        slot,
+                        all_entries,
+                        registry,
+                        coinproof_pk,
+                        coinproof_vkey,
+                        client,
+                        stats,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Run IVC for a freshly discovered coin from slot 0 up to `up_to_slot`.
+    fn bootstrap<C: Prover>(
+        &mut self,
+        cn: [u8; 32],
+        up_to_slot: usize,
+        all_entries: &[BoardEntry],
+        registry: &[[u8; 32]],
+        coinproof_pk: &C::ProvingKey,
+        coinproof_vkey: &[u32; 8],
+        client: &C,
+        stats: &mut Vec<ProveStats>,
+    ) {
+        // Base case: slot 0.
+        let ap0 = append_proof_for(&all_entries[..1]);
+        let stdin = build_coinproof_stdin(
+            coinproof_vkey,
+            self.party.pk,
+            cn,
+            &all_entries[0],
+            0,
+            &ap0,
+            registry,
+            None,
+        );
+        let label = format!("{} coin-proof slot 0 (base)", self.party.name);
+        let record = self.run_coinproof_step(stdin, &label, 1, coinproof_pk, client, stats);
+        self.coins.insert(cn, record);
+
+        // Recursive steps: slots 1..=up_to_slot.
+        for s in 1..=up_to_slot {
+            let aps = append_proof_for(&all_entries[..=s]);
+            let rec = self.coins.get(&cn).unwrap();
+            let inner_pv = rec.pv.clone();
+            let SP1Proof::Compressed(inner_c) = rec.proof.proof.clone() else {
+                panic!("compressed required")
+            };
+
+            let mut stdin = build_coinproof_stdin(
+                coinproof_vkey,
+                self.party.pk,
+                cn,
+                &all_entries[s],
+                s,
+                &aps,
+                registry,
+                Some(&inner_pv),
+            );
+            stdin.write_proof(*inner_c, coinproof_pk.verifying_key().vk.clone());
+
+            let label = format!("{} coin-proof slot {} (bootstrap)", self.party.name, s);
+            let record = self.run_coinproof_step(stdin, &label, s + 1, coinproof_pk, client, stats);
+            self.coins.insert(cn, record);
+        }
+    }
+
+    /// Prove one coin-proof step, verify, collect stats, return the record.
+    fn run_coinproof_step<C: Prover>(
+        &self,
+        stdin: SP1Stdin,
+        label: &str,
+        board_size: usize,
+        coinproof_pk: &C::ProvingKey,
+        client: &C,
+        stats: &mut Vec<ProveStats>,
+    ) -> CoinRecord {
+        let t = Instant::now();
+        let proof = client
+            .prove(coinproof_pk, stdin)
+            .compressed()
+            .run()
+            .unwrap_or_else(|e| panic!("coin-proof step failed: {e}"));
+        let prove_secs = t.elapsed().as_secs_f64();
+
+        let t = Instant::now();
+        client
+            .verify(&proof, coinproof_pk.verifying_key(), None)
+            .expect("coin-proof verify failed");
+        let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let pv: CoinProofPublicValues =
+            bincode::deserialize(proof.public_values.as_slice()).expect("decode coin-proof pv");
+
+        println!(
+            "  [{}]  received_at={:?}  spent={}  ({:.1}s)",
+            label, pv.received_at, pv.spent, prove_secs
+        );
+        stats.push(ProveStats {
+            name: label.to_string(),
+            board_size,
+            prove_secs,
+            verify_ms,
+            entry_bytes: None,
+        });
+        CoinRecord { pv, proof }
+    }
+
+    /// Return the latest coin-proof for a coin (if tracked).
+    fn get(&self, cn: &[u8; 32]) -> Option<&CoinRecord> {
+        self.coins.get(cn)
+    }
+
+    /// Print a summary of all tracked coins and their current state.
+    fn print_state(&self) {
+        println!("  {}:", self.party.name);
+        if self.coins.is_empty() {
+            println!("    (no coins tracked)");
+            return;
+        }
+        for (cn, rec) in &self.coins {
+            println!(
+                "    cn={}..{}  received_at={:?}  spent={}  slot_covered={}",
+                hex(&cn[..2]),
+                hex(&cn[30..]),
+                rec.pv.received_at,
+                rec.pv.spent,
+                rec.slot_covered()
+            );
+        }
+    }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+// ---- Statistics -------------------------------------------------------------
+
 struct ProveStats {
-    name: &'static str,
+    name: String,
     board_size: usize,
     prove_secs: f64,
     verify_ms: f64,
-    entry_bytes: Option<usize>, // ciphertext size after proof embedding (spend steps only)
+    entry_bytes: Option<usize>,
 }
 
-fn print_exec_table(stats: &[ExecStats]) {
-    println!("\n{}", "=".repeat(70));
-    println!("  Execution Statistics  (mock prover — no ZK proofs generated)");
-    println!("{}", "=".repeat(70));
-    println!("{:<40} {:>5}  {:>12}  {:>10}", "Step", "Board", "Cycles", "Time");
-    println!("{}", "-".repeat(70));
-    for s in stats {
-        println!(
-            "{:<40} {:>5}  {:>12}  {:>8} ms",
-            s.name,
-            s.board_size,
-            format_cycles(s.cycles),
-            s.exec_ms,
-        );
-    }
-    println!("{}", "=".repeat(70));
+struct ExecStats {
+    name: String,
+    board_size: usize,
+    exec_ms: u128,
+    cycles: u64,
 }
 
 fn print_prove_table(stats: &[ProveStats]) {
@@ -100,49 +321,56 @@ fn print_prove_table(stats: &[ProveStats]) {
     println!("  Proof Statistics  (compressed recursive SP1 STARKs)");
     println!("{}", "=".repeat(80));
     println!(
-        "{:<42} {:>5}  {:>9}  {:>10}  {:>12}",
-        "Step", "Board", "Prove", "Verify", "Entry size"
+        "{:<44} {:>5}  {:>9}  {:>10}  {:>10}",
+        "Step", "Board", "Prove", "Verify", "Entry"
     );
     println!("{}", "-".repeat(80));
-
-    let mut total_prove = 0f64;
-    let mut total_verify = 0f64;
-
+    let (mut tp, mut tv) = (0f64, 0f64);
     for s in stats {
         let entry_col = match s.entry_bytes {
-            Some(b) => format!("{:>8} B", b),
-            None => "        —".into(),
+            Some(b) => format!("{:>7} B", b),
+            None => "       —".into(),
         };
         println!(
-            "{:<42} {:>5}  {:>7.1} s  {:>8.1} ms  {}",
-            s.name,
-            s.board_size,
-            s.prove_secs,
-            s.verify_ms,
-            entry_col,
+            "{:<44} {:>5}  {:>7.1} s  {:>8.1} ms  {}",
+            s.name, s.board_size, s.prove_secs, s.verify_ms, entry_col
         );
-        total_prove += s.prove_secs;
-        total_verify += s.verify_ms;
+        tp += s.prove_secs;
+        tv += s.verify_ms;
     }
-
     println!("{}", "-".repeat(80));
-    println!(
-        "{:<42} {:>5}  {:>7.1} s  {:>8.1} ms",
-        "TOTAL", "", total_prove, total_verify
-    );
-    println!("{}", "=".repeat(80));
-    println!("  Board = number of entries scanned/committed at that step.");
-    println!("  Entry size = ciphertext length after the spend proof is embedded");
-    println!("  (base ciphertext with empty proof = 400 B; grows by proof.len()).");
+    println!("{:<44} {:>5}  {:>7.1} s  {:>8.1} ms", "TOTAL", "", tp, tv);
     println!("{}", "=".repeat(80));
 }
 
-fn format_cycles(c: u64) -> String {
-    // Insert thousands separators.
+fn print_exec_table(stats: &[ExecStats]) {
+    println!("\n{}", "=".repeat(70));
+    println!("  Execution Statistics  (mock prover — no ZK proofs)");
+    println!("{}", "=".repeat(70));
+    println!(
+        "{:<44} {:>5}  {:>14}  {:>8}",
+        "Step", "Board", "Cycles", "Time"
+    );
+    println!("{}", "-".repeat(70));
+    for s in stats {
+        println!(
+            "{:<44} {:>5}  {:>14}  {:>6} ms",
+            s.name,
+            s.board_size,
+            fmt_cycles(s.cycles),
+            s.exec_ms
+        );
+    }
+    println!("{}", "=".repeat(70));
+}
+
+fn fmt_cycles(c: u64) -> String {
     let s = c.to_string();
     let mut out = String::new();
     for (i, ch) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 { out.push(','); }
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
         out.push(ch);
     }
     out.chars().rev().collect()
@@ -155,12 +383,14 @@ fn coin(seed: u8, value: u64, owner_pk: [u8; 32]) -> Coin {
     tag[0] = seed;
     let mut rand = [0u8; 32];
     rand[1] = seed;
-    Coin { tag, value, rand, owner_pk }
+    Coin {
+        tag,
+        value,
+        rand,
+        owner_pk,
+    }
 }
 
-/// The 3-tx demo chain: genesis mints a 100-unit coin to Alice. Alice sends 40
-/// units to Bob (keeping 60 as change). Bob sends his 40 units to Carol (keeping
-/// no change). Each entry is `(sender, transaction)`.
 fn demo_chain<'a>(
     alice: &'a Party,
     bob: &'a Party,
@@ -216,10 +446,6 @@ fn demo_chain<'a>(
 
 // ---- stdin builders ---------------------------------------------------------
 
-/// Build the SP1Stdin for one step of the coin-proof relation at `slot`.
-/// Only `entry_k` (the new entry) and its `append_path` are passed — no full
-/// history. `inner` is the previous step's public values, or `None` for the
-/// base case (`slot == 0`).
 fn build_coinproof_stdin(
     coinproof_vkey: &[u32; 8],
     owner_pk: [u8; 32],
@@ -245,10 +471,6 @@ fn build_coinproof_stdin(
     stdin
 }
 
-/// Build the SP1Stdin for the spend relation. `prior_entries` is the board
-/// before tx* (used for the anchor); `tx_star` is the spending transaction
-/// passed as plaintext — no encrypt/decrypt round-trip inside the zkVM.
-/// For non-genesis spends, `coin_proof` must cover `prior_entries`.
 fn build_spend_stdin(
     spend_vkey: &[u32; 8],
     coinproof_vkey: &[u32; 8],
@@ -289,191 +511,362 @@ fn main() {
     let alice = Party::new("Alice", 1);
     let bob = Party::new("Bob", 2);
     let carol = Party::new("Carol", 3);
-    let genesis = Party { name: "Genesis", sk: GENESIS_SK, pk: genesis_pk() };
-
+    let genesis = Party {
+        name: "Genesis",
+        sk: GENESIS_SK,
+        pk: genesis_pk(),
+    };
     let registry = vec![genesis.pk, alice.pk, bob.pk, carol.pk];
 
-    let mut chain = demo_chain(&alice, &bob, &carol, &genesis);
+    let mut chain: Vec<(&Party, Transaction)> = demo_chain(&alice, &bob, &carol, &genesis);
     let mut entries: Vec<BoardEntry> = chain.iter().map(|(_, tx)| encrypt_tx(tx)).collect();
-    let cn_genesis = chain[0].1.input_coin.commitment();
-    let cn_alice = chain[0].1.output_coin.commitment();
-    let cn_bob = chain[1].1.output_coin.commitment();
 
-    // ---- --execute: mock prover, measures cycles only ----------------------
+    // ---- --execute: mock prover (no ZK proofs, just logic verification) -----
     if args.execute {
         let client = MockProver::new();
-        let spend_pk = client.setup(CLOAKKCHAIN_SPEND_ELF).expect("failed to setup spend elf");
-        let coinproof_pk =
-            client.setup(CLOAKKCHAIN_COINPROOF_ELF).expect("failed to setup coinproof elf");
+        let spend_pk = client
+            .setup(CLOAKKCHAIN_SPEND_ELF)
+            .expect("setup spend elf");
+        let coinproof_pk = client
+            .setup(CLOAKKCHAIN_COINPROOF_ELF)
+            .expect("setup coinproof elf");
         let spend_vkey = spend_pk.verifying_key().hash_u32();
         let coinproof_vkey = coinproof_pk.verifying_key().hash_u32();
         println!("spend vkey:     {}", spend_pk.verifying_key().bytes32());
         println!("coinproof vkey: {}", coinproof_pk.verifying_key().bytes32());
 
-        let mut exec_stats: Vec<ExecStats> = Vec::new();
+        let mut stats: Vec<ExecStats> = Vec::new();
 
-        // Genesis mints a 100-unit coin to Alice (slot 0). Prior board is empty.
-        let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn_genesis, &entries[..0], &chain[0].1, true, None);
+        // --- Slot 0: genesis mint ---
+        let cn_genesis = chain[0].1.input_coin.commitment();
+        let stdin = build_spend_stdin(
+            &spend_vkey,
+            &coinproof_vkey,
+            &genesis,
+            cn_genesis,
+            &entries[..0],
+            &chain[0].1,
+            true,
+            None,
+        );
         let t = Instant::now();
         let (output, report) = client.execute(CLOAKKCHAIN_SPEND_ELF, stdin).run().unwrap();
         let exec_ms = t.elapsed().as_millis();
         let pv: ValidPublicValues = bincode::deserialize(output.as_slice()).expect("decode");
-        assert_eq!(pv.board_root, merkle_root_of(&entries[..0]), "genesis: anchor mismatch");
-        assert_eq!(pv.pk_p, genesis.pk);
-        assert_eq!(pv.board_size, 1);
+        assert_eq!(pv.board_root, merkle_root_of(&entries[..0]));
         chain[0].1.spend_proof = output.to_vec();
         entries[0] = encrypt_tx(&chain[0].1);
-        exec_stats.push(ExecStats { name: "Genesis mint (spend)", board_size: 1, exec_ms, cycles: report.total_instruction_count() });
+        stats.push(ExecStats {
+            name: "Slot 0: genesis mint (spend)".into(),
+            board_size: 1,
+            exec_ms,
+            cycles: report.total_instruction_count(),
+        });
 
-        // Alice's coin-proof step 0: she received her 100-unit coin at slot 0.
+        // Wallets scan slot 0 (base case only — no recursive proofs in execute mode).
+        // Each party scans for their own coin: Alice for cn_alice, others for theirs.
         let ap0 = append_proof_for(&entries[..1]);
-        let stdin = build_coinproof_stdin(&coinproof_vkey, alice.pk, cn_alice, &entries[0], 0, &ap0, &registry, None);
-        let t = Instant::now();
-        let (output, report) = client.execute(CLOAKKCHAIN_COINPROOF_ELF, stdin).run().unwrap();
-        let exec_ms = t.elapsed().as_millis();
-        let alice_cp0: CoinProofPublicValues = bincode::deserialize(output.as_slice()).expect("decode");
-        assert_eq!(alice_cp0.board_root, merkle_root_of(&entries[..1]));
-        assert_eq!(alice_cp0.received_at, Some(0));
-        assert_eq!(alice_cp0.spent, false);
-        exec_stats.push(ExecStats { name: "Alice coin-proof step 0", board_size: 1, exec_ms, cycles: report.total_instruction_count() });
+        let cn_alice = chain[0].1.output_coin.commitment();
+        for (owner_pk, cn, label) in [
+            (&alice.pk, cn_alice, "Alice"),
+            (&bob.pk, cn_alice, "Bob  "), // bob hasn't received yet — received_at=None
+            (&carol.pk, cn_alice, "Carol"), // same
+        ] {
+            let stdin = build_coinproof_stdin(
+                &coinproof_vkey,
+                *owner_pk,
+                cn,
+                &entries[0],
+                0,
+                &ap0,
+                &registry,
+                None,
+            );
+            let t = Instant::now();
+            let (output, report) = client
+                .execute(CLOAKKCHAIN_COINPROOF_ELF, stdin)
+                .run()
+                .unwrap();
+            let exec_ms = t.elapsed().as_millis();
+            let cp: CoinProofPublicValues =
+                bincode::deserialize(output.as_slice()).expect("decode");
+            stats.push(ExecStats {
+                name: format!("{label} coin-proof slot 0"),
+                board_size: 1,
+                exec_ms,
+                cycles: report.total_instruction_count(),
+            });
+            println!(
+                "  [{label} slot 0] received_at={:?} spent={}",
+                cp.received_at, cp.spent
+            );
+        }
 
-        // Bob's coin-proof step 0: slot 0 isn't his.
-        let stdin = build_coinproof_stdin(&coinproof_vkey, bob.pk, cn_bob, &entries[0], 0, &ap0, &registry, None);
-        let t = Instant::now();
-        let (output, report) = client.execute(CLOAKKCHAIN_COINPROOF_ELF, stdin).run().unwrap();
-        let exec_ms = t.elapsed().as_millis();
-        let bob_cp0: CoinProofPublicValues = bincode::deserialize(output.as_slice()).expect("decode");
-        assert_eq!(bob_cp0.board_root, merkle_root_of(&entries[..1]));
-        assert_eq!(bob_cp0.received_at, None);
-        assert_eq!(bob_cp0.spent, false);
-        exec_stats.push(ExecStats { name: "Bob coin-proof step 0", board_size: 1, exec_ms, cycles: report.total_instruction_count() });
-
-        print_exec_table(&exec_stats);
+        print_exec_table(&stats);
         println!("\nRun --prove for the full recursive chain with real ZK proofs.");
         return;
     }
 
-    // ---- --prove: full recursive chain with real compressed proofs ---------
+    // ---- --prove: wallet-based incremental IVC + real compressed proofs -----
     let client = ProverClient::from_env();
-    let spend_pk = client.setup(CLOAKKCHAIN_SPEND_ELF).expect("failed to setup spend elf");
-    let coinproof_pk =
-        client.setup(CLOAKKCHAIN_COINPROOF_ELF).expect("failed to setup coinproof elf");
+    let spend_pk = client
+        .setup(CLOAKKCHAIN_SPEND_ELF)
+        .expect("setup spend elf");
+    let coinproof_pk = client
+        .setup(CLOAKKCHAIN_COINPROOF_ELF)
+        .expect("setup coinproof elf");
     let spend_vkey = spend_pk.verifying_key().hash_u32();
     let coinproof_vkey = coinproof_pk.verifying_key().hash_u32();
     println!("spend vkey:     {}", spend_pk.verifying_key().bytes32());
     println!("coinproof vkey: {}", coinproof_pk.verifying_key().bytes32());
 
-    let mut prove_stats: Vec<ProveStats> = Vec::new();
+    let mut alice_wallet = Wallet::new(&alice);
+    let mut bob_wallet = Wallet::new(&bob);
+    let mut carol_wallet = Wallet::new(&carol);
+    let mut stats: Vec<ProveStats> = Vec::new();
 
-    // -- Genesis mint (slot 0, anchor = empty) --------------------------------
-    println!("\nProving genesis mint...");
-    let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn_genesis, &entries[..0], &chain[0].1, true, None);
+    // =========================================================================
+    // Slot 0: genesis mints 100 units to Alice
+    // =========================================================================
+    let cn_genesis = chain[0].1.input_coin.commitment();
+    let cn_alice = chain[0].1.output_coin.commitment();
+
+    println!("\n--- Slot 0: genesis mint ---");
+    let stdin = build_spend_stdin(
+        &spend_vkey,
+        &coinproof_vkey,
+        &genesis,
+        cn_genesis,
+        &entries[..0],
+        &chain[0].1,
+        true,
+        None,
+    );
     let t = Instant::now();
-    let genesis_proof = client.prove(&spend_pk, stdin).compressed().run().expect("failed to prove genesis mint");
+    let proof = client
+        .prove(&spend_pk, stdin)
+        .compressed()
+        .run()
+        .expect("genesis mint prove");
     let prove_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
-    client.verify(&genesis_proof, spend_pk.verifying_key(), None).expect("failed to verify genesis mint");
+    client
+        .verify(&proof, spend_pk.verifying_key(), None)
+        .expect("genesis mint verify");
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let genesis_pv: ValidPublicValues = bincode::deserialize(genesis_proof.public_values.as_slice()).expect("decode");
-    assert_eq!(genesis_pv.board_root, merkle_root_of(&entries[..0]));
-    chain[0].1.spend_proof = genesis_proof.public_values.to_vec();
+    let pv: ValidPublicValues =
+        bincode::deserialize(proof.public_values.as_slice()).expect("decode");
+    assert_eq!(pv.board_root, merkle_root_of(&entries[..0]));
+    chain[0].1.spend_proof = proof.public_values.to_vec();
     entries[0] = encrypt_tx(&chain[0].1);
     let entry0_bytes = entries[0].ciphertext.len();
-    prove_stats.push(ProveStats { name: "Genesis mint (spend)", board_size: 1, prove_secs, verify_ms, entry_bytes: Some(entry0_bytes) });
-    println!("  -> Genesis mint proved & verified ({prove_secs:.1} s)");
+    stats.push(ProveStats {
+        name: "Slot 0: genesis mint (spend)".into(),
+        board_size: 1,
+        prove_secs,
+        verify_ms,
+        entry_bytes: Some(entry0_bytes),
+    });
+    println!("  Proved & verified ({prove_secs:.1} s) — entry now {entry0_bytes} B");
 
-    // -- Alice coin-proof step 0 (base case) ----------------------------------
-    println!("Proving Alice's coin-proof step 0...");
-    let ap0 = append_proof_for(&entries[..1]);
-    let stdin = build_coinproof_stdin(&coinproof_vkey, alice.pk, cn_alice, &entries[0], 0, &ap0, &registry, None);
-    let t = Instant::now();
-    let alice_cp0_proof = client.prove(&coinproof_pk, stdin).compressed().run().expect("failed to prove alice cp0");
-    let prove_secs = t.elapsed().as_secs_f64();
-    let t = Instant::now();
-    client.verify(&alice_cp0_proof, coinproof_pk.verifying_key(), None).expect("failed to verify alice cp0");
-    let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let alice_cp0: CoinProofPublicValues = bincode::deserialize(alice_cp0_proof.public_values.as_slice()).expect("decode");
-    assert_eq!(alice_cp0.received_at, Some(0));
-    assert_eq!(alice_cp0.spent, false);
-    prove_stats.push(ProveStats { name: "Alice coin-proof step 0", board_size: 1, prove_secs, verify_ms, entry_bytes: None });
-    println!("  -> Alice coin-proof step 0 proved & verified ({prove_secs:.1} s, received_at={:?})", alice_cp0.received_at);
+    // All wallets scan slot 0
+    println!("--- Wallets scanning slot 0 ---");
+    alice_wallet.process_slot(
+        0,
+        &entries[..1],
+        &registry,
+        &coinproof_pk,
+        &coinproof_vkey,
+        &client,
+        &mut stats,
+    );
+    bob_wallet.process_slot(
+        0,
+        &entries[..1],
+        &registry,
+        &coinproof_pk,
+        &coinproof_vkey,
+        &client,
+        &mut stats,
+    );
+    carol_wallet.process_slot(
+        0,
+        &entries[..1],
+        &registry,
+        &coinproof_pk,
+        &coinproof_vkey,
+        &client,
+        &mut stats,
+    );
 
-    // -- Alice's spend (slot 1, recursive, anchor = entries[..1]) -------------
-    println!("Proving Alice's spend...");
-    let mut stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &alice, cn_alice, &entries[..1], &chain[1].1, false, Some(&alice_cp0));
+    // =========================================================================
+    // Slot 1: Alice spends cn_alice, sends 40 to Bob, keeps 60 change
+    // =========================================================================
+    println!("\n--- Slot 1: Alice spends to Bob ---");
+    let alice_record = alice_wallet
+        .get(&cn_alice)
+        .expect("Alice must have coin-proof for cn_alice");
+    let mut stdin = build_spend_stdin(
+        &spend_vkey,
+        &coinproof_vkey,
+        &alice,
+        cn_alice,
+        &entries[..1],
+        &chain[1].1,
+        false,
+        Some(&alice_record.pv),
+    );
     {
-        let SP1Proof::Compressed(inner) = alice_cp0_proof.proof.clone() else { panic!("compressed mode required") };
+        let SP1Proof::Compressed(inner) = alice_record.proof.proof.clone() else {
+            panic!("compressed required")
+        };
         stdin.write_proof(*inner, coinproof_pk.verifying_key().vk.clone());
     }
     let t = Instant::now();
-    let alice_spend_proof = client.prove(&spend_pk, stdin).compressed().run().expect("failed to prove alice's spend");
+    let proof = client
+        .prove(&spend_pk, stdin)
+        .compressed()
+        .run()
+        .expect("alice spend prove");
     let prove_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
-    client.verify(&alice_spend_proof, spend_pk.verifying_key(), None).expect("failed to verify alice's spend");
+    client
+        .verify(&proof, spend_pk.verifying_key(), None)
+        .expect("alice spend verify");
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let alice_spend_pv: ValidPublicValues = bincode::deserialize(alice_spend_proof.public_values.as_slice()).expect("decode");
-    assert_eq!(alice_spend_pv.board_root, merkle_root_of(&entries[..1]));
-    chain[1].1.spend_proof = alice_spend_proof.public_values.to_vec();
+    let pv: ValidPublicValues =
+        bincode::deserialize(proof.public_values.as_slice()).expect("decode");
+    assert_eq!(pv.board_root, merkle_root_of(&entries[..1]));
+    chain[1].1.spend_proof = proof.public_values.to_vec();
     entries[1] = encrypt_tx(&chain[1].1);
     let entry1_bytes = entries[1].ciphertext.len();
-    prove_stats.push(ProveStats { name: "Alice's spend (recursive)", board_size: 2, prove_secs, verify_ms, entry_bytes: Some(entry1_bytes) });
-    println!("  -> Alice's spend proved & verified ({prove_secs:.1} s)");
+    stats.push(ProveStats {
+        name: "Slot 1: Alice's spend (recursive)".into(),
+        board_size: 2,
+        prove_secs,
+        verify_ms,
+        entry_bytes: Some(entry1_bytes),
+    });
+    println!("  Proved & verified ({prove_secs:.1} s) — entry now {entry1_bytes} B");
 
-    // -- Bob coin-proof step 0 (base case, slot 0 is not his) -----------------
-    println!("Proving Bob's coin-proof step 0...");
-    let stdin = build_coinproof_stdin(&coinproof_vkey, bob.pk, cn_bob, &entries[0], 0, &ap0, &registry, None);
-    let t = Instant::now();
-    let bob_cp0_proof = client.prove(&coinproof_pk, stdin).compressed().run().expect("failed to prove bob cp0");
-    let prove_secs = t.elapsed().as_secs_f64();
-    let t = Instant::now();
-    client.verify(&bob_cp0_proof, coinproof_pk.verifying_key(), None).expect("failed to verify bob cp0");
-    let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let bob_cp0: CoinProofPublicValues = bincode::deserialize(bob_cp0_proof.public_values.as_slice()).expect("decode");
-    assert_eq!(bob_cp0.received_at, None);
-    prove_stats.push(ProveStats { name: "Bob coin-proof step 0", board_size: 1, prove_secs, verify_ms, entry_bytes: None });
-    println!("  -> Bob coin-proof step 0 proved & verified ({prove_secs:.1} s)");
+    // All wallets scan slot 1
+    println!("--- Wallets scanning slot 1 ---");
+    alice_wallet.process_slot(
+        1,
+        &entries[..2],
+        &registry,
+        &coinproof_pk,
+        &coinproof_vkey,
+        &client,
+        &mut stats,
+    );
+    bob_wallet.process_slot(
+        1,
+        &entries[..2],
+        &registry,
+        &coinproof_pk,
+        &coinproof_vkey,
+        &client,
+        &mut stats,
+    );
+    carol_wallet.process_slot(
+        1,
+        &entries[..2],
+        &registry,
+        &coinproof_pk,
+        &coinproof_vkey,
+        &client,
+        &mut stats,
+    );
 
-    // -- Bob coin-proof step 1 (recursive, he received his coin here) ---------
-    println!("Proving Bob's coin-proof step 1...");
-    let ap1 = append_proof_for(&entries[..2]);
-    let mut stdin = build_coinproof_stdin(&coinproof_vkey, bob.pk, cn_bob, &entries[1], 1, &ap1, &registry, Some(&bob_cp0));
+    // =========================================================================
+    // Slot 2: Bob spends cn_bob, sends all 40 to Carol (no change)
+    // =========================================================================
+    let cn_bob = chain[1].1.output_coin.commitment();
+    println!("\n--- Slot 2: Bob spends to Carol ---");
+    let bob_record = bob_wallet
+        .get(&cn_bob)
+        .expect("Bob must have coin-proof for cn_bob");
+    let mut stdin = build_spend_stdin(
+        &spend_vkey,
+        &coinproof_vkey,
+        &bob,
+        cn_bob,
+        &entries[..2],
+        &chain[2].1,
+        false,
+        Some(&bob_record.pv),
+    );
     {
-        let SP1Proof::Compressed(inner) = bob_cp0_proof.proof.clone() else { panic!("compressed mode required") };
+        let SP1Proof::Compressed(inner) = bob_record.proof.proof.clone() else {
+            panic!("compressed required")
+        };
         stdin.write_proof(*inner, coinproof_pk.verifying_key().vk.clone());
     }
     let t = Instant::now();
-    let bob_cp1_proof = client.prove(&coinproof_pk, stdin).compressed().run().expect("failed to prove bob cp1");
+    let proof = client
+        .prove(&spend_pk, stdin)
+        .compressed()
+        .run()
+        .expect("bob spend prove");
     let prove_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
-    client.verify(&bob_cp1_proof, coinproof_pk.verifying_key(), None).expect("failed to verify bob cp1");
+    client
+        .verify(&proof, spend_pk.verifying_key(), None)
+        .expect("bob spend verify");
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let bob_cp1: CoinProofPublicValues = bincode::deserialize(bob_cp1_proof.public_values.as_slice()).expect("decode");
-    assert_eq!(bob_cp1.received_at, Some(1));
-    assert_eq!(bob_cp1.spent, false);
-    prove_stats.push(ProveStats { name: "Bob coin-proof step 1 (recursive)", board_size: 2, prove_secs, verify_ms, entry_bytes: None });
-    println!("  -> Bob coin-proof step 1 proved & verified ({prove_secs:.1} s, received_at={:?})", bob_cp1.received_at);
-
-    // -- Bob's spend (slot 2, recursive, anchor = entries[..2]) ---------------
-    println!("Proving Bob's spend...");
-    let mut stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &bob, cn_bob, &entries[..2], &chain[2].1, false, Some(&bob_cp1));
-    {
-        let SP1Proof::Compressed(inner) = bob_cp1_proof.proof.clone() else { panic!("compressed mode required") };
-        stdin.write_proof(*inner, coinproof_pk.verifying_key().vk.clone());
-    }
-    let t = Instant::now();
-    let bob_spend_proof = client.prove(&spend_pk, stdin).compressed().run().expect("failed to prove bob's spend");
-    let prove_secs = t.elapsed().as_secs_f64();
-    let t = Instant::now();
-    client.verify(&bob_spend_proof, spend_pk.verifying_key(), None).expect("failed to verify bob's spend");
-    let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let bob_spend_pv: ValidPublicValues = bincode::deserialize(bob_spend_proof.public_values.as_slice()).expect("decode");
-    assert_eq!(bob_spend_pv.board_root, merkle_root_of(&entries[..2]));
-    chain[2].1.spend_proof = bob_spend_proof.public_values.to_vec();
+    let pv: ValidPublicValues =
+        bincode::deserialize(proof.public_values.as_slice()).expect("decode");
+    assert_eq!(pv.board_root, merkle_root_of(&entries[..2]));
+    chain[2].1.spend_proof = proof.public_values.to_vec();
     entries[2] = encrypt_tx(&chain[2].1);
     let entry2_bytes = entries[2].ciphertext.len();
-    prove_stats.push(ProveStats { name: "Bob's spend (recursive)", board_size: 3, prove_secs, verify_ms, entry_bytes: Some(entry2_bytes) });
-    println!("  -> Bob's spend proved & verified ({prove_secs:.1} s)");
+    stats.push(ProveStats {
+        name: "Slot 2: Bob's spend (recursive)".into(),
+        board_size: 3,
+        prove_secs,
+        verify_ms,
+        entry_bytes: Some(entry2_bytes),
+    });
+    println!("  Proved & verified ({prove_secs:.1} s) — entry now {entry2_bytes} B");
 
-    println!("\nFull chain of {} transfers proved valid end-to-end.", chain.len());
-    print_prove_table(&prove_stats);
+    // All wallets scan slot 2
+    println!("--- Wallets scanning slot 2 ---");
+    alice_wallet.process_slot(
+        2,
+        &entries[..3],
+        &registry,
+        &coinproof_pk,
+        &coinproof_vkey,
+        &client,
+        &mut stats,
+    );
+    bob_wallet.process_slot(
+        2,
+        &entries[..3],
+        &registry,
+        &coinproof_pk,
+        &coinproof_vkey,
+        &client,
+        &mut stats,
+    );
+    carol_wallet.process_slot(
+        2,
+        &entries[..3],
+        &registry,
+        &coinproof_pk,
+        &coinproof_vkey,
+        &client,
+        &mut stats,
+    );
+
+    // =========================================================================
+    // Summary
+    // =========================================================================
+    println!("\n=== Wallet States ===");
+    alice_wallet.print_state();
+    bob_wallet.print_state();
+    carol_wallet.print_state();
+
+    print_prove_table(&stats);
 }
