@@ -223,7 +223,13 @@ impl<'a> Wallet<'a> {
             );
             stdin.write_proof(*inner_c, coinproof_pk.verifying_key().vk.clone());
 
-            let label = format!("{} coin-proof slot {} (bootstrap)", self.party.name, s);
+            // Last slot is where the coin was received; prior slots are just
+            // building the IVC chain through history where the coin didn't exist yet.
+            let label = if s == up_to_slot {
+                format!("{} coin-proof slot {} (received)", self.party.name, s)
+            } else {
+                format!("{} coin-proof slot {} (scanning)", self.party.name, s)
+            };
             let record = self.run_coinproof_step(stdin, &label, s + 1, coinproof_pk, client, stats);
             self.coins.insert(cn, record);
         }
