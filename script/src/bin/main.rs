@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use clap::Parser;
 use cloakkchain_lib::{
-    derive_pk, encrypt_tx, genesis_pk, merkle_root_of, BoardEntry, Coin,
+    append_proof_for, derive_pk, encrypt_tx, genesis_pk, merkle_root_of, BoardEntry, Coin,
     CoinProofPublicValues, Transaction, ValidPublicValues, GENESIS_SK,
 };
 use sp1_sdk::{
@@ -216,14 +216,17 @@ fn demo_chain<'a>(
 
 // ---- stdin builders ---------------------------------------------------------
 
-/// Build the SP1Stdin for one step of the coin-proof relation, covering
-/// `entries` (= `entries[0..=k]`). `inner` is the previous step's public
-/// values, or `None` for the base case (`k == 0`).
+/// Build the SP1Stdin for one step of the coin-proof relation at `slot`.
+/// Only `entry_k` (the new entry) and its `append_path` are passed — no full
+/// history. `inner` is the previous step's public values, or `None` for the
+/// base case (`slot == 0`).
 fn build_coinproof_stdin(
     coinproof_vkey: &[u32; 8],
     owner_pk: [u8; 32],
     coin_commitment: [u8; 32],
-    entries: &[BoardEntry],
+    entry_k: &BoardEntry,
+    slot: usize,
+    append_path: &[[u8; 32]],
     registry: &[[u8; 32]],
     inner: Option<&CoinProofPublicValues>,
 ) -> SP1Stdin {
@@ -231,7 +234,9 @@ fn build_coinproof_stdin(
     stdin.write(coinproof_vkey);
     stdin.write(&owner_pk);
     stdin.write(&coin_commitment);
-    stdin.write(&entries.to_vec());
+    stdin.write(entry_k);
+    stdin.write(&slot);
+    stdin.write(&append_path.to_vec());
     stdin.write(&registry.to_vec());
     stdin.write(&inner.is_some());
     if let Some(pv) = inner {
@@ -321,7 +326,8 @@ fn main() {
         exec_stats.push(ExecStats { name: "Genesis mint (spend)", board_size: 1, exec_ms, cycles: report.total_instruction_count() });
 
         // Alice's coin-proof step 0: she received her 100-unit coin at slot 0.
-        let stdin = build_coinproof_stdin(&coinproof_vkey, alice.pk, cn_alice, &entries[..1], &registry, None);
+        let ap0 = append_proof_for(&entries[..1]);
+        let stdin = build_coinproof_stdin(&coinproof_vkey, alice.pk, cn_alice, &entries[0], 0, &ap0, &registry, None);
         let t = Instant::now();
         let (output, report) = client.execute(CLOAKKCHAIN_COINPROOF_ELF, stdin).run().unwrap();
         let exec_ms = t.elapsed().as_millis();
@@ -332,7 +338,7 @@ fn main() {
         exec_stats.push(ExecStats { name: "Alice coin-proof step 0", board_size: 1, exec_ms, cycles: report.total_instruction_count() });
 
         // Bob's coin-proof step 0: slot 0 isn't his.
-        let stdin = build_coinproof_stdin(&coinproof_vkey, bob.pk, cn_bob, &entries[..1], &registry, None);
+        let stdin = build_coinproof_stdin(&coinproof_vkey, bob.pk, cn_bob, &entries[0], 0, &ap0, &registry, None);
         let t = Instant::now();
         let (output, report) = client.execute(CLOAKKCHAIN_COINPROOF_ELF, stdin).run().unwrap();
         let exec_ms = t.elapsed().as_millis();
@@ -378,7 +384,8 @@ fn main() {
 
     // -- Alice coin-proof step 0 (base case) ----------------------------------
     println!("Proving Alice's coin-proof step 0...");
-    let stdin = build_coinproof_stdin(&coinproof_vkey, alice.pk, cn_alice, &entries[..1], &registry, None);
+    let ap0 = append_proof_for(&entries[..1]);
+    let stdin = build_coinproof_stdin(&coinproof_vkey, alice.pk, cn_alice, &entries[0], 0, &ap0, &registry, None);
     let t = Instant::now();
     let alice_cp0_proof = client.prove(&coinproof_pk, stdin).compressed().run().expect("failed to prove alice cp0");
     let prove_secs = t.elapsed().as_secs_f64();
@@ -414,7 +421,7 @@ fn main() {
 
     // -- Bob coin-proof step 0 (base case, slot 0 is not his) -----------------
     println!("Proving Bob's coin-proof step 0...");
-    let stdin = build_coinproof_stdin(&coinproof_vkey, bob.pk, cn_bob, &entries[..1], &registry, None);
+    let stdin = build_coinproof_stdin(&coinproof_vkey, bob.pk, cn_bob, &entries[0], 0, &ap0, &registry, None);
     let t = Instant::now();
     let bob_cp0_proof = client.prove(&coinproof_pk, stdin).compressed().run().expect("failed to prove bob cp0");
     let prove_secs = t.elapsed().as_secs_f64();
@@ -428,7 +435,8 @@ fn main() {
 
     // -- Bob coin-proof step 1 (recursive, he received his coin here) ---------
     println!("Proving Bob's coin-proof step 1...");
-    let mut stdin = build_coinproof_stdin(&coinproof_vkey, bob.pk, cn_bob, &entries[..2], &registry, Some(&bob_cp0));
+    let ap1 = append_proof_for(&entries[..2]);
+    let mut stdin = build_coinproof_stdin(&coinproof_vkey, bob.pk, cn_bob, &entries[1], 1, &ap1, &registry, Some(&bob_cp0));
     {
         let SP1Proof::Compressed(inner) = bob_cp0_proof.proof.clone() else { panic!("compressed mode required") };
         stdin.write_proof(*inner, coinproof_pk.verifying_key().vk.clone());

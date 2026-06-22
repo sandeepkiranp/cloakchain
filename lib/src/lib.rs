@@ -209,27 +209,29 @@ pub fn scan_entry(
     None
 }
 
-// ---- Merkle tree over board entries ------------------------------------
+// ---- Fixed-depth Merkle tree over board entries ------------------------
 //
-// The prover can't be trusted to supply a genuine, complete copy of the
-// bulletin board — they could omit slots where they previously spent a coin.
-// The fix:
+// The tree has a fixed depth of TREE_DEPTH (supporting up to 2^TREE_DEPTH
+// entries). Unfilled leaf positions are treated as the zero byte array [0u8;32].
+// This lets each IVC coin-proof step update the root in O(TREE_DEPTH) = O(1)
+// time using a single Merkle inclusion (append) proof, rather than O(n) by
+// recomputing the root from all prior entries.
 //
-//   1. The Merkle root of the complete board is a PUBLIC output, committed in
-//      the proof. Carol independently computes her own root from the real
-//      board (the real ciphertexts) and checks it matches. This guarantees the
-//      prover used the genuine, complete board.
+// Key property: if `append_path` is the inclusion proof for slot k in the
+// fixed-depth tree containing entries[0..=k], then:
 //
-//   2. Each board entry the prover witnesses is accompanied by its Merkle
-//      inclusion proof (a log-T-length chain of sibling hashes from the leaf
-//      to the root), verified in-circuit, tying the witnessed ciphertext to
-//      the committed root.
+//   compute_root_from_path([0u8;32], k, &append_path)  == root_{k-1}  (old root)
+//   compute_root_from_path(merkle_leaf(k, e_k), k, &append_path) == root_k (new root)
+//
+// Only the leaf value changes between the two computations; the path is the
+// same. This lets the IVC step verify consistency with the prior root AND
+// compute the new root in a single O(TREE_DEPTH) pass.
 
-/// Leaf hash = SHA256(slot_as_u64_le || ciphertext).
-/// The ciphertext already contains the proof (inside the encrypted
-/// `Transaction.spend_proof`), so this naturally covers everything once the
-/// proof is attached and the entry is re-encrypted. The slot index prevents
-/// permuting genuine entries across slots while keeping a valid root.
+/// Maximum tree depth. Supports up to 2^32 ≈ 4 billion board entries.
+pub const TREE_DEPTH: usize = 32;
+
+/// Leaf hash = SHA256(slot_as_u64_le || ciphertext). Including the slot index
+/// prevents permuting entries while keeping a valid root.
 pub fn merkle_leaf(slot: usize, entry: &BoardEntry) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update((slot as u64).to_le_bytes());
@@ -248,73 +250,92 @@ fn merkle_combine(l: &[u8; 32], r: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-fn next_pow2(n: usize) -> usize {
-    if n <= 1 {
-        return 1;
+/// Precomputed hashes of empty subtrees at each depth.
+/// `zero_hashes()[d]` = root of a complete subtree of depth `d` with all
+/// leaves equal to [0u8;32].
+fn zero_hashes() -> Vec<[u8; 32]> {
+    let mut out = vec![[0u8; 32]]; // depth 0: the zero leaf itself
+    for _ in 0..TREE_DEPTH {
+        let prev = *out.last().unwrap();
+        out.push(merkle_combine(&prev, &prev));
     }
-    let mut p = 1usize;
-    while p < n {
-        p <<= 1;
-    }
-    p
+    out
 }
 
-/// Build the complete Merkle tree over `leaves`.
-/// Returns all levels: index 0 = leaf level, last index = [root].
-/// Padded with [0u8;32] to the next power of 2.
-fn build_tree(leaves: &[[u8; 32]]) -> Vec<Vec<[u8; 32]>> {
-    let n = next_pow2(leaves.len().max(1));
-    let mut level = leaves.to_vec();
-    level.resize(n, [0u8; 32]);
-    let mut levels = vec![level.clone()];
-    while level.len() > 1 {
-        let next: Vec<[u8; 32]> = level
-            .chunks(2)
-            .map(|pair| merkle_combine(&pair[0], &pair[1]))
-            .collect();
-        levels.push(next.clone());
-        level = next;
-    }
-    levels
+/// Root of the empty fixed-depth tree (all leaves = [0u8;32]).
+pub fn empty_root() -> [u8; 32] {
+    zero_hashes()[TREE_DEPTH]
 }
 
-/// Compute the Merkle root of `entries` at consecutive slots 0..T-1.
-pub fn merkle_root_of(entries: &[BoardEntry]) -> [u8; 32] {
-    let leaves: Vec<[u8; 32]> =
-        entries.iter().enumerate().map(|(i, e)| merkle_leaf(i, e)).collect();
-    let tree = build_tree(&leaves);
-    tree.last().unwrap()[0]
-}
-
-/// Generate the Merkle inclusion proof (sibling hashes leaf→root) for `slot`
-/// in the tree over `entries`.
-pub fn merkle_proof_for(entries: &[BoardEntry], slot: usize) -> Vec<[u8; 32]> {
-    let leaves: Vec<[u8; 32]> =
-        entries.iter().enumerate().map(|(i, e)| merkle_leaf(i, e)).collect();
-    let tree = build_tree(&leaves);
-    let mut proof = Vec::new();
+/// Walk the path from `leaf` at `slot` to the root. Used by both
+/// `merkle_root_of` and `check_coin_proof_step`.
+pub fn compute_root_from_path(leaf: [u8; 32], slot: usize, path: &[[u8; 32]]) -> [u8; 32] {
+    let mut current = leaf;
     let mut idx = slot;
-    for level in &tree[..tree.len() - 1] {
-        let sibling = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
-        proof.push(level[sibling]);
-        idx /= 2;
-    }
-    proof
-}
-
-/// Verify that `entry` at `slot` is a member of the tree with the given `root`.
-pub fn merkle_verify(root: [u8; 32], slot: usize, entry: &BoardEntry, proof: &[[u8; 32]]) -> bool {
-    let mut current = merkle_leaf(slot, entry);
-    let mut idx = slot;
-    for sibling in proof {
+    for sibling in path {
         current = if idx % 2 == 0 {
             merkle_combine(&current, sibling)
         } else {
             merkle_combine(sibling, &current)
         };
-        idx /= 2;
+        idx >>= 1;
     }
-    current == root
+    current
+}
+
+/// Compute the Merkle root of a fixed-depth tree containing `entries` at
+/// slots 0..T and [0u8;32] at all other leaf positions.
+pub fn merkle_root_of(entries: &[BoardEntry]) -> [u8; 32] {
+    if entries.is_empty() {
+        return empty_root();
+    }
+    let last = entries.len() - 1;
+    let path = append_proof_for(entries);
+    compute_root_from_path(merkle_leaf(last, &entries[last]), last, &path)
+}
+
+/// Inclusion proof for `slot` in the fixed-depth tree over `entries`.
+/// At each level the sibling is either the real hash of the adjacent subtree
+/// (if it was already filled by prior entries) or the zero-subtree hash.
+pub fn append_proof_for(entries: &[BoardEntry]) -> Vec<[u8; 32]> {
+    let slot = entries.len() - 1;
+    let zeros = zero_hashes();
+    let mut path = Vec::with_capacity(TREE_DEPTH);
+
+    // Build the filled portion of the current level from real entries.
+    let mut level: Vec<[u8; 32]> = entries.iter().enumerate()
+        .map(|(i, e)| merkle_leaf(i, e))
+        .collect();
+
+    let mut idx = slot;
+    for d in 0..TREE_DEPTH {
+        let sibling_idx = idx ^ 1;
+        let sibling = if sibling_idx < level.len() {
+            level[sibling_idx]
+        } else {
+            zeros[d] // unfilled subtree — use the zero hash for this depth
+        };
+        path.push(sibling);
+
+        // Collapse current level to the next level up.
+        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        let mut i = 0;
+        while i < level.len() {
+            let left = level[i];
+            let right = if i + 1 < level.len() { level[i + 1] } else { zeros[d] };
+            next.push(merkle_combine(&left, &right));
+            i += 2;
+        }
+        level = next;
+        idx >>= 1;
+    }
+    path
+}
+
+/// Verify that `entry` is the genuine content of `slot` in a fixed-depth tree
+/// with the given `root`.
+pub fn merkle_verify(root: [u8; 32], slot: usize, entry: &BoardEntry, proof: &[[u8; 32]]) -> bool {
+    compute_root_from_path(merkle_leaf(slot, entry), slot, proof) == root
 }
 
 // ---- Public values -------------------------------------------------------
@@ -380,27 +401,34 @@ pub enum CoinProofJustification {
     Step { inner_public_values: CoinProofPublicValues },
 }
 
-/// One step of the coin-proof IVC: extend the previous step's public values
-/// (covering `entries[0..k]`) to cover `entries[0..=k]`.
+/// One step of the coin-proof IVC, extended for slot `slot` (= k).
 ///
-/// `registry` is the set of all known parties' public keys (excluding
-/// `owner_pk` is not required — it is skipped automatically). The relation
-/// scans `entries[k]` against every other registry member; see [`scan_entry`].
+/// Instead of receiving all prior entries and recomputing the root in O(n),
+/// this step receives only:
+///   - `entry_k`: the single new board entry at position `slot`
+///   - `append_path`: its Merkle inclusion proof in the fixed-depth tree
+///     (TREE_DEPTH sibling hashes, leaf → root)
+///
+/// The root is updated in O(TREE_DEPTH) = O(1):
+///   old root = compute_root_from_path([0u8;32],    slot, &append_path)
+///   new root = compute_root_from_path(leaf_k,      slot, &append_path)
+///
+/// The inner proof's `board_root` is verified against the old root, binding
+/// the chain to a genuine board history without passing all prior entries.
 pub fn check_coin_proof_step(
     vkey: [u32; 8],
     owner_pk: [u8; 32],
     coin_commitment: [u8; 32],
-    entries: Vec<BoardEntry>,
+    entry_k: BoardEntry,
+    slot: usize,
+    append_path: Vec<[u8; 32]>,
     registry: Vec<[u8; 32]>,
     inner: Option<CoinProofPublicValues>,
 ) -> Result<(CoinProofPublicValues, CoinProofJustification), &'static str> {
-    if entries.is_empty() {
-        return Err("coin-proof must cover at least one board slot");
-    }
-    let k = entries.len() - 1;
-    let board_root = merkle_root_of(&entries);
+    let leaf_k = merkle_leaf(slot, &entry_k);
+    let board_root = compute_root_from_path(leaf_k, slot, &append_path);
 
-    let (prev_received_at, prev_spent, justification) = if k == 0 {
+    let (prev_received_at, prev_spent, justification) = if slot == 0 {
         (None, false, CoinProofJustification::Base)
     } else {
         let inner = inner.ok_or("steps after the base case require an inner coin-proof")?;
@@ -413,10 +441,13 @@ pub fn check_coin_proof_step(
         if inner.coin_commitment != coin_commitment {
             return Err("inner coin-proof tracks a different coin");
         }
-        if inner.board_size != k {
+        if inner.board_size != slot {
             return Err("inner coin-proof must cover exactly the prefix before this slot");
         }
-        if inner.board_root != merkle_root_of(&entries[..k]) {
+        // Verify the append_path is consistent with the inner proof's root:
+        // the old root is what you get from the same path with a zero leaf at slot.
+        let old_root = compute_root_from_path([0u8; 32], slot, &append_path);
+        if inner.board_root != old_root {
             return Err("inner coin-proof's board root does not match this prefix");
         }
         let prev_received_at = inner.received_at;
@@ -426,9 +457,9 @@ pub fn check_coin_proof_step(
 
     let mut received_at = prev_received_at;
     let mut spent = prev_spent;
-    if let Some(tx) = scan_entry(&owner_pk, &registry, &entries[k]) {
+    if let Some(tx) = scan_entry(&owner_pk, &registry, &entry_k) {
         if tx.receives_coin(&owner_pk, &coin_commitment) && received_at.is_none() {
-            received_at = Some(k as u64);
+            received_at = Some(slot as u64);
         }
         if tx.spends_coin(&owner_pk, &coin_commitment) {
             spent = true;
@@ -441,7 +472,7 @@ pub fn check_coin_proof_step(
             owner_pk,
             coin_commitment,
             board_root,
-            board_size: k + 1,
+            board_size: slot + 1,
             received_at,
             spent,
         },
@@ -578,11 +609,14 @@ mod tests {
         let mut out = Vec::new();
         let mut inner = None;
         for k in 0..entries.len() {
+            let append_path = append_proof_for(&entries[..=k]);
             let (pv, _) = check_coin_proof_step(
                 TEST_COIN_PROOF_VKEY,
                 owner_pk,
                 coin_commitment,
-                entries[..=k].to_vec(),
+                entries[k].clone(),
+                k,
+                append_path,
                 registry.to_vec(),
                 inner.clone(),
             )
