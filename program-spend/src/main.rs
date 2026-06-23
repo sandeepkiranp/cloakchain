@@ -15,7 +15,7 @@
 #![no_main]
 sp1_zkvm::entrypoint!(main);
 
-use cloakkchain_lib::{check_spend, BoardEntry, CoinProofPublicValues, Transaction};
+use cloakkchain_lib::{check_spend, BoardEntry, Coin, CoinProofPublicValues, Transaction};
 use sha2::{Digest, Sha256};
 
 pub fn main() {
@@ -26,6 +26,8 @@ pub fn main() {
     let coin_commitment: [u8; 32] = sp1_zkvm::io::read();
     let prior_entries: Vec<BoardEntry> = sp1_zkvm::io::read();
     let tx_star: Transaction = sp1_zkvm::io::read();
+    let input_coins: Vec<Coin> = sp1_zkvm::io::read();
+    let output_coins: Vec<Coin> = sp1_zkvm::io::read();
     let is_genesis: bool = sp1_zkvm::io::read();
     let coin_proof: Option<CoinProofPublicValues> =
         if is_genesis { None } else { Some(sp1_zkvm::io::read()) };
@@ -38,6 +40,8 @@ pub fn main() {
         coin_commitment,
         prior_entries,
         tx_star,
+        input_coins,
+        output_coins,
         is_genesis,
         coin_proof.clone(),
     )
