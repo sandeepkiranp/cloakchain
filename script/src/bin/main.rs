@@ -87,6 +87,7 @@ impl<'a> Wallet<'a> {
         coinproof_vkey: &[u32; 8],
         client: &C,
         stats: &mut Vec<ProveStats>,
+        proof_registry: &[Option<SP1ProofWithPublicValues>],
     ) {
         assert_eq!(all_entries.len(), slot + 1);
         let entry = &all_entries[slot];
@@ -118,8 +119,9 @@ impl<'a> Wallet<'a> {
                     if !self.coins.contains_key(&cn) {
                         println!("  [{}] discovered coin (value={}) at slot {} — bootstrapping",
                             self.party.name, note_coin.value, slot);
+                        let receipt_proof = proof_registry.get(slot).and_then(|p| p.as_ref());
                         self.bootstrap(cn, slot, all_entries, registry, spend_pk, coinproof_pk,
-                            spend_vkey, coinproof_vkey, client, stats);
+                            spend_vkey, coinproof_vkey, client, stats, receipt_proof);
                     }
                 }
             }
@@ -138,6 +140,10 @@ impl<'a> Wallet<'a> {
         coinproof_vkey: &[u32; 8],
         client: &C,
         stats: &mut Vec<ProveStats>,
+        // Proof for the slot that created this coin — passed directly from the
+        // script's proof registry to avoid embedding large proof bytes in the
+        // encrypted board entry (which would balloon entry sizes to ~1 MB).
+        receipt_proof: Option<&SP1ProofWithPublicValues>,
     ) {
         let ap0 = append_proof_for(&all_entries[..1]);
         let stdin = build_coinproof_stdin(
@@ -158,20 +164,13 @@ impl<'a> Wallet<'a> {
             );
             stdin.write_proof(*inner_c, coinproof_pk.verifying_key().vk.clone());
 
-            // At the receipt slot, also write the spend proof so program-coinproof
-            // can verify in-circuit that the creating transaction was authorised.
+            // At the receipt slot, write the spend proof for in-circuit verification.
+            // The proof comes from the script's proof registry (not the board entry)
+            // to avoid storing large proof bytes (~1 MB) inside the transaction.
             if s == up_to_slot {
-                if let Some(tx) = lib_scan_entry(&self.party.pk, registry, &all_entries[s]) {
-                    if let Ok((_, full_bytes)) =
-                        bincode::deserialize::<(Vec<u8>, Vec<u8>)>(&tx.spend_proof)
-                    {
-                        if let Ok(spend_proof) =
-                            bincode::deserialize::<SP1ProofWithPublicValues>(&full_bytes)
-                        {
-                            if let SP1Proof::Compressed(inner_spend) = spend_proof.proof {
-                                stdin.write_proof(*inner_spend, spend_pk.verifying_key().vk.clone());
-                            }
-                        }
+                if let Some(proof) = receipt_proof {
+                    if let SP1Proof::Compressed(inner_spend) = proof.proof.clone() {
+                        stdin.write_proof(*inner_spend, spend_pk.verifying_key().vk.clone());
                     }
                 }
             }
@@ -330,17 +329,6 @@ fn build_spend_stdin(
     stdin
 }
 
-/// Encode a spend proof for storage in `tx.spend_proof`.
-/// Stores a bincode tuple `(pv_bytes, full_proof_bytes)` so that:
-/// - The zkVM can extract `pv_bytes` (ValidPublicValues) to compute the digest
-///   for `verify_sp1_proof` inside `program-coinproof`.
-/// - The host wallet can extract `full_proof_bytes` to call `stdin.write_proof`
-///   when building the coinproof stdin for a receipt step.
-fn encode_spend_proof(proof: &SP1ProofWithPublicValues) -> Vec<u8> {
-    let pv_bytes = proof.public_values.as_slice().to_vec();
-    let full_bytes = bincode::serialize(proof).expect("serialize spend proof");
-    bincode::serialize(&(pv_bytes, full_bytes)).expect("encode spend proof tuple")
-}
 
 // ---- main -------------------------------------------------------------------
 
@@ -435,6 +423,10 @@ fn main() {
     let mut bob_wallet   = Wallet::new(&bob);
     let mut carol_wallet = Wallet::new(&carol);
     let mut stats: Vec<ProveStats> = Vec::new();
+    // proof_registry[slot] = the spend proof for that board slot, used by
+    // wallets to write_proof for the receipt step without embedding large
+    // proof bytes (~1 MB) in the encrypted transaction.
+    let mut proof_registry: Vec<Option<SP1ProofWithPublicValues>> = vec![];
 
     // =========================================================================
     // Slot 0: genesis mints 100 units to Alice
@@ -443,22 +435,23 @@ fn main() {
     let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn_genesis,
         &entries[..0], &tx0, &[genesis_coin.clone()], &[alice_coin.clone()], true, None);
     let t = Instant::now();
-    let proof = client.prove(&spend_pk, stdin).compressed().run().expect("genesis prove");
+    let genesis_proof = client.prove(&spend_pk, stdin).compressed().run().expect("genesis prove");
     let prove_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
-    client.verify(&proof, spend_pk.verifying_key(), None).expect("genesis verify");
+    client.verify(&genesis_proof, spend_pk.verifying_key(), None).expect("genesis verify");
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let pv: ValidPublicValues = bincode::deserialize(proof.public_values.as_slice()).expect("decode");
+    let pv: ValidPublicValues = bincode::deserialize(genesis_proof.public_values.as_slice()).expect("decode");
     assert_eq!(pv.board_root, merkle_root_of(&entries[..0]));
-    tx0.spend_proof = encode_spend_proof(&proof); entries[0] = encrypt_tx(&tx0);
+    tx0.spend_proof = genesis_proof.public_values.to_vec(); entries[0] = encrypt_tx(&tx0);
+    proof_registry.push(Some(genesis_proof));
     let e0_bytes = entries[0].ciphertext.len();
     stats.push(ProveStats { name: "Slot 0: genesis mint".into(), board_size: 1, prove_secs, verify_ms, entry_bytes: Some(e0_bytes) });
     println!("  Proved & verified ({prove_secs:.1} s) — entry now {e0_bytes} B");
 
     println!("--- Wallets scanning slot 0 ---");
-    alice_wallet.process_slot(0, &entries[..1], &registry, &spend_pk, &coinproof_pk, &spend_vkey, &coinproof_vkey, &client, &mut stats);
-    bob_wallet.process_slot(0, &entries[..1], &registry, &spend_pk, &coinproof_pk, &spend_vkey, &coinproof_vkey, &client, &mut stats);
-    carol_wallet.process_slot(0, &entries[..1], &registry, &spend_pk, &coinproof_pk, &spend_vkey, &coinproof_vkey, &client, &mut stats);
+    alice_wallet.process_slot(0, &entries[..1], &registry, &spend_pk, &coinproof_pk, &spend_vkey, &coinproof_vkey, &client, &mut stats, &proof_registry);
+    bob_wallet.process_slot(0, &entries[..1], &registry, &spend_pk, &coinproof_pk, &spend_vkey, &coinproof_vkey, &client, &mut stats, &proof_registry);
+    carol_wallet.process_slot(0, &entries[..1], &registry, &spend_pk, &coinproof_pk, &spend_vkey, &coinproof_vkey, &client, &mut stats, &proof_registry);
 
     // =========================================================================
     // Slot 1: Alice sends 40 to Bob + 60 change to herself (1 input → 2 outputs)
@@ -474,22 +467,23 @@ fn main() {
         stdin.write_proof(*inner, coinproof_pk.verifying_key().vk.clone());
     }
     let t = Instant::now();
-    let proof = client.prove(&spend_pk, stdin).compressed().run().expect("alice spend prove");
+    let alice_spend_proof = client.prove(&spend_pk, stdin).compressed().run().expect("alice spend prove");
     let prove_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
-    client.verify(&proof, spend_pk.verifying_key(), None).expect("alice spend verify");
+    client.verify(&alice_spend_proof, spend_pk.verifying_key(), None).expect("alice spend verify");
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let pv: ValidPublicValues = bincode::deserialize(proof.public_values.as_slice()).expect("decode");
+    let pv: ValidPublicValues = bincode::deserialize(alice_spend_proof.public_values.as_slice()).expect("decode");
     assert_eq!(pv.board_root, merkle_root_of(&entries[..1]));
-    tx1.spend_proof = encode_spend_proof(&proof); entries[1] = encrypt_tx(&tx1);
+    tx1.spend_proof = alice_spend_proof.public_values.to_vec(); entries[1] = encrypt_tx(&tx1);
+    proof_registry.push(Some(alice_spend_proof));
     let e1_bytes = entries[1].ciphertext.len();
     stats.push(ProveStats { name: "Slot 1: Alice's spend (recursive)".into(), board_size: 2, prove_secs, verify_ms, entry_bytes: Some(e1_bytes) });
     println!("  Proved & verified ({prove_secs:.1} s) — entry now {e1_bytes} B");
 
     println!("--- Wallets scanning slot 1 ---");
-    alice_wallet.process_slot(1, &entries[..2], &registry, &spend_pk, &coinproof_pk, &spend_vkey, &coinproof_vkey, &client, &mut stats);
-    bob_wallet.process_slot(1, &entries[..2], &registry, &spend_pk, &coinproof_pk, &spend_vkey, &coinproof_vkey, &client, &mut stats);
-    carol_wallet.process_slot(1, &entries[..2], &registry, &spend_pk, &coinproof_pk, &spend_vkey, &coinproof_vkey, &client, &mut stats);
+    alice_wallet.process_slot(1, &entries[..2], &registry, &spend_pk, &coinproof_pk, &spend_vkey, &coinproof_vkey, &client, &mut stats, &proof_registry);
+    bob_wallet.process_slot(1, &entries[..2], &registry, &spend_pk, &coinproof_pk, &spend_vkey, &coinproof_vkey, &client, &mut stats, &proof_registry);
+    carol_wallet.process_slot(1, &entries[..2], &registry, &spend_pk, &coinproof_pk, &spend_vkey, &coinproof_vkey, &client, &mut stats, &proof_registry);
 
     // =========================================================================
     // Slot 2: Bob sends 40 to Carol (1 input → 1 output)
@@ -505,22 +499,23 @@ fn main() {
         stdin.write_proof(*inner, coinproof_pk.verifying_key().vk.clone());
     }
     let t = Instant::now();
-    let proof = client.prove(&spend_pk, stdin).compressed().run().expect("bob spend prove");
+    let bob_spend_proof = client.prove(&spend_pk, stdin).compressed().run().expect("bob spend prove");
     let prove_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
-    client.verify(&proof, spend_pk.verifying_key(), None).expect("bob spend verify");
+    client.verify(&bob_spend_proof, spend_pk.verifying_key(), None).expect("bob spend verify");
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let pv: ValidPublicValues = bincode::deserialize(proof.public_values.as_slice()).expect("decode");
+    let pv: ValidPublicValues = bincode::deserialize(bob_spend_proof.public_values.as_slice()).expect("decode");
     assert_eq!(pv.board_root, merkle_root_of(&entries[..2]));
-    tx2.spend_proof = encode_spend_proof(&proof); entries[2] = encrypt_tx(&tx2);
+    tx2.spend_proof = bob_spend_proof.public_values.to_vec(); entries[2] = encrypt_tx(&tx2);
+    proof_registry.push(Some(bob_spend_proof));
     let e2_bytes = entries[2].ciphertext.len();
     stats.push(ProveStats { name: "Slot 2: Bob's spend (recursive)".into(), board_size: 3, prove_secs, verify_ms, entry_bytes: Some(e2_bytes) });
     println!("  Proved & verified ({prove_secs:.1} s) — entry now {e2_bytes} B");
 
     println!("--- Wallets scanning slot 2 ---");
-    alice_wallet.process_slot(2, &entries[..3], &registry, &spend_pk, &coinproof_pk, &spend_vkey, &coinproof_vkey, &client, &mut stats);
-    bob_wallet.process_slot(2, &entries[..3], &registry, &spend_pk, &coinproof_pk, &spend_vkey, &coinproof_vkey, &client, &mut stats);
-    carol_wallet.process_slot(2, &entries[..3], &registry, &spend_pk, &coinproof_pk, &spend_vkey, &coinproof_vkey, &client, &mut stats);
+    alice_wallet.process_slot(2, &entries[..3], &registry, &spend_pk, &coinproof_pk, &spend_vkey, &coinproof_vkey, &client, &mut stats, &proof_registry);
+    bob_wallet.process_slot(2, &entries[..3], &registry, &spend_pk, &coinproof_pk, &spend_vkey, &coinproof_vkey, &client, &mut stats, &proof_registry);
+    carol_wallet.process_slot(2, &entries[..3], &registry, &spend_pk, &coinproof_pk, &spend_vkey, &coinproof_vkey, &client, &mut stats, &proof_registry);
 
     println!("\n=== Wallet States ===");
     alice_wallet.print_state();
