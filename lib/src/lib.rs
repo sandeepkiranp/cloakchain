@@ -446,6 +446,10 @@ pub enum CoinProofJustification {
 ///
 /// The inner proof's `board_root` is verified against the old root, binding
 /// the chain to a genuine board history without passing all prior entries.
+/// Third return value: when `received_at` is newly set in this step, returns the
+/// `ValidPublicValues` bytes from the transaction's `spend_proof` field so that
+/// `program-coinproof` can verify the spend proof in-circuit — confirming the
+/// transaction that created this coin had a valid, authorised spend behind it.
 pub fn check_coin_proof_step(
     vkey: [u32; 8],
     owner_pk: [u8; 32],
@@ -455,7 +459,7 @@ pub fn check_coin_proof_step(
     append_path: Vec<[u8; 32]>,
     registry: Vec<[u8; 32]>,
     inner: Option<CoinProofPublicValues>,
-) -> Result<(CoinProofPublicValues, CoinProofJustification), &'static str> {
+) -> Result<(CoinProofPublicValues, CoinProofJustification, Option<Vec<u8>>), &'static str> {
     let leaf_k = merkle_leaf(slot, &entry_k);
     let board_root = compute_root_from_path(leaf_k, slot, &append_path);
 
@@ -488,9 +492,20 @@ pub fn check_coin_proof_step(
 
     let mut received_at = prev_received_at;
     let mut spent = prev_spent;
+    let mut receipt_spend_pv: Option<Vec<u8>> = None;
+
     if let Some(tx) = scan_entry(&owner_pk, &registry, &entry_k) {
         if tx.receives_coin(&owner_pk, &coin_commitment) && received_at.is_none() {
             received_at = Some(slot as u64);
+            // Capture the spend proof's ValidPublicValues bytes so program-coinproof
+            // can verify in-circuit that the transaction creating this coin was
+            // backed by a genuine, authorised spend proof.
+            // tx.spend_proof stores (pv_bytes, full_proof_bytes) as a bincode tuple;
+            // extract just the pv_bytes needed for the in-circuit digest.
+            receipt_spend_pv = bincode::deserialize::<(Vec<u8>, Vec<u8>)>(&tx.spend_proof)
+                .ok()
+                .map(|(pv, _)| pv)
+                .filter(|b| !b.is_empty());
         }
         if tx.spends_coin(&owner_pk, &coin_commitment) {
             spent = true;
@@ -508,6 +523,7 @@ pub fn check_coin_proof_step(
             spent,
         },
         justification,
+        receipt_spend_pv,
     ))
 }
 
@@ -663,7 +679,7 @@ mod tests {
         let mut inner = None;
         for k in 0..entries.len() {
             let ap = append_proof_for(&entries[..=k]);
-            let (pv, _) = check_coin_proof_step(
+            let (pv, _, _) = check_coin_proof_step(
                 TEST_COIN_PROOF_VKEY, owner_pk, coin_commitment,
                 entries[k].clone(), k, ap, registry.to_vec(), inner.clone(),
             ).unwrap();
