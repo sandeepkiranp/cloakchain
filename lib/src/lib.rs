@@ -43,48 +43,37 @@ impl Coin {
 /// A generalised transaction: `S` spends one or more input coins and creates
 /// one or more output coins for (potentially different) recipients.
 ///
-/// Only **commitments** appear in the transaction body — the actual coin data
-/// (`tag`, `value`, `rand`) for each output is encrypted separately in
-/// `note_encs[i]` using `pair_key(sender_pk, recipient_pks[i])`, so that each
-/// recipient can only read their own coin's value and not the others'.
+/// Only **commitments** appear in the transaction body. Sender and recipient
+/// identities are NOT stored — the sender is proven via `input_nullifier` and
+/// recipient ownership is encoded inside each coin commitment (`H(tag||v||r||pk)`).
+/// Each output's coin data is encrypted in `note_encs[i]` per recipient.
 ///
 /// `spend_proof` is attached after proving and the whole struct re-encrypted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     pub id: u64,
-    pub sender_pk: [u8; 32],
-    /// One entry per output coin; sender appears here for change outputs.
-    pub recipient_pks: Vec<[u8; 32]>,
-    /// Commitments to the coins being spent (`input_coins[i].commitment()`).
+    /// Commitments to the coins being spent.
     pub input_commitments: Vec<[u8; 32]>,
-    /// Commitments to the new coins (`output_coins[i].commitment()`),
-    /// matching `recipient_pks` index-for-index.
+    /// Commitments to the new coins (same index as note_encs).
     pub output_commitments: Vec<[u8; 32]>,
-    /// `note_encs[i]` = `encrypt(output_coin_i, pair_key(sender, recipient_pks[i]))`.
-    /// Only `recipient_pks[i]` (or the sender, who knows all keys) can decrypt.
+    /// `note_encs[i]` = `encrypt(output_coin_i, pair_key(sender, recipient_i))`.
     pub note_encs: Vec<Vec<u8>>,
+    /// `H(primary_input_commitment || sk_spender)` — proves sender identity
+    /// without storing sender_pk; also serves as the double-spend nullifier.
+    pub input_nullifier: [u8; 32],
     pub spend_proof: Vec<u8>,
 }
 
 impl Transaction {
-    pub fn sent_by(&self, pk: &[u8; 32]) -> bool {
-        &self.sender_pk == pk
-    }
-    pub fn received_by(&self, pk: &[u8; 32]) -> bool {
-        self.recipient_pks.contains(pk)
-    }
-
-    /// `pk` receives the coin with commitment `cn` in this tx if any
-    /// `(recipient_pks[i], output_commitments[i])` pair matches `(pk, cn)`.
-    pub fn receives_coin(&self, pk: &[u8; 32], cn: &[u8; 32]) -> bool {
-        self.recipient_pks.iter().zip(self.output_commitments.iter())
-            .any(|(rpk, ocn)| rpk == pk && ocn == cn)
+    /// `cn` was received in this tx if it is among the output commitments.
+    /// Recipient ownership is already encoded inside the commitment itself.
+    pub fn receives_coin(&self, cn: &[u8; 32]) -> bool {
+        self.output_commitments.contains(cn)
     }
 
-    /// `pk` spends coin `cn` in this tx if `sender_pk == pk` and `cn` is
-    /// one of the input commitments.
-    pub fn spends_coin(&self, pk: &[u8; 32], cn: &[u8; 32]) -> bool {
-        self.sender_pk == *pk && self.input_commitments.contains(cn)
+    /// `cn` was spent as an input in this tx.
+    pub fn spends_coin(&self, cn: &[u8; 32]) -> bool {
+        self.input_commitments.contains(cn)
     }
 }
 
@@ -145,33 +134,42 @@ fn xor_with_keystream(key: &[u8; 32], data: &[u8]) -> Vec<u8> {
 }
 
 /// A board entry: the transaction encrypted with a session key (visible to all
-/// authorised parties) plus one `key_enc` per participant for session-key recovery.
+/// authorised parties) plus one `key_enc` per recipient for session-key recovery.
+/// `nullifier` = `H(primary_input_commitment || sk_spender)` posted alongside
+/// the ciphertext — looks like random bytes to external observers but lets the
+/// IVC perform its double-spend check without decryption.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardEntry {
     /// `xor_with_keystream(session_key, MAGIC_TAG || bincode(tx))`.
     pub ciphertext: Vec<u8>,
-    /// `key_encs[i] = xor_with_keystream(pair_key(sender, participant_i), SESSION_MAGIC || session_key)`.
-    /// Participants = [sender, recipient_pks[0], recipient_pks[1], …].
+    /// `key_encs[i] = xor_with_keystream(pair_key(sender, recipient_i), SESSION_MAGIC || session_key)`.
+    /// Recipients only — sender no longer needs a key_enc since spend detection
+    /// uses the public nullifier field rather than decryption.
     pub key_encs: Vec<Vec<u8>>,
+    /// = `tx.input_nullifier`; externally indistinguishable from random bytes.
+    pub nullifier: [u8; 32],
 }
 
-/// Derive a deterministic session key from the transaction (reproducible across
-/// re-encryptions of the same logical transaction).
-fn session_key_for(tx: &Transaction) -> [u8; 32] {
+/// Derive a deterministic session key from the transaction id and sender key.
+fn session_key_for(tx_id: u64, sender_pk: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(tx.sender_pk);
-    h.update(tx.id.to_le_bytes());
+    h.update(sender_pk);
+    h.update(tx_id.to_le_bytes());
     h.update(PAIR_SALT);
     let mut out = [0u8; 32];
     out.copy_from_slice(&h.finalize());
     out
 }
 
-/// Encrypt `tx` using a session key. All authorised parties (sender + all
-/// recipients) receive a wrapped copy of the session key in `key_encs`.
+/// Encrypt `tx`. `sender_pk` and `recipient_pks` are the authorised parties;
+/// they are used for key derivation but are NOT stored inside the transaction.
 /// Call again after updating `tx.spend_proof` to re-encrypt with the proof.
-pub fn encrypt_tx(tx: &Transaction) -> BoardEntry {
-    let session_key = session_key_for(tx);
+pub fn encrypt_tx(
+    tx: &Transaction,
+    sender_pk: &[u8; 32],
+    recipient_pks: &[[u8; 32]],
+) -> BoardEntry {
+    let session_key = session_key_for(tx.id, sender_pk);
 
     // Encrypt the transaction body.
     let tx_bytes = bincode::serialize(tx).expect("Transaction is always serializable");
@@ -179,29 +177,29 @@ pub fn encrypt_tx(tx: &Transaction) -> BoardEntry {
     plaintext.extend_from_slice(&tx_bytes);
     let ciphertext = xor_with_keystream(&session_key, &plaintext);
 
-    // Wrap the session key for each participant: sender first, then recipients.
-    let mut participants = vec![tx.sender_pk];
-    participants.extend_from_slice(&tx.recipient_pks);
-    let key_encs = participants.iter().map(|p| {
-        let k = pair_key(&tx.sender_pk, p);
+    // Wrap the session key for each RECIPIENT (sender excluded — sender uses
+    // nullifier comparison for spend detection, not decryption).
+    let key_encs = recipient_pks.iter().map(|rpk| {
+        let k = pair_key(sender_pk, rpk);
         let mut payload = SESSION_MAGIC.to_vec();
         payload.extend_from_slice(&session_key);
         xor_with_keystream(&k, &payload)
     }).collect();
 
-    BoardEntry { ciphertext, key_encs }
+    BoardEntry { ciphertext, key_encs, nullifier: tx.input_nullifier }
 }
 
-/// Try every registry member as a potential sender/co-participant to recover
-/// the session key, then decrypt the transaction. Returns `Some(tx)` only if
-/// `owner_pk` is genuinely the sender or one of the recipients.
+/// Try every registry member as a potential sender to recover the session key,
+/// then decrypt the transaction. Returns `Some((tx, sender_pk))` — the second
+/// value is the discovered sender (the registry member whose pair_key worked).
 pub fn scan_entry(
     owner_pk: &[u8; 32],
     registry: &[[u8; 32]],
     entry: &BoardEntry,
-) -> Option<Transaction> {
+) -> Option<(Transaction, [u8; 32])> {
     const KEY_ENC_LEN: usize = 8 + 32; // SESSION_MAGIC + session_key
     for candidate in registry {
+        if candidate == owner_pk { continue; } // sender excluded from key_encs
         let k = pair_key(owner_pk, candidate);
         for key_enc in &entry.key_encs {
             if key_enc.len() != KEY_ENC_LEN { continue; }
@@ -209,14 +207,13 @@ pub fn scan_entry(
             if dec[..8] != SESSION_MAGIC { continue; }
             let mut session_key = [0u8; 32];
             session_key.copy_from_slice(&dec[8..]);
-            // Decrypt the transaction ciphertext.
             if entry.ciphertext.len() <= 8 { continue; }
             let tx_bytes = xor_with_keystream(&session_key, &entry.ciphertext);
             if tx_bytes[..8] != MAGIC_TAG { continue; }
             let tx: Transaction = bincode::deserialize(&tx_bytes[8..]).ok()?;
-            if tx.sent_by(owner_pk) || tx.received_by(owner_pk) {
-                return Some(tx);
-            }
+            // candidate is the sender; owner must be a recipient (output commitment
+            // with owner's pk embedded) to be genuinely involved.
+            return Some((tx, *candidate));
         }
     }
     None
@@ -415,6 +412,12 @@ pub struct CoinProofPublicValues {
     pub board_size: usize,
     pub received_at: Option<u64>,
     pub spent: bool,
+    /// The nullifier to watch for across prior slots (= H(parent_input_commitment || sk_parent_spender)).
+    /// Known upfront before bootstrap starts; carried through the IVC unchanged.
+    pub parent_nullifier: [u8; 32],
+    /// Set to true if `parent_nullifier` was found (as a substring) in any prior slot's entry bytes.
+    /// If true at the receipt slot, the creating transaction was a double-spend → receipt invalid.
+    pub parent_nullifier_seen: bool,
 }
 
 impl CoinProofPublicValues {
@@ -459,12 +462,19 @@ pub fn check_coin_proof_step(
     append_path: Vec<[u8; 32]>,
     registry: Vec<[u8; 32]>,
     inner: Option<CoinProofPublicValues>,
+    /// `H(parent_input_commitment || sk_parent_spender)` — the nullifier of the
+    /// transaction that CREATED the tracked coin. Known upfront; checked via
+    /// substring search in every prior slot's raw entry bytes.
+    parent_nullifier: [u8; 32],
+    /// `H(coin_commitment || sk_owner)` — the owner's own spending nullifier.
+    /// If found in a prior slot, the coin was already spent (double-spend).
+    own_nullifier: [u8; 32],
 ) -> Result<(CoinProofPublicValues, CoinProofJustification, Option<Vec<u8>>), &'static str> {
     let leaf_k = merkle_leaf(slot, &entry_k);
     let board_root = compute_root_from_path(leaf_k, slot, &append_path);
 
-    let (prev_received_at, prev_spent, justification) = if slot == 0 {
-        (None, false, CoinProofJustification::Base)
+    let (prev_received_at, prev_spent, prev_parent_nullifier_seen, justification) = if slot == 0 {
+        (None, false, false, CoinProofJustification::Base)
     } else {
         let inner = inner.ok_or("steps after the base case require an inner coin-proof")?;
         if inner.vkey != vkey {
@@ -476,38 +486,49 @@ pub fn check_coin_proof_step(
         if inner.coin_commitment != coin_commitment {
             return Err("inner coin-proof tracks a different coin");
         }
+        if inner.parent_nullifier != parent_nullifier {
+            return Err("inner coin-proof tracks a different parent nullifier");
+        }
         if inner.board_size != slot {
             return Err("inner coin-proof must cover exactly the prefix before this slot");
         }
-        // Verify the append_path is consistent with the inner proof's root:
-        // the old root is what you get from the same path with a zero leaf at slot.
         let old_root = compute_root_from_path([0u8; 32], slot, &append_path);
         if inner.board_root != old_root {
             return Err("inner coin-proof's board root does not match this prefix");
         }
-        let prev_received_at = inner.received_at;
-        let prev_spent = inner.spent;
-        (prev_received_at, prev_spent, CoinProofJustification::Step { inner_public_values: inner })
+        let pns = inner.parent_nullifier_seen;
+        let pra = inner.received_at;
+        let ps  = inner.spent;
+        (pra, ps, pns, CoinProofJustification::Step { inner_public_values: inner })
     };
 
+    // Nullifier substring searches on the raw serialised entry bytes.
+    // The entry's `nullifier` field sits inside the serialised bytes, so
+    // `bincode::serialize(&entry_k)` contains it — no decryption needed.
+    let raw = bincode::serialize(&entry_k).unwrap_or_default();
+    let parent_nullifier_seen = prev_parent_nullifier_seen
+        || raw.windows(32).any(|w| w == parent_nullifier);
+    let mut spent = prev_spent
+        || raw.windows(32).any(|w| w == own_nullifier);
+
     let mut received_at = prev_received_at;
-    let mut spent = prev_spent;
     let mut receipt_spend_pv: Option<Vec<u8>> = None;
 
-    if let Some(tx) = scan_entry(&owner_pk, &registry, &entry_k) {
-        if tx.receives_coin(&owner_pk, &coin_commitment) && received_at.is_none() {
-            received_at = Some(slot as u64);
-            // Capture the spend proof's ValidPublicValues bytes so program-coinproof
-            // can verify in-circuit that the transaction creating this coin was
-            // backed by a genuine, authorised spend proof.
-            // tx.spend_proof stores (pv_bytes, full_proof_bytes) as a bincode tuple;
-            // extract just the pv_bytes needed for the in-circuit digest.
-            receipt_spend_pv = bincode::deserialize::<(Vec<u8>, Vec<u8>)>(&tx.spend_proof)
-                .ok()
-                .map(|(pv, _)| pv)
-                .filter(|b| !b.is_empty());
+    if let Some((tx, _sender_pk)) = scan_entry(&owner_pk, &registry, &entry_k) {
+        if tx.receives_coin(&coin_commitment) && received_at.is_none() {
+            // At the receipt slot: assert parent nullifier was NOT seen before.
+            // If it was, the creating transaction was a double-spend → invalid.
+            if parent_nullifier_seen {
+                // Do not credit receipt — parent coin was double-spent.
+            } else {
+                received_at = Some(slot as u64);
+                receipt_spend_pv = bincode::deserialize::<(Vec<u8>, Vec<u8>)>(&tx.spend_proof)
+                    .ok()
+                    .map(|(pv, _)| pv)
+                    .filter(|b| !b.is_empty());
+            }
         }
-        if tx.spends_coin(&owner_pk, &coin_commitment) {
+        if tx.spends_coin(&coin_commitment) {
             spent = true;
         }
     }
@@ -521,6 +542,8 @@ pub fn check_coin_proof_step(
             board_size: slot + 1,
             received_at,
             spent,
+            parent_nullifier,
+            parent_nullifier_seen,
         },
         justification,
         receipt_spend_pv,
@@ -557,8 +580,25 @@ pub fn check_spend(
 
     let anchor = merkle_root_of(&prior_entries);
 
-    if tx_star.sender_pk != pk_p {
-        return Err("tx* must be sent by P");
+    // Compute and verify the spender's own nullifier.
+    // This replaces the old sender_pk check and also serves as the double-spend guard.
+    let own_nullifier = {
+        let mut h = Sha256::new();
+        h.update(coin_commitment);
+        h.update(sk_p);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&h.finalize());
+        out
+    };
+    if tx_star.input_nullifier != own_nullifier {
+        return Err("tx* input_nullifier does not match H(coin_commitment || sk_p)");
+    }
+    // Check own nullifier has not appeared in any prior board entry.
+    for entry in &prior_entries {
+        let raw = bincode::serialize(entry).unwrap_or_default();
+        if raw.windows(32).any(|w| w == own_nullifier) {
+            return Err("coin has already been spent (nullifier seen in prior slot)");
+        }
     }
 
     // Verify input coin preimages match the transaction's committed commitments.
@@ -652,29 +692,54 @@ mod tests {
         Coin { tag, value, rand, owner_pk }
     }
 
-    /// Build a Transaction from explicit input coins and (coin, recipient_pk) output pairs.
+    /// Build a Transaction. `sender_pk` and `recipient_pks` are used for key
+    /// derivation but NOT stored in the struct. Returns (tx, sender_pk, recipient_pks)
+    /// so callers can pass them to `encrypt_tx`.
     fn make_tx(
         id: u64,
-        sender_pk: [u8; 32],
+        sender_sk: [u8; 32],
         input_coins: &[Coin],
         outputs: &[(Coin, [u8; 32])],
-    ) -> Transaction {
-        let input_commitments = input_coins.iter().map(|c| c.commitment()).collect();
+    ) -> (Transaction, [u8; 32], Vec<[u8; 32]>) {
+        let sender_pk = derive_pk(&sender_sk);
+        let input_commitments: Vec<[u8; 32]> = input_coins.iter().map(|c| c.commitment()).collect();
         let recipient_pks: Vec<[u8; 32]> = outputs.iter().map(|(_, rpk)| *rpk).collect();
         let output_commitments: Vec<[u8; 32]> = outputs.iter().map(|(c, _)| c.commitment()).collect();
         let note_encs: Vec<Vec<u8>> = outputs.iter()
             .map(|(c, rpk)| build_note_enc(&sender_pk, rpk, c))
             .collect();
-        Transaction { id, sender_pk, recipient_pks, input_commitments, output_commitments, note_encs, spend_proof: vec![] }
+        // input_nullifier = H(primary_input_commitment || sk_sender)
+        let input_nullifier = {
+            let mut h = Sha256::new();
+            h.update(input_commitments[0]);
+            h.update(sender_sk);
+            let mut out = [0u8; 32]; out.copy_from_slice(&h.finalize()); out
+        };
+        let tx = Transaction { id, input_commitments, output_commitments, note_encs, input_nullifier, spend_proof: vec![] };
+        (tx, sender_pk, recipient_pks)
     }
 
-    /// Run the coin-proof IVC chain for `owner_pk`/`coin_commitment` over `entries`.
+    fn enc(tx: &Transaction, sender_pk: &[u8;32], recipient_pks: &[[u8;32]]) -> BoardEntry {
+        encrypt_tx(tx, sender_pk, recipient_pks)
+    }
+
+    /// Run the IVC coin-proof chain. Uses zero nullifiers for tests that don't
+    /// exercise the nullifier double-spend detection.
     fn coin_proof_chain(
-        owner_pk: [u8; 32],
+        owner_sk: [u8; 32],
         coin_commitment: [u8; 32],
         entries: &[BoardEntry],
         registry: &[[u8; 32]],
+        parent_nullifier: [u8; 32],
     ) -> Vec<CoinProofPublicValues> {
+        let owner_pk = derive_pk(&owner_sk);
+        // own_nullifier = H(coin_commitment || sk_owner)
+        let own_nullifier = {
+            let mut h = Sha256::new();
+            h.update(coin_commitment);
+            h.update(owner_sk);
+            let mut out = [0u8; 32]; out.copy_from_slice(&h.finalize()); out
+        };
         let mut out = Vec::new();
         let mut inner = None;
         for k in 0..entries.len() {
@@ -682,6 +747,7 @@ mod tests {
             let (pv, _, _) = check_coin_proof_step(
                 TEST_COIN_PROOF_VKEY, owner_pk, coin_commitment,
                 entries[k].clone(), k, ap, registry.to_vec(), inner.clone(),
+                parent_nullifier, own_nullifier,
             ).unwrap();
             inner = Some(pv.clone());
             out.push(pv);
@@ -689,7 +755,6 @@ mod tests {
         out
     }
 
-    /// Convenience wrapper: call `check_spend` with explicit input/output coin witnesses.
     fn spend(
         sk: [u8; 32],
         pk: [u8; 32],
@@ -711,187 +776,161 @@ mod tests {
 
     #[test]
     fn encrypt_decrypt_round_trips_for_participants_and_rejects_outsiders() {
-        let (_, genesis_pk) = (GENESIS_SK, genesis_pk());
         let (_, alice_pk) = party(1);
         let (_, bob_pk) = party(2);
         let (_, carol_pk) = party(3);
-        let registry = vec![genesis_pk, alice_pk, bob_pk, carol_pk];
+        let registry = vec![genesis_pk(), alice_pk, bob_pk, carol_pk];
 
         let alice_coin = coin(0xA2, 100, alice_pk);
-        let tx0 = make_tx(0, genesis_pk,
-            &[coin(0xA1, 100, genesis_pk)],
+        let (tx0, spk, rpks) = make_tx(0, GENESIS_SK,
+            &[coin(0xA1, 100, genesis_pk())],
             &[(alice_coin.clone(), alice_pk)]);
-        let entry = encrypt_tx(&tx0);
+        let entry = enc(&tx0, &spk, &rpks);
 
-        // Both sender and recipient can decrypt.
-        assert_eq!(scan_entry(&genesis_pk, &registry, &entry), Some(tx0.clone()));
-        assert_eq!(scan_entry(&alice_pk, &registry, &entry), Some(tx0.clone()));
-
+        // Recipient can decrypt.
+        assert_eq!(scan_entry(&alice_pk, &registry, &entry).map(|(t, _)| t), Some(tx0.clone()));
         // Outsiders cannot.
-        assert_eq!(scan_entry(&bob_pk, &registry, &entry), None);
+        assert_eq!(scan_entry(&bob_pk,   &registry, &entry), None);
         assert_eq!(scan_entry(&carol_pk, &registry, &entry), None);
 
-        // Recipient can decrypt their own note.
-        assert_eq!(decrypt_note(&genesis_pk, &alice_pk, &tx0.note_encs[0]), Some(alice_coin));
-        // Bob cannot decrypt Alice's note.
-        assert_eq!(decrypt_note(&genesis_pk, &bob_pk, &tx0.note_encs[0]), None);
+        // Recipient decrypts their note (sender_pk = spk = genesis_pk).
+        assert_eq!(decrypt_note(&spk, &alice_pk, &tx0.note_encs[0]), Some(alice_coin));
+        assert_eq!(decrypt_note(&spk, &bob_pk,   &tx0.note_encs[0]), None);
     }
 
     #[test]
     fn multi_output_tx_each_recipient_sees_only_own_note() {
-        let (_, alice_pk) = party(1);
+        let (alice_sk, alice_pk) = party(1);
         let (_, bob_pk) = party(2);
         let (_, carol_pk) = party(3);
 
-        let alice_coin = coin(0xA1, 100, alice_pk);
-        let bob_coin = coin(0xB1, 40, bob_pk);
-        let alice_change = coin(0xB2, 60, alice_pk);
+        let alice_coin   = coin(0xA1, 100, alice_pk);
+        let bob_coin     = coin(0xB1,  40, bob_pk);
+        let alice_change = coin(0xB2,  60, alice_pk);
 
-        // Alice→Bob+change: two outputs.
-        let tx1 = make_tx(1, alice_pk,
-            &[alice_coin.clone()],
+        let (tx1, spk, _) = make_tx(1, alice_sk, &[alice_coin],
             &[(bob_coin.clone(), bob_pk), (alice_change.clone(), alice_pk)]);
 
-        // Bob decrypts his note.
-        assert_eq!(decrypt_note(&alice_pk, &bob_pk,   &tx1.note_encs[0]), Some(bob_coin));
-        // Alice decrypts her change note.
-        assert_eq!(decrypt_note(&alice_pk, &alice_pk, &tx1.note_encs[1]), Some(alice_change));
-        // Carol cannot decrypt either note.
-        assert_eq!(decrypt_note(&alice_pk, &carol_pk, &tx1.note_encs[0]), None);
-        assert_eq!(decrypt_note(&alice_pk, &carol_pk, &tx1.note_encs[1]), None);
+        assert_eq!(decrypt_note(&spk, &bob_pk,   &tx1.note_encs[0]), Some(bob_coin));
+        assert_eq!(decrypt_note(&spk, &alice_pk, &tx1.note_encs[1]), Some(alice_change));
+        assert_eq!(decrypt_note(&spk, &carol_pk, &tx1.note_encs[0]), None);
+        assert_eq!(decrypt_note(&spk, &carol_pk, &tx1.note_encs[1]), None);
     }
 
     #[test]
     fn registry_scan_finds_the_right_counterparty() {
-        let (_, genesis_pk) = (GENESIS_SK, genesis_pk());
         let (_, alice_pk) = party(1);
         let (_, bob_pk) = party(2);
         let (_, carol_pk) = party(3);
-        let registry = vec![genesis_pk, alice_pk, bob_pk, carol_pk];
+        let registry = vec![genesis_pk(), alice_pk, bob_pk, carol_pk];
 
-        let tx0 = make_tx(0, genesis_pk,
-            &[coin(0xA1, 100, genesis_pk)],
+        let (tx0, spk, rpks) = make_tx(0, GENESIS_SK,
+            &[coin(0xA1, 100, genesis_pk())],
             &[(coin(0xA2, 100, alice_pk), alice_pk)]);
-        let entry = encrypt_tx(&tx0);
+        let entry = enc(&tx0, &spk, &rpks);
 
-        assert_eq!(scan_entry(&alice_pk,   &registry, &entry), Some(tx0.clone()));
-        assert_eq!(scan_entry(&genesis_pk, &registry, &entry), Some(tx0));
-        assert_eq!(scan_entry(&bob_pk,     &registry, &entry), None);
-        assert_eq!(scan_entry(&carol_pk,   &registry, &entry), None);
+        assert_eq!(scan_entry(&alice_pk, &registry, &entry).map(|(t,_)| t), Some(tx0.clone()));
+        assert_eq!(scan_entry(&bob_pk,   &registry, &entry), None);
+        assert_eq!(scan_entry(&carol_pk, &registry, &entry), None);
     }
 
     #[test]
     fn coin_proof_tracks_receipt_and_spend_for_demo_chain() {
-        let (genesis_sk, genesis_pk) = (GENESIS_SK, genesis_pk());
         let (alice_sk, alice_pk) = party(1);
         let (bob_sk, bob_pk) = party(2);
-        let (_carol_sk, carol_pk) = party(3);
-        let registry = vec![genesis_pk, alice_pk, bob_pk, carol_pk];
+        let (_, carol_pk) = party(3);
+        let registry = vec![genesis_pk(), alice_pk, bob_pk, carol_pk];
 
-        let alice_coin  = coin(0xA2, 100, alice_pk);
-        let bob_coin    = coin(0xB1,  40, bob_pk);
-        let alice_change = coin(0xB2, 60, alice_pk);
-        let carol_coin  = coin(0xC1,  40, carol_pk);
+        let alice_coin   = coin(0xA2, 100, alice_pk);
+        let bob_coin     = coin(0xB1,  40, bob_pk);
+        let alice_change = coin(0xB2,  60, alice_pk);
+        let carol_coin   = coin(0xC1,  40, carol_pk);
 
-        let tx0 = make_tx(0, genesis_pk, &[coin(0xA1, 100, genesis_pk)],
-            &[(alice_coin.clone(), alice_pk)]);
-        let tx1 = make_tx(1, alice_pk, &[alice_coin.clone()],
-            &[(bob_coin.clone(), bob_pk), (alice_change, alice_pk)]);
-        let tx2 = make_tx(2, bob_pk, &[bob_coin.clone()],
-            &[(carol_coin, carol_pk)]);
-        let entries = vec![encrypt_tx(&tx0), encrypt_tx(&tx1), encrypt_tx(&tx2)];
+        let (tx0, s0, r0) = make_tx(0, GENESIS_SK, &[coin(0xA1, 100, genesis_pk())], &[(alice_coin.clone(), alice_pk)]);
+        let (tx1, s1, r1) = make_tx(1, alice_sk, &[alice_coin.clone()], &[(bob_coin.clone(), bob_pk), (alice_change, alice_pk)]);
+        let (tx2, s2, r2) = make_tx(2, bob_sk, &[bob_coin.clone()], &[(carol_coin, carol_pk)]);
+        let entries = vec![enc(&tx0,&s0,&r0), enc(&tx1,&s1,&r1), enc(&tx2,&s2,&r2)];
 
         let cn_alice = alice_coin.commitment();
         let cn_bob   = bob_coin.commitment();
 
-        let alice_cp = coin_proof_chain(alice_pk, cn_alice, &entries[..1], &registry);
+        let alice_cp = coin_proof_chain(alice_sk, cn_alice, &entries[..1], &registry, [0u8;32]);
         assert_eq!(alice_cp[0].received_at, Some(0));
-        assert_eq!(alice_cp[0].spent, false);
+        assert!(!alice_cp[0].spent);
 
-        let bob_cp = coin_proof_chain(bob_pk, cn_bob, &entries[..2], &registry);
+        let bob_cp = coin_proof_chain(bob_sk, cn_bob, &entries[..2], &registry, [0u8;32]);
         assert_eq!(bob_cp[0].received_at, None);
         assert_eq!(bob_cp[1].received_at, Some(1));
-        assert_eq!(bob_cp[1].spent, false);
-
-        let _ = (genesis_sk, alice_sk, bob_sk);
+        assert!(!bob_cp[1].spent);
     }
 
     #[test]
     fn coin_proof_tracks_change_as_a_receipt() {
-        let (genesis_sk, genesis_pk) = (GENESIS_SK, genesis_pk());
         let (alice_sk, alice_pk) = party(1);
         let (bob_sk, bob_pk) = party(2);
         let (_, carol_pk) = party(3);
-        let registry = vec![genesis_pk, alice_pk, bob_pk, carol_pk];
+        let registry = vec![genesis_pk(), alice_pk, bob_pk, carol_pk];
 
         let alice_coin   = coin(0xA2, 100, alice_pk);
         let bob_coin     = coin(0xB1,  40, bob_pk);
         let alice_change = coin(0xB2,  60, alice_pk);
 
-        let tx0 = make_tx(0, genesis_pk, &[coin(0xA1, 100, genesis_pk)],
-            &[(alice_coin.clone(), alice_pk)]);
-        let tx1 = make_tx(1, alice_pk, &[alice_coin.clone()],
-            &[(bob_coin, bob_pk), (alice_change.clone(), alice_pk)]);
-        let entries = vec![encrypt_tx(&tx0), encrypt_tx(&tx1)];
+        let (tx0, s0, r0) = make_tx(0, GENESIS_SK, &[coin(0xA1, 100, genesis_pk())], &[(alice_coin.clone(), alice_pk)]);
+        let (tx1, s1, r1) = make_tx(1, alice_sk, &[alice_coin], &[(bob_coin, bob_pk), (alice_change.clone(), alice_pk)]);
+        let entries = vec![enc(&tx0,&s0,&r0), enc(&tx1,&s1,&r1)];
 
-        let cn_alice_change = alice_change.commitment();
-        let cp = coin_proof_chain(alice_pk, cn_alice_change, &entries, &registry);
+        let cn_change = alice_change.commitment();
+        let cp = coin_proof_chain(alice_sk, cn_change, &entries, &registry, [0u8;32]);
         assert_eq!(cp[0].received_at, None);
         assert_eq!(cp[1].received_at, Some(1));
-        assert_eq!(cp[1].spent, false);
-
-        let _ = (genesis_sk, bob_sk, carol_pk);
+        assert!(!cp[1].spent);
+        let _ = carol_pk;
     }
 
     #[test]
     fn demo_chain_is_valid_end_to_end() {
-        let (genesis_sk, genesis_pk) = (GENESIS_SK, genesis_pk());
         let (alice_sk, alice_pk) = party(1);
         let (bob_sk, bob_pk) = party(2);
         let (_, carol_pk) = party(3);
-        let registry = vec![genesis_pk, alice_pk, bob_pk, carol_pk];
+        let registry = vec![genesis_pk(), alice_pk, bob_pk, carol_pk];
 
-        let genesis_coin  = coin(0xA1, 100, genesis_pk);
-        let alice_coin    = coin(0xA2, 100, alice_pk);
-        let bob_coin      = coin(0xB1,  40, bob_pk);
-        let alice_change  = coin(0xB2,  60, alice_pk);
-        let carol_coin    = coin(0xC1,  40, carol_pk);
+        let genesis_coin = coin(0xA1, 100, genesis_pk());
+        let alice_coin   = coin(0xA2, 100, alice_pk);
+        let bob_coin     = coin(0xB1,  40, bob_pk);
+        let alice_change = coin(0xB2,  60, alice_pk);
+        let carol_coin   = coin(0xC1,  40, carol_pk);
 
-        let tx0 = make_tx(0, genesis_pk, &[genesis_coin.clone()],
-            &[(alice_coin.clone(), alice_pk)]);
-        let tx1 = make_tx(1, alice_pk, &[alice_coin.clone()],
-            &[(bob_coin.clone(), bob_pk), (alice_change.clone(), alice_pk)]);
-        let tx2 = make_tx(2, bob_pk, &[bob_coin.clone()],
-            &[(carol_coin, carol_pk)]);
-        let entries = vec![encrypt_tx(&tx0), encrypt_tx(&tx1), encrypt_tx(&tx2)];
+        let (tx0, s0, r0) = make_tx(0, GENESIS_SK, &[genesis_coin.clone()], &[(alice_coin.clone(), alice_pk)]);
+        let (tx1, s1, r1) = make_tx(1, alice_sk, &[alice_coin.clone()], &[(bob_coin.clone(), bob_pk), (alice_change.clone(), alice_pk)]);
+        let (tx2, s2, r2) = make_tx(2, bob_sk, &[bob_coin.clone()], &[(carol_coin.clone(), carol_pk)]);
+        let entries = vec![enc(&tx0,&s0,&r0), enc(&tx1,&s1,&r1), enc(&tx2,&s2,&r2)];
 
         let cn_genesis = genesis_coin.commitment();
         let cn_alice   = alice_coin.commitment();
         let cn_bob     = bob_coin.commitment();
 
-        spend(genesis_sk, genesis_pk, cn_genesis, &[], &tx0,
-            &[genesis_coin.clone()], &[alice_coin.clone()], true, None).unwrap();
+        spend(GENESIS_SK, genesis_pk(), cn_genesis, &[], &tx0,
+            &[genesis_coin], &[alice_coin.clone()], true, None).unwrap();
 
-        let alice_cp = coin_proof_chain(alice_pk, cn_alice, &entries[..1], &registry);
+        let alice_cp = coin_proof_chain(alice_sk, cn_alice, &entries[..1], &registry, [0u8;32]);
         spend(alice_sk, alice_pk, cn_alice, &entries[..1], &tx1,
             &[alice_coin.clone()], &[bob_coin.clone(), alice_change], false,
             Some(alice_cp[0].clone())).unwrap();
 
-        let bob_cp = coin_proof_chain(bob_pk, cn_bob, &entries[..2], &registry);
+        let bob_cp = coin_proof_chain(bob_sk, cn_bob, &entries[..2], &registry, [0u8;32]);
         spend(bob_sk, bob_pk, cn_bob, &entries[..2], &tx2,
-            &[bob_coin.clone()], &[coin(0xC1, 40, carol_pk)], false,
+            &[bob_coin.clone()], &[carol_coin], false,
             Some(bob_cp[1].clone())).unwrap();
     }
 
     #[test]
     fn rejects_wrong_secret_key() {
-        let (_, genesis_pk) = (GENESIS_SK, genesis_pk());
         let (alice_sk, alice_pk) = party(1);
-        let genesis_coin = coin(0xA1, 100, genesis_pk);
-        let alice_coin = coin(0xA2, 100, alice_pk);
-        let tx0 = make_tx(0, genesis_pk, &[genesis_coin.clone()], &[(alice_coin.clone(), alice_pk)]);
+        let genesis_coin = coin(0xA1, 100, genesis_pk());
+        let alice_coin   = coin(0xA2, 100, alice_pk);
+        let (tx0, _, _) = make_tx(0, GENESIS_SK, &[genesis_coin.clone()], &[(alice_coin.clone(), alice_pk)]);
 
-        let err = spend(alice_sk, genesis_pk, genesis_coin.commitment(), &[], &tx0,
+        let err = spend(alice_sk, genesis_pk(), genesis_coin.commitment(), &[], &tx0,
             &[genesis_coin], &[alice_coin], true, None).unwrap_err();
         assert_eq!(err, "pk_P must be the public key for sk_P");
     }
@@ -901,8 +940,8 @@ mod tests {
         let (alice_sk, alice_pk) = party(1);
         let (_, bob_pk) = party(2);
         let alice_coin = coin(0xA1, 100, alice_pk);
-        let bob_coin = coin(0xB1, 100, bob_pk);
-        let tx0 = make_tx(0, alice_pk, &[alice_coin.clone()], &[(bob_coin.clone(), bob_pk)]);
+        let bob_coin   = coin(0xB1, 100, bob_pk);
+        let (tx0, _, _) = make_tx(0, alice_sk, &[alice_coin.clone()], &[(bob_coin.clone(), bob_pk)]);
 
         let err = spend(alice_sk, alice_pk, alice_coin.commitment(), &[], &tx0,
             &[alice_coin], &[bob_coin], true, None).unwrap_err();
@@ -911,113 +950,108 @@ mod tests {
 
     #[test]
     fn rejects_spending_a_coin_one_never_received() {
-        let (genesis_sk, genesis_pk) = (GENESIS_SK, genesis_pk());
         let (alice_sk, alice_pk) = party(1);
         let (carol_sk, carol_pk) = party(3);
-        let registry = vec![genesis_pk, alice_pk, carol_pk];
+        let registry = vec![genesis_pk(), alice_pk, carol_pk];
 
-        let genesis_coin     = coin(0xA1, 100, genesis_pk);
+        let genesis_coin     = coin(0xA1, 100, genesis_pk());
         let alice_coin       = coin(0xA2, 100, alice_pk);
         let carol_fake_input = coin(0xC1, 100, carol_pk);
         let carol_fake_out   = coin(0xC2, 100, alice_pk);
 
-        let tx0     = make_tx(0, genesis_pk, &[genesis_coin], &[(alice_coin, alice_pk)]);
-        let tx_fake = make_tx(1, carol_pk,   &[carol_fake_input.clone()], &[(carol_fake_out.clone(), alice_pk)]);
-        let entries = vec![encrypt_tx(&tx0)];
+        let (tx0,     s0, r0) = make_tx(0, GENESIS_SK, &[genesis_coin], &[(alice_coin, alice_pk)]);
+        let (tx_fake, sf, rf) = make_tx(1, carol_sk, &[carol_fake_input.clone()], &[(carol_fake_out.clone(), alice_pk)]);
+        let entries = vec![enc(&tx0,&s0,&r0)];
         let cn_carol = carol_fake_input.commitment();
 
-        let carol_cp = coin_proof_chain(carol_pk, cn_carol, &entries, &registry);
+        let carol_cp = coin_proof_chain(carol_sk, cn_carol, &entries, &registry, [0u8;32]);
         assert_eq!(carol_cp[0].received_at, None);
 
         let err = spend(carol_sk, carol_pk, cn_carol, &entries, &tx_fake,
             &[carol_fake_input], &[carol_fake_out], false,
             Some(carol_cp[0].clone())).unwrap_err();
         assert_eq!(err, "P must have received this coin at some prior slot");
-
-        let _ = (genesis_sk, alice_sk);
+        let _ = (sf, rf, alice_sk);
     }
 
     #[test]
     fn rejects_double_spend() {
-        let (genesis_sk, genesis_pk) = (GENESIS_SK, genesis_pk());
         let (alice_sk, alice_pk) = party(1);
-        let (_, bob_pk) = party(2);
+        let (bob_sk, bob_pk) = party(2);
         let (_, carol_pk) = party(3);
-        let registry = vec![genesis_pk, alice_pk, bob_pk, carol_pk];
+        let registry = vec![genesis_pk(), alice_pk, bob_pk, carol_pk];
 
-        let genesis_coin  = coin(0xA1, 100, genesis_pk);
-        let alice_coin    = coin(0xA2, 100, alice_pk);
-        let bob_coin      = coin(0xB1,  60, bob_pk);
-        let alice_change  = coin(0xB2,  40, alice_pk);
-        let carol_coin    = coin(0xC1, 100, carol_pk);
+        let genesis_coin = coin(0xA1, 100, genesis_pk());
+        let alice_coin   = coin(0xA2, 100, alice_pk);
+        let bob_coin     = coin(0xB1,  60, bob_pk);
+        let alice_change = coin(0xB2,  40, alice_pk);
+        let carol_coin   = coin(0xC1, 100, carol_pk);
 
         let cn_genesis = genesis_coin.commitment();
         let cn_alice   = alice_coin.commitment();
 
-        let tx0  = make_tx(0, genesis_pk, &[genesis_coin.clone()], &[(alice_coin.clone(), alice_pk)]);
-        let tx1  = make_tx(1, alice_pk,   &[alice_coin.clone()],   &[(bob_coin.clone(), bob_pk), (alice_change.clone(), alice_pk)]);
-        let tx1b = make_tx(2, alice_pk,   &[alice_coin.clone()],   &[(carol_coin.clone(), carol_pk)]);
-        let entries = vec![encrypt_tx(&tx0), encrypt_tx(&tx1)];
+        let (tx0,  s0, r0) = make_tx(0, GENESIS_SK, &[genesis_coin.clone()], &[(alice_coin.clone(), alice_pk)]);
+        let (tx1,  s1, r1) = make_tx(1, alice_sk, &[alice_coin.clone()], &[(bob_coin.clone(), bob_pk), (alice_change.clone(), alice_pk)]);
+        let (tx1b, sb, rb) = make_tx(2, alice_sk, &[alice_coin.clone()], &[(carol_coin.clone(), carol_pk)]);
+        let entries = vec![enc(&tx0,&s0,&r0), enc(&tx1,&s1,&r1)];
 
-        spend(genesis_sk, genesis_pk, cn_genesis, &[], &tx0,
+        spend(GENESIS_SK, genesis_pk(), cn_genesis, &[], &tx0,
             &[genesis_coin], &[alice_coin.clone()], true, None).unwrap();
 
-        let alice_cp = coin_proof_chain(alice_pk, cn_alice, &entries, &registry);
+        let alice_cp = coin_proof_chain(alice_sk, cn_alice, &entries, &registry, [0u8;32]);
         assert_eq!(alice_cp[0].received_at, Some(0));
-        assert_eq!(alice_cp[1].spent, true);
+        assert!(alice_cp[1].spent);
 
         spend(alice_sk, alice_pk, cn_alice, &entries[..1], &tx1,
             &[alice_coin.clone()], &[bob_coin, alice_change], false,
             Some(alice_cp[0].clone())).unwrap();
 
+        // The nullifier check fires first: entries[1] contains Alice's nullifier.
         let err = spend(alice_sk, alice_pk, cn_alice, &entries, &tx1b,
             &[alice_coin], &[carol_coin], false,
             Some(alice_cp[1].clone())).unwrap_err();
-        assert_eq!(err, "P must not have spent this coin before (double spend)");
+        assert_eq!(err, "coin has already been spent (nullifier seen in prior slot)");
+        let _ = (bob_sk, sb, rb);
     }
 
     #[test]
     fn rejects_tampered_board_entry() {
-        let (genesis_sk, genesis_pk) = (GENESIS_SK, genesis_pk());
         let (alice_sk, alice_pk) = party(1);
-        let (_, bob_pk) = party(2);
-        let registry = vec![genesis_pk, alice_pk, bob_pk];
+        let (bob_sk, bob_pk) = party(2);
+        let registry = vec![genesis_pk(), alice_pk, bob_pk];
 
-        let genesis_coin = coin(0xA1, 100, genesis_pk);
+        let genesis_coin = coin(0xA1, 100, genesis_pk());
         let alice_coin   = coin(0xA2, 100, alice_pk);
         let bob_coin     = coin(0xB1, 100, bob_pk);
 
-        let tx0_real = make_tx(0, genesis_pk, &[genesis_coin.clone()], &[(alice_coin.clone(), alice_pk)]);
-        let tx1      = make_tx(1, alice_pk,   &[alice_coin.clone()],   &[(bob_coin.clone(), bob_pk)]);
-        let entries_real    = vec![encrypt_tx(&tx0_real)];
+        let (tx0_real, s0r, r0r) = make_tx(0, GENESIS_SK, &[genesis_coin.clone()], &[(alice_coin.clone(), alice_pk)]);
+        let (tx1,      s1,  r1)  = make_tx(1, alice_sk, &[alice_coin.clone()], &[(bob_coin.clone(), bob_pk)]);
+        let entries_real = vec![enc(&tx0_real,&s0r,&r0r)];
         let cn_alice = alice_coin.commitment();
-        let alice_cp = coin_proof_chain(alice_pk, cn_alice, &entries_real, &registry);
+        let alice_cp = coin_proof_chain(alice_sk, cn_alice, &entries_real, &registry, [0u8;32]);
 
-        // Attacker posts a different genesis entry.
-        let fake_coin    = coin(0xB3, 100, alice_pk);
-        let tx0_fake     = make_tx(0, genesis_pk, &[genesis_coin.clone()], &[(fake_coin.clone(), alice_pk)]);
-        let entries_tampered = vec![encrypt_tx(&tx0_fake)];
+        let fake_coin = coin(0xB3, 100, alice_pk);
+        let (tx0_fake, sf, rf) = make_tx(0, GENESIS_SK, &[genesis_coin], &[(fake_coin, alice_pk)]);
+        let entries_tampered = vec![enc(&tx0_fake,&sf,&rf)];
 
         let err = spend(alice_sk, alice_pk, cn_alice, &entries_tampered, &tx1,
             &[alice_coin], &[bob_coin], false,
             Some(alice_cp[0].clone())).unwrap_err();
         assert_eq!(err, "coin-proof's board root does not match the board prefix");
-
-        let _ = genesis_sk;
+        let _ = (bob_sk, s1, r1);
     }
 
     #[test]
     fn rejects_value_conservation_violation() {
-        let (genesis_sk, genesis_pk) = (GENESIS_SK, genesis_pk());
         let (_, alice_pk) = party(1);
-        let genesis_coin  = coin(0xA1, 100, genesis_pk);
-        let alice_coin    = coin(0xA2, 100, alice_pk);
-        let extra_coin    = coin(0xA3,   1, alice_pk);  // total out = 101 ≠ 100
+        let genesis_coin = coin(0xA1, 100, genesis_pk());
+        let alice_coin   = coin(0xA2, 100, alice_pk);
+        let extra_coin   = coin(0xA3,   1, alice_pk);
 
-        let tx0 = make_tx(0, genesis_pk, &[genesis_coin.clone()],
+        let (tx0, _, _) = make_tx(0, GENESIS_SK, &[genesis_coin.clone()],
             &[(alice_coin.clone(), alice_pk), (extra_coin.clone(), alice_pk)]);
 
-        let err = spend(genesis_sk, genesis_pk, genesis_coin.commitment(), &[], &tx0,
+        let err = spend(GENESIS_SK, genesis_pk(), genesis_coin.commitment(), &[], &tx0,
             &[genesis_coin], &[alice_coin, extra_coin], true, None).unwrap_err();
         assert_eq!(err, "transaction violates value conservation: sum(inputs) must equal sum(outputs)");
     }

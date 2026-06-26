@@ -16,9 +16,6 @@ use sha2::{Digest, Sha256};
 
 pub fn main() {
     let vkey: [u32; 8] = sp1_zkvm::io::read();
-    // spend_vkey is the verifying key for `program-spend`. Used to verify the
-    // spend proof embedded in the transaction that first delivered a coin to
-    // this owner — proving the transaction was genuinely authorised.
     let spend_vkey: [u32; 8] = sp1_zkvm::io::read();
     let owner_pk: [u8; 32] = sp1_zkvm::io::read();
     let coin_commitment: [u8; 32] = sp1_zkvm::io::read();
@@ -29,9 +26,15 @@ pub fn main() {
     let has_inner: bool = sp1_zkvm::io::read();
     let inner: Option<CoinProofPublicValues> =
         if has_inner { Some(sp1_zkvm::io::read()) } else { None };
+    // Nullifier of the transaction that created the tracked coin — checked via
+    // substring search in every prior slot to detect double-spend of the input.
+    let parent_nullifier: [u8; 32] = sp1_zkvm::io::read();
+    // Owner's own spending nullifier — set spent=true if found in any prior slot.
+    let own_nullifier: [u8; 32] = sp1_zkvm::io::read();
 
     let (public_values, justification, receipt_spend_pv) =
-        check_coin_proof_step(vkey, owner_pk, coin_commitment, entry_k, slot, append_path, registry, inner)
+        check_coin_proof_step(vkey, owner_pk, coin_commitment, entry_k, slot, append_path,
+            registry, inner, parent_nullifier, own_nullifier)
             .expect("the CoinProof relation does not hold for this step");
 
     // Verify the previous IVC step's coin-proof (existing recursive check).
