@@ -154,10 +154,20 @@ impl<'a> Wallet<'a> {
     ) {
         let own_null = nullifier(cn, self.party.sk);
         let ap0 = append_proof_for(&all_entries[..1]);
-        let stdin = build_coinproof_stdin(
+        let mut stdin = build_coinproof_stdin(
             spend_vkey, coinproof_vkey, self.party.pk, cn, &all_entries[0], 0, &ap0, registry,
             None, parent_nullifier, own_null,
         );
+        // When the coin is received at slot 0 (up_to_slot == 0), the base case
+        // IS the receipt step — write the spend proof so verify_sp1_proof can
+        // consume it inside the zkVM.
+        if up_to_slot == 0 {
+            if let Some(proof) = receipt_proof {
+                if let SP1Proof::Compressed(inner_spend) = proof.proof.clone() {
+                    stdin.write_proof(*inner_spend, spend_pk.verifying_key().vk.clone());
+                }
+            }
+        }
         let label = format!("{} coin-proof slot 0 (base)", self.party.name);
         let rec = self.run_coinproof_step(stdin, &label, 1, coinproof_pk, client, stats);
         self.coins.insert(cn, rec);
