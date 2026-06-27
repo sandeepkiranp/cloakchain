@@ -177,10 +177,14 @@ pub fn encrypt_tx(
     plaintext.extend_from_slice(&tx_bytes);
     let ciphertext = xor_with_keystream(&session_key, &plaintext);
 
-    // Wrap the session key for each RECIPIENT (sender excluded — sender uses
-    // nullifier comparison for spend detection, not decryption).
-    let key_encs = recipient_pks.iter().map(|rpk| {
-        let k = pair_key(sender_pk, rpk);
+    // Wrap the session key for the sender (self-key) and all recipients.
+    // The sender needs their self-key to decrypt their own transactions and
+    // discover their change coins — without it, scan_entry returns a recipient
+    // as the "candidate sender" and note decryption breaks.
+    let mut participants: Vec<&[u8; 32]> = vec![sender_pk];
+    participants.extend(recipient_pks.iter());
+    let key_encs = participants.iter().map(|p| {
+        let k = pair_key(sender_pk, p);
         let mut payload = SESSION_MAGIC.to_vec();
         payload.extend_from_slice(&session_key);
         xor_with_keystream(&k, &payload)
@@ -199,7 +203,6 @@ pub fn scan_entry(
 ) -> Option<(Transaction, [u8; 32])> {
     const KEY_ENC_LEN: usize = 8 + 32; // SESSION_MAGIC + session_key
     for candidate in registry {
-        if candidate == owner_pk { continue; } // sender excluded from key_encs
         let k = pair_key(owner_pk, candidate);
         for key_enc in &entry.key_encs {
             if key_enc.len() != KEY_ENC_LEN { continue; }

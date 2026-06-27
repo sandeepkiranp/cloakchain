@@ -116,8 +116,12 @@ impl<'a> Wallet<'a> {
         // Discover new coins via note decryption.
         // scan_entry returns (tx, sender_pk); try decrypting each note_enc.
         if let Some((tx, sender_pk)) = lib_scan_entry(&self.party.pk, registry, entry) {
-            for (i, note_enc) in tx.note_encs.iter().enumerate() {
+            for note_enc in tx.note_encs.iter() {
                 if let Some(note_coin) = decrypt_note(&sender_pk, &self.party.pk, note_enc) {
+                    // Only track coins that actually belong to this wallet owner.
+                    // Without this check, the sender could accidentally decrypt a
+                    // recipient's note (pair keys are symmetric).
+                    if note_coin.owner_pk != self.party.pk { continue; }
                     let cn = note_coin.commitment();
                     if !self.coins.contains_key(&cn) {
                         println!("  [{}] discovered coin (value={}) at slot {} — bootstrapping",
