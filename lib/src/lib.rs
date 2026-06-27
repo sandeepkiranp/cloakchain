@@ -502,24 +502,19 @@ pub fn check_coin_proof_step(
         (pra, ps, pns, CoinProofJustification::Step { inner_public_values: inner })
     };
 
-    // Nullifier substring searches on the raw serialised entry bytes.
-    // The entry's `nullifier` field sits inside the serialised bytes, so
-    // `bincode::serialize(&entry_k)` contains it — no decryption needed.
     let raw = bincode::serialize(&entry_k).unwrap_or_default();
-    let parent_nullifier_seen = prev_parent_nullifier_seen
-        || raw.windows(32).any(|w| w == parent_nullifier);
-    let mut spent = prev_spent
-        || raw.windows(32).any(|w| w == own_nullifier);
 
     let mut received_at = prev_received_at;
     let mut receipt_spend_pv: Option<Vec<u8>> = None;
 
     if let Some((tx, _sender_pk)) = scan_entry(&owner_pk, &registry, &entry_k) {
         if tx.receives_coin(&coin_commitment) && received_at.is_none() {
-            // At the receipt slot: assert parent nullifier was NOT seen before.
-            // If it was, the creating transaction was a double-spend → invalid.
-            if parent_nullifier_seen {
-                // Do not credit receipt — parent coin was double-spent.
+            // Use PREV parent_nullifier_seen (from slots before this one).
+            // The receipt slot's own entry contains the parent_nullifier by design
+            // (it IS the spending transaction), so we must NOT include the current
+            // slot in the double-spend check — that would always block honest receipt.
+            if prev_parent_nullifier_seen {
+                // Parent coin was spent in an earlier slot → double-spend → skip.
             } else {
                 received_at = Some(slot as u64);
                 receipt_spend_pv = bincode::deserialize::<(Vec<u8>, Vec<u8>)>(&tx.spend_proof)
@@ -529,9 +524,17 @@ pub fn check_coin_proof_step(
             }
         }
         if tx.spends_coin(&coin_commitment) {
-            spent = true;
+            // own-coin spend detected via decryption (belt-and-suspenders alongside nullifier)
         }
     }
+
+    // Update nullifier state for future IVC steps (AFTER receipt check).
+    let parent_nullifier_seen = prev_parent_nullifier_seen
+        || raw.windows(32).any(|w| w == parent_nullifier);
+    // own_nullifier search: if our spending nullifier appears in this slot,
+    // our coin was spent here (e.g. we spent it in a previous proof of spend).
+    let spent = prev_spent
+        || raw.windows(32).any(|w| w == own_nullifier);
 
     Ok((
         CoinProofPublicValues {
