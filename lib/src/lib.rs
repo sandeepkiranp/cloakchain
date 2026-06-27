@@ -378,10 +378,14 @@ pub fn merkle_verify(root: [u8; 32], slot: usize, entry: &BoardEntry, proof: &[[
 /// circular dependency: the proof commits to a root that does not include itself,
 /// so the proof can be embedded inside tx* and re-encrypted without any
 /// self-reference.
+///
+/// The spender's public key is intentionally NOT included — the proof proves
+/// "someone with the right key spent this coin" without revealing who.
+/// Spender identity is encoded in `tx.input_nullifier` inside the encrypted
+/// transaction, visible only to authorised parties.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidPublicValues {
     pub vkey: [u32; 8],
-    pub pk_p: [u8; 32],
     pub board_root: [u8; 32],
     pub board_size: usize,
 }
@@ -452,10 +456,6 @@ pub enum CoinProofJustification {
 ///
 /// The inner proof's `board_root` is verified against the old root, binding
 /// the chain to a genuine board history without passing all prior entries.
-/// Third return value: when `received_at` is newly set in this step, returns the
-/// `ValidPublicValues` bytes from the transaction's `spend_proof` field so that
-/// `program-coinproof` can verify the spend proof in-circuit — confirming the
-/// transaction that created this coin had a valid, authorised spend behind it.
 pub fn check_coin_proof_step(
     vkey: [u32; 8],
     owner_pk: [u8; 32],
@@ -472,7 +472,7 @@ pub fn check_coin_proof_step(
     // H(coin_commitment || sk_owner) — the owner's own spending nullifier.
     // If found in a prior slot, the coin was already spent (double-spend).
     own_nullifier: [u8; 32],
-) -> Result<(CoinProofPublicValues, CoinProofJustification, Option<Vec<u8>>), &'static str> {
+) -> Result<(CoinProofPublicValues, CoinProofJustification), &'static str> {
     let leaf_k = merkle_leaf(slot, &entry_k);
     let board_root = compute_root_from_path(leaf_k, slot, &append_path);
 
@@ -508,43 +508,17 @@ pub fn check_coin_proof_step(
     let raw = bincode::serialize(&entry_k).unwrap_or_default();
 
     let mut received_at = prev_received_at;
-    let mut receipt_spend_pv: Option<Vec<u8>> = None;
 
     if let Some((tx, _sender_pk)) = scan_entry(&owner_pk, &registry, &entry_k) {
         if tx.receives_coin(&coin_commitment) && received_at.is_none() {
-            // Use PREV parent_nullifier_seen (from slots before this one).
-            // The receipt slot's own entry contains the parent_nullifier by design
-            // (it IS the spending transaction), so we must NOT include the current
-            // slot in the double-spend check — that would always block honest receipt.
-            if prev_parent_nullifier_seen {
-                // Parent coin was spent in an earlier slot → double-spend → skip.
-            } else {
+            if !prev_parent_nullifier_seen {
                 received_at = Some(slot as u64);
-                // tx.spend_proof stores either:
-                //   (a) raw ValidPublicValues bytes, or
-                //   (b) a bincode tuple (pv_bytes, full_proof_bytes)
-                // In case (a) the bytes ARE the pv_bytes needed for the digest.
-                // In case (b) extract just the pv portion.
-                receipt_spend_pv = if !tx.spend_proof.is_empty() {
-                    let pv_bytes = bincode::deserialize::<(Vec<u8>, Vec<u8>)>(&tx.spend_proof)
-                        .map(|(pv, _)| pv)
-                        .unwrap_or_else(|_| tx.spend_proof.clone());
-                    Some(pv_bytes)
-                } else {
-                    None
-                };
             }
-        }
-        if tx.spends_coin(&coin_commitment) {
-            // own-coin spend detected via decryption (belt-and-suspenders alongside nullifier)
         }
     }
 
-    // Update nullifier state for future IVC steps (AFTER receipt check).
     let parent_nullifier_seen = prev_parent_nullifier_seen
         || raw.windows(32).any(|w| w == parent_nullifier);
-    // own_nullifier search: if our spending nullifier appears in this slot,
-    // our coin was spent here (e.g. we spent it in a previous proof of spend).
     let spent = prev_spent
         || raw.windows(32).any(|w| w == own_nullifier);
 
@@ -561,7 +535,6 @@ pub fn check_coin_proof_step(
             parent_nullifier_seen,
         },
         justification,
-        receipt_spend_pv,
     ))
 }
 
@@ -703,7 +676,7 @@ pub fn check_spend(
         }
     }
 
-    Ok(ValidPublicValues { vkey, pk_p, board_root: anchor, board_size: prior_entries.len() + 1 })
+    Ok(ValidPublicValues { vkey, board_root: anchor, board_size: prior_entries.len() + 1 })
 }
 
 #[cfg(test)]
@@ -779,7 +752,7 @@ mod tests {
         let mut inner = None;
         for k in 0..entries.len() {
             let ap = append_proof_for(&entries[..=k]);
-            let (pv, _, _) = check_coin_proof_step(
+            let (pv, _) = check_coin_proof_step(
                 TEST_COIN_PROOF_VKEY, owner_pk, coin_commitment,
                 entries[k].clone(), k, ap, registry.to_vec(), inner.clone(),
                 parent_nullifier, own_nullifier,
