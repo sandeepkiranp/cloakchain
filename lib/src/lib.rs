@@ -520,10 +520,19 @@ pub fn check_coin_proof_step(
                 // Parent coin was spent in an earlier slot → double-spend → skip.
             } else {
                 received_at = Some(slot as u64);
-                receipt_spend_pv = bincode::deserialize::<(Vec<u8>, Vec<u8>)>(&tx.spend_proof)
-                    .ok()
-                    .map(|(pv, _)| pv)
-                    .filter(|b| !b.is_empty());
+                // tx.spend_proof stores either:
+                //   (a) raw ValidPublicValues bytes, or
+                //   (b) a bincode tuple (pv_bytes, full_proof_bytes)
+                // In case (a) the bytes ARE the pv_bytes needed for the digest.
+                // In case (b) extract just the pv portion.
+                receipt_spend_pv = if !tx.spend_proof.is_empty() {
+                    let pv_bytes = bincode::deserialize::<(Vec<u8>, Vec<u8>)>(&tx.spend_proof)
+                        .map(|(pv, _)| pv)
+                        .unwrap_or_else(|_| tx.spend_proof.clone());
+                    Some(pv_bytes)
+                } else {
+                    None
+                };
             }
         }
         if tx.spends_coin(&coin_commitment) {
