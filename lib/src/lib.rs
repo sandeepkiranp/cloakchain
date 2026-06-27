@@ -462,12 +462,12 @@ pub fn check_coin_proof_step(
     append_path: Vec<[u8; 32]>,
     registry: Vec<[u8; 32]>,
     inner: Option<CoinProofPublicValues>,
-    /// `H(parent_input_commitment || sk_parent_spender)` — the nullifier of the
-    /// transaction that CREATED the tracked coin. Known upfront; checked via
-    /// substring search in every prior slot's raw entry bytes.
+    // H(parent_input_commitment || sk_parent_spender) — the nullifier of the
+    // transaction that CREATED the tracked coin. Known upfront; checked via
+    // substring search in every prior slot's raw entry bytes.
     parent_nullifier: [u8; 32],
-    /// `H(coin_commitment || sk_owner)` — the owner's own spending nullifier.
-    /// If found in a prior slot, the coin was already spent (double-spend).
+    // H(coin_commitment || sk_owner) — the owner's own spending nullifier.
+    // If found in a prior slot, the coin was already spent (double-spend).
     own_nullifier: [u8; 32],
 ) -> Result<(CoinProofPublicValues, CoinProofJustification, Option<Vec<u8>>), &'static str> {
     let leaf_k = merkle_leaf(slot, &entry_k);
