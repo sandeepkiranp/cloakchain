@@ -608,13 +608,6 @@ pub fn check_spend(
     if tx_star.input_nullifier != own_nullifier {
         return Err("tx* input_nullifier does not match H(coin_commitment || sk_p)");
     }
-    // Check own nullifier has not appeared in any prior board entry.
-    for entry in &prior_entries {
-        let raw = bincode::serialize(entry).unwrap_or_default();
-        if raw.windows(32).any(|w| w == own_nullifier) {
-            return Err("coin has already been spent (nullifier seen in prior slot)");
-        }
-    }
 
     // Verify input coin preimages match the transaction's committed commitments.
     if input_coins.len() != tx_star.input_commitments.len() {
@@ -652,11 +645,36 @@ pub fn check_spend(
     }
 
     if is_genesis {
-        // Genesis mints are authorised solely by the genesis key — no coin-proof
-        // provenance is required. The mint may appear at any slot on the board
-        // (prior_entries may be non-empty from unrelated Monero transactions).
+        // Genesis creates coins from authority (PoW) — no prior receipt required.
         if pk_p != genesis_pk() {
             return Err("only the genesis key may mint without provenance");
+        }
+        if prior_entries.is_empty() {
+            // Empty board → own_nullifier cannot exist anywhere → double-spend
+            // is trivially impossible. No coin-proof needed.
+        } else {
+            // Prior entries exist → require a coin-proof so cp.spent (set by
+            // the IVC's per-slot own-nullifier search) gives us O(1) double-spend
+            // detection without scanning all entries again here.
+            let cp = coin_proof.ok_or("genesis at a non-empty board requires a coin-proof")?;
+            if cp.vkey != coin_proof_vkey {
+                return Err("coin-proof was produced under an unexpected vkey");
+            }
+            if cp.owner_pk != pk_p {
+                return Err("coin-proof owner must be P");
+            }
+            if cp.coin_commitment != coin_commitment {
+                return Err("coin-proof tracks a different coin");
+            }
+            if cp.board_size != prior_entries.len() {
+                return Err("coin-proof must cover exactly the board prefix before tx*");
+            }
+            if cp.board_root != anchor {
+                return Err("coin-proof's board root does not match the board prefix");
+            }
+            if cp.spent {
+                return Err("P must not have spent this coin before (double spend)");
+            }
         }
     } else {
         let cp = coin_proof.ok_or("non-genesis spends require a coin-proof")?;
@@ -678,6 +696,8 @@ pub fn check_spend(
         if cp.received_at.is_none() {
             return Err("P must have received this coin at some prior slot");
         }
+        // Double-spend check: the IVC encoded cp.spent via per-slot own-nullifier
+        // search → O(1) here, no redundant O(n) scan.
         if cp.spent {
             return Err("P must not have spent this coin before (double spend)");
         }
