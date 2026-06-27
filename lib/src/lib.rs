@@ -652,11 +652,11 @@ pub fn check_spend(
     }
 
     if is_genesis {
+        // Genesis mints are authorised solely by the genesis key — no coin-proof
+        // provenance is required. The mint may appear at any slot on the board
+        // (prior_entries may be non-empty from unrelated Monero transactions).
         if pk_p != genesis_pk() {
             return Err("only the genesis key may mint without provenance");
-        }
-        if !prior_entries.is_empty() {
-            return Err("a genesis mint has no prior history");
         }
     } else {
         let cp = coin_proof.ok_or("non-genesis spends require a coin-proof")?;
