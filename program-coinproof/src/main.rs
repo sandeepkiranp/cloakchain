@@ -2,19 +2,16 @@
 //!
 //! Uses `owner_sk` (private key) for X25519 ECDH decryption in `scan_entry`.
 //!
-//! At the receipt slot the justification carries a `SpendProofPackage`.  We
-//! verify it here with our self-contained Groth16 verifier (BN254 algebraic
-//! check via `substrate-bn-succinct-rs`), establishing a cryptographic chain
-//! of custody from the creating spend proof all the way to this coin-proof.
+//! At the receipt slot the justification carries `ReceiptInfo` (spend vkey +
+//! public values).  We call `verify_sp1_proof` on it — the same mechanism used
+//! for recursive inner-proof verification — establishing a cryptographic chain
+//! of custody without any extra proof format conversions.
 //!
-//! Board entries stay ~1 KB because spend proofs are Groth16 (~356 bytes
-//! inside the package) rather than compressed STARKs (~1.21 MB).
+//! The HOST passes the compressed spend proof as a `write_proof` hint alongside
+//! the inner coin-proof hint.
 
 #![no_main]
-extern crate alloc;
 sp1_zkvm::entrypoint!(main);
-
-mod groth16;
 
 use cloakkchain_lib::{
     check_coin_proof_step, BoardEntry, CoinProofJustification, CoinProofPublicValues,
@@ -40,25 +37,23 @@ pub fn main() {
             .expect("the CoinProof relation does not hold for this step");
 
     // Verify the recursive inner coin-proof (all steps except base case).
+    // The HOST passes the compressed inner proof as write_proof hint #1.
     if let CoinProofJustification::Step { inner_public_values, .. } = &justification {
         let digest: [u8; 32] = Sha256::digest(inner_public_values.encode()).into();
         sp1_zkvm::lib::verify::verify_sp1_proof(&vkey, &digest);
     }
 
-    // At the receipt slot: verify the parent's Groth16 spend proof in-circuit.
-    // This establishes that the coin was created by a valid spend — full chain
-    // of custody without any large proof hints or OOM risk.
-    let receipt_pkg = match &justification {
-        CoinProofJustification::Base { receipt_spend_pkg: Some(p) } => Some(p),
-        CoinProofJustification::Step { receipt_spend_pkg: Some(p), .. } => Some(p),
+    // At the receipt slot: verify the parent's compressed spend proof.
+    // The HOST passes it as write_proof hint #2 (or #1 for base-case receipts).
+    // This establishes a cryptographic chain of custody from spend → coin-proof.
+    let receipt = match &justification {
+        CoinProofJustification::Base { receipt: Some(r) } => Some(r),
+        CoinProofJustification::Step { receipt: Some(r), .. } => Some(r),
         _ => None,
     };
-    if let Some(pkg) = receipt_pkg {
-        groth16::verify_sp1_groth16(
-            &pkg.proof_bytes,
-            &pkg.public_values,
-            &pkg.spend_vkey_hash,
-        ).expect("parent spend proof failed Groth16 verification");
+    if let Some(r) = receipt {
+        let digest: [u8; 32] = Sha256::digest(&r.pv_encode).into();
+        sp1_zkvm::lib::verify::verify_sp1_proof(&r.spend_vkey, &digest);
     }
 
     sp1_zkvm::io::commit_slice(&public_values.encode());
