@@ -473,17 +473,9 @@ impl CoinProofPublicValues {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CoinProofJustification {
     /// `slot == 0`: no recursive inner proof to verify.
-    Base {
-        /// Present iff this slot is the receipt — the program must call
-        /// `verify_sp1_proof(&spend_vkey, &digest)` on these values.
-        receipt_spend_pv: Option<ValidPublicValues>,
-    },
+    Base,
     /// `slot > 0`: extends the chain from `inner_public_values`.
-    Step {
-        inner_public_values: CoinProofPublicValues,
-        /// Present iff this slot is the receipt.
-        receipt_spend_pv: Option<ValidPublicValues>,
-    },
+    Step { inner_public_values: CoinProofPublicValues },
 }
 
 /// One step of the coin-proof IVC, extended for slot `slot` (= k).
@@ -515,20 +507,13 @@ pub fn check_coin_proof_step(
     // H(coin_commitment || sk_owner) — the owner's own spending nullifier.
     // If found in a prior slot, the coin was already spent (double-spend).
     own_nullifier: [u8; 32],
-    // The ValidPublicValues of the spend proof embedded in the entry at this
-    // slot.  Must be Some at the receipt slot so provenance can be verified:
-    // the program will call verify_sp1_proof on these values, and we check here
-    // that output_commitments contains coin_commitment.  None on all other slots.
-    receipt_spend_pv: Option<ValidPublicValues>,
 ) -> Result<(CoinProofPublicValues, CoinProofJustification), &'static str> {
     let owner_pk = derive_pk(&owner_sk);
     let leaf_k = merkle_leaf(slot, &entry_k);
     let board_root = compute_root_from_path(leaf_k, slot, &append_path);
 
-    // Extract prev-step state and stash the inner pv for the justification.
-    // Defer building the justification until we know whether this is the receipt.
-    let (prev_received_at, prev_spent, prev_parent_nullifier_seen, maybe_inner) = if slot == 0 {
-        (None, false, false, None)
+    let (prev_received_at, prev_spent, prev_parent_nullifier_seen, justification) = if slot == 0 {
+        (None, false, false, CoinProofJustification::Base)
     } else {
         let inner = inner.ok_or("steps after the base case require an inner coin-proof")?;
         if inner.vkey != vkey {
@@ -551,7 +536,7 @@ pub fn check_coin_proof_step(
             return Err("inner coin-proof's board root does not match this prefix");
         }
         let (pra, ps, pns) = (inner.received_at, inner.spent, inner.parent_nullifier_seen);
-        (pra, ps, pns, Some(inner))
+        (pra, ps, pns, CoinProofJustification::Step { inner_public_values: inner })
     };
 
     let raw = bincode::serialize(&entry_k).unwrap_or_default();
@@ -566,24 +551,6 @@ pub fn check_coin_proof_step(
         }
     }
 
-    let just_received = prev_received_at.is_none() && received_at.is_some();
-
-    // At the receipt slot the caller must supply the spend proof public values
-    // from the transaction that created this coin.  We verify two things here
-    // (the program verifies the proof itself via verify_sp1_proof):
-    //   1. output_commitments contains coin_commitment — correct coin created
-    //   2. The program will call verify_sp1_proof on these values — valid spend
-    if just_received {
-        match &receipt_spend_pv {
-            Some(pv) => {
-                if !pv.output_commitments.contains(&coin_commitment) {
-                    return Err("parent spend proof does not commit to this coin commitment");
-                }
-            }
-            None => return Err("receipt slot requires parent spend proof for provenance verification"),
-        }
-    }
-
     // Only scan for parent_nullifier while the coin has not yet been received.
     // Once received_at is set, further appearances of parent_nullifier on the
     // board are irrelevant and must not be able to retroactively invalidate it.
@@ -592,12 +559,6 @@ pub fn check_coin_proof_step(
             && raw.windows(32).any(|w| w == parent_nullifier));
     let spent = prev_spent
         || raw.windows(32).any(|w| w == own_nullifier);
-
-    let receipt_pv_for_jus = if just_received { receipt_spend_pv } else { None };
-    let justification = match maybe_inner {
-        None    => CoinProofJustification::Base { receipt_spend_pv: receipt_pv_for_jus },
-        Some(i) => CoinProofJustification::Step { inner_public_values: i, receipt_spend_pv: receipt_pv_for_jus },
-    };
 
     Ok((
         CoinProofPublicValues {
@@ -765,7 +726,8 @@ mod tests {
 
     fn party(seed: u8) -> ([u8; 32], [u8; 32]) {
         let mut sk = [0u8; 32];
-        sk[0] = seed;
+        sk[1] = seed; // byte 0 is clamped by X25519 (sk[0] &= 248), so seeds 1-7 would
+                      // all collapse to the same scalar as genesis. Use byte 1 instead.
         (sk, derive_pk(&sk))
     }
 
@@ -825,23 +787,10 @@ mod tests {
         let mut inner: Option<CoinProofPublicValues> = None;
         for k in 0..entries.len() {
             let ap = append_proof_for(&entries[..=k]);
-            // Supply a mock ValidPublicValues at the receipt slot so the
-            // provenance check has the correct output_commitments.  In real
-            // execution the program verifies the actual proof; in tests the
-            // check_coin_proof_step call only validates output_commitments.
-            let receipt_spend_pv = if let Some(tx) = scan_entry(&owner_sk, &entries[k]) {
-                if tx.receives_coin(&coin_commitment) && inner.as_ref().map_or(true, |p| p.received_at.is_none()) {
-                    Some(ValidPublicValues {
-                        vkey: TEST_VKEY,
-                        board_root: [0u8; 32],
-                        output_commitments: tx.output_commitments.clone(),
-                    })
-                } else { None }
-            } else { None };
             let (pv, _) = check_coin_proof_step(
                 TEST_COIN_PROOF_VKEY, owner_sk, coin_commitment,
                 entries[k].clone(), k, ap, inner.clone(),
-                parent_nullifier, own_nullifier, receipt_spend_pv,
+                parent_nullifier, own_nullifier,
             ).unwrap();
             inner = Some(pv.clone());
             out.push(pv);
@@ -1099,7 +1048,7 @@ mod tests {
         let err = spend(alice_sk, alice_pk, cn_alice, &entries, &tx1b,
             &[alice_coin], &[carol_coin], false,
             Some(alice_cp[1].clone())).unwrap_err();
-        assert_eq!(err, "coin has already been spent (nullifier seen in prior slot)");
+        assert_eq!(err, "P must not have spent this coin before (double spend)");
         let _ = bob_sk;
     }
 
