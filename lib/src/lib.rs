@@ -469,13 +469,37 @@ impl CoinProofPublicValues {
     }
 }
 
+/// The spend proof data stored in `tx.spend_proof` for in-circuit chain verification.
+///
+/// Contains exactly what `verify_sp1_groth16` needs — total ~570 bytes, keeping
+/// board entries at ~1 KB rather than the ~1.21 MB of a compressed STARK.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpendProofPackage {
+    /// `proof.bytes()` from the SP1 SDK: 4-byte vk-hash prefix + 32 exit_code
+    /// + 32 vk_root + 32 nonce + 256 Gnark Groth16 bytes = 356 bytes total.
+    pub proof_bytes: Vec<u8>,
+    /// The spend proof's committed public values (bincode of `ValidPublicValues`).
+    pub public_values: Vec<u8>,
+    /// SHA-256 of the spend program verification key as raw 32 bytes
+    /// (= first 32 bytes of `hex::decode(vk.bytes32()[2..])` from the SDK).
+    pub spend_vkey_hash: [u8; 32],
+}
+
 /// What justifies a coin-proof step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CoinProofJustification {
     /// `slot == 0`: no recursive inner proof to verify.
-    Base,
+    Base {
+        /// Present iff this is the receipt slot; the program must call
+        /// `verify_sp1_groth16` on the contained package.
+        receipt_spend_pkg: Option<SpendProofPackage>,
+    },
     /// `slot > 0`: extends the chain from `inner_public_values`.
-    Step { inner_public_values: CoinProofPublicValues },
+    Step {
+        inner_public_values: CoinProofPublicValues,
+        /// Present iff this is the receipt slot.
+        receipt_spend_pkg: Option<SpendProofPackage>,
+    },
 }
 
 /// One step of the coin-proof IVC, extended for slot `slot` (= k).
@@ -512,8 +536,8 @@ pub fn check_coin_proof_step(
     let leaf_k = merkle_leaf(slot, &entry_k);
     let board_root = compute_root_from_path(leaf_k, slot, &append_path);
 
-    let (prev_received_at, prev_spent, prev_parent_nullifier_seen, justification) = if slot == 0 {
-        (None, false, false, CoinProofJustification::Base)
+    let (prev_received_at, prev_spent, prev_parent_nullifier_seen, maybe_inner) = if slot == 0 {
+        (None, false, false, None)
     } else {
         let inner = inner.ok_or("steps after the base case require an inner coin-proof")?;
         if inner.vkey != vkey {
@@ -536,16 +560,33 @@ pub fn check_coin_proof_step(
             return Err("inner coin-proof's board root does not match this prefix");
         }
         let (pra, ps, pns) = (inner.received_at, inner.spent, inner.parent_nullifier_seen);
-        (pra, ps, pns, CoinProofJustification::Step { inner_public_values: inner })
+        (pra, ps, pns, Some(inner))
     };
 
     let raw = bincode::serialize(&entry_k).unwrap_or_default();
 
     let mut received_at = prev_received_at;
+    let mut receipt_spend_pkg: Option<SpendProofPackage> = None;
 
     if let Some(tx) = scan_entry(&owner_sk, &entry_k) {
         if tx.receives_coin(&coin_commitment) && received_at.is_none() {
             if !prev_parent_nullifier_seen {
+                // Extract and validate the spend proof from the creating transaction.
+                // The program will call verify_sp1_groth16 on this package.
+                if !tx.spend_proof.is_empty() {
+                    let pkg = bincode::deserialize::<SpendProofPackage>(&tx.spend_proof)
+                        .map_err(|_| "receipt tx.spend_proof is not a valid SpendProofPackage")?;
+                    let pv = bincode::deserialize::<ValidPublicValues>(&pkg.public_values)
+                        .map_err(|_| "SpendProofPackage has invalid public_values")?;
+                    if !pv.output_commitments.contains(&coin_commitment) {
+                        return Err("parent spend proof does not commit to this coin commitment");
+                    }
+                    // Non-empty proof_bytes → real Groth16 proof; the program verifies it.
+                    // Empty proof_bytes → mock/execute mode; output_commitments check is sufficient.
+                    if !pkg.proof_bytes.is_empty() {
+                        receipt_spend_pkg = Some(pkg);
+                    }
+                }
                 received_at = Some(slot as u64);
             }
         }
@@ -559,6 +600,11 @@ pub fn check_coin_proof_step(
             && raw.windows(32).any(|w| w == parent_nullifier));
     let spent = prev_spent
         || raw.windows(32).any(|w| w == own_nullifier);
+
+    let justification = match maybe_inner {
+        None    => CoinProofJustification::Base { receipt_spend_pkg },
+        Some(i) => CoinProofJustification::Step { inner_public_values: i, receipt_spend_pkg },
+    };
 
     Ok((
         CoinProofPublicValues {

@@ -556,6 +556,7 @@ dependencies = [
  "cloakkchain-lib",
  "sha2",
  "sp1-zkvm",
+ "substrate-bn-succinct-rs",
 ]
 
 [[package]]

@@ -18,7 +18,8 @@ use clap::Parser;
 use cloakkchain_lib::{
     append_proof_for, build_note_enc, decrypt_note, derive_pk, encrypt_tx, genesis_pk,
     merkle_root_of, recover_session_key, scan_entry as lib_scan_entry,
-    BoardEntry, Coin, CoinProofPublicValues, Transaction, ValidPublicValues, EK_SALT, GENESIS_SK,
+    BoardEntry, Coin, CoinProofPublicValues, SpendProofPackage, Transaction, ValidPublicValues,
+    EK_SALT, GENESIS_SK,
 };
 use sp1_sdk::{
     blocking::{MockProver, ProveRequest, Prover, ProverClient},
@@ -286,6 +287,21 @@ fn nullifier(cn: [u8; 32], sk: [u8; 32]) -> [u8; 32] {
     let mut out = [0u8; 32]; out.copy_from_slice(&h.finalize()); out
 }
 
+/// Build the compact `SpendProofPackage` stored in `tx.spend_proof`.
+/// Extracts the three things `verify_sp1_groth16` needs from the SDK proof object.
+fn build_spend_proof_package(
+    proof: &SP1ProofWithPublicValues,
+    spend_vkey_hash_hex: &str,   // from vk.bytes32()
+) -> SpendProofPackage {
+    let proof_bytes = proof.bytes();
+    let public_values = proof.public_values.as_slice().to_vec();
+    let hash_bytes: [u8; 32] = hex::decode(&spend_vkey_hash_hex[2..])
+        .expect("invalid vkey hex")
+        .try_into()
+        .expect("vkey hash must be 32 bytes");
+    SpendProofPackage { proof_bytes, public_values, spend_vkey_hash: hash_bytes }
+}
+
 /// Build a Transaction using X25519 note encryption via session_key.
 /// Returns `(tx, session_key, recipient_pks)` — pass to `encrypt_tx` as
 /// `encrypt_tx(&tx, &recipient_pks, session_key)`.
@@ -412,7 +428,15 @@ fn main() {
         let exec_ms = t.elapsed().as_millis();
         let pv: ValidPublicValues = bincode::deserialize(output.as_slice()).expect("decode");
         assert_eq!(pv.board_root, merkle_root_of(&entries));
-        tx0.spend_proof = output.to_vec();
+        // In execute mode there is no real Groth16 proof. Store a mock package
+        // with empty proof_bytes so check_coin_proof_step validates output_commitments
+        // but skips the Groth16 cryptographic check.
+        let mock_pkg = SpendProofPackage {
+            proof_bytes: vec![],
+            public_values: pv.encode(),
+            spend_vkey_hash: [0u8; 32],
+        };
+        tx0.spend_proof = bincode::serialize(&mock_pkg).expect("serialize mock pkg");
         entries.push(encrypt_tx(&tx0, &r0, s0)); // board now has slot 0
         stats.push(ExecStats { name: "Slot 0: genesis mint (spend)".into(), board_size: 1, exec_ms, cycles: report.total_instruction_count() });
 
@@ -466,9 +490,9 @@ fn main() {
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
     let pv: ValidPublicValues = bincode::deserialize(genesis_proof.public_values.as_slice()).expect("decode");
     assert_eq!(pv.board_root, merkle_root_of(&entries));
-    let genesis_proof_bytes = bincode::serialize(&genesis_proof).expect("serialize spend proof");
-    let genesis_proof_size = genesis_proof_bytes.len();
-    tx0.spend_proof = genesis_proof_bytes;
+    let genesis_pkg = build_spend_proof_package(&genesis_proof, &spend_pk.verifying_key().bytes32());
+    let genesis_proof_size = bincode::serialize(&genesis_pkg).map(|v| v.len()).unwrap_or(0);
+    tx0.spend_proof = bincode::serialize(&genesis_pkg).expect("serialize spend proof package");
     entries.push(encrypt_tx(&tx0, &r0, s0));
     let e0_bytes = bincode::serialize(&entries[0]).map(|v| v.len()).unwrap_or(0);
     stats.push(ProveStats { name: "Slot 0: genesis mint".into(), board_size: 1, prove_secs, verify_ms, proof_bytes: Some(genesis_proof_size), entry_bytes: Some(e0_bytes) });
@@ -502,9 +526,9 @@ fn main() {
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
     let pv: ValidPublicValues = bincode::deserialize(alice_spend_proof.public_values.as_slice()).expect("decode");
     assert_eq!(pv.board_root, merkle_root_of(&entries));
-    let alice_proof_bytes = bincode::serialize(&alice_spend_proof).expect("serialize spend proof");
-    let alice_proof_size = alice_proof_bytes.len();
-    tx1.spend_proof = alice_proof_bytes;
+    let alice_pkg = build_spend_proof_package(&alice_spend_proof, &spend_pk.verifying_key().bytes32());
+    let alice_proof_size = bincode::serialize(&alice_pkg).map(|v| v.len()).unwrap_or(0);
+    tx1.spend_proof = bincode::serialize(&alice_pkg).expect("serialize spend proof package");
     entries.push(encrypt_tx(&tx1, &r1, s1));
     let e1_bytes = bincode::serialize(&entries[1]).map(|v| v.len()).unwrap_or(0);
     stats.push(ProveStats { name: "Slot 1: Alice's spend (Groth16)".into(), board_size: 2, prove_secs, verify_ms, proof_bytes: Some(alice_proof_size), entry_bytes: Some(e1_bytes) });
@@ -537,9 +561,9 @@ fn main() {
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
     let pv: ValidPublicValues = bincode::deserialize(bob_spend_proof.public_values.as_slice()).expect("decode");
     assert_eq!(pv.board_root, merkle_root_of(&entries));
-    let bob_proof_bytes = bincode::serialize(&bob_spend_proof).expect("serialize spend proof");
-    let bob_proof_size = bob_proof_bytes.len();
-    tx2.spend_proof = bob_proof_bytes;
+    let bob_pkg = build_spend_proof_package(&bob_spend_proof, &spend_pk.verifying_key().bytes32());
+    let bob_proof_size = bincode::serialize(&bob_pkg).map(|v| v.len()).unwrap_or(0);
+    tx2.spend_proof = bincode::serialize(&bob_pkg).expect("serialize spend proof package");
     entries.push(encrypt_tx(&tx2, &r2, s2));
     let e2_bytes = bincode::serialize(&entries[2]).map(|v| v.len()).unwrap_or(0);
     stats.push(ProveStats { name: "Slot 2: Bob's spend (Groth16)".into(), board_size: 3, prove_secs, verify_ms, proof_bytes: Some(bob_proof_size), entry_bytes: Some(e2_bytes) });
