@@ -1,15 +1,12 @@
-use sp1_sdk::{blocking::MockProver, blocking::Prover, include_elf, Elf, HashableKey, ProvingKey};
-
-/// The ELF files for the Succinct RISC-V zkVM.
-const CLOAKKCHAIN_SPEND_ELF: Elf = include_elf!("cloakkchain-program-spend");
-const CLOAKKCHAIN_COINPROOF_ELF: Elf = include_elf!("cloakkchain-program-coinproof");
+//! Print the VK hash for a bb verification key file.
+//! Usage: cargo run --bin vkey -- path/to/vk/vk_hash
 
 fn main() {
-    let prover = MockProver::new();
-
-    let spend_pk = prover.setup(CLOAKKCHAIN_SPEND_ELF).expect("failed to setup spend elf");
-    println!("spend:     {}", spend_pk.verifying_key().bytes32());
-
-    let coinproof_pk = prover.setup(CLOAKKCHAIN_COINPROOF_ELF).expect("failed to setup coinproof elf");
-    println!("coinproof: {}", coinproof_pk.verifying_key().bytes32());
+    let path = std::env::args().nth(1).expect("usage: vkey <path-to-vk_hash>");
+    let raw = std::fs::read(&path).expect("read vk_hash");
+    if raw.len() == 32 {
+        println!("0x{}", hex::encode(&raw));
+    } else {
+        println!("{}", String::from_utf8_lossy(&raw).trim());
+    }
 }
