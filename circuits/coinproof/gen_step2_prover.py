@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Generate Prover.toml for coinproof_step at slot=1.
-Run from circuits/coinproof/ with coinproof_base already proved at ../coinproof_base/.
+Generate Prover.toml for coinproof_step at slot=2.
+Run from circuits/coinproof/ after slot=1 has been proved (artifacts in target/).
+The VK is the same coinproof_step VK — no need to rerun bb write_vk.
 """
 
 import hashlib
 import os
 import struct
 
-BASE_DIR = "../coinproof_base"
+STEP_DIR = "."   # coinproof_step artifacts (slot=1 proof used as inner)
 
 def blake2s(data: bytes) -> bytes:
     return hashlib.blake2s(data, digest_size=32).digest()
@@ -73,45 +74,62 @@ def zeros32() -> str:
 def arr8x32z() -> str:
     return '[' + ', '.join([zeros32()] * 8) + ']'
 
-# ── Compute inner state from coinproof_base (all-zero inputs, proper Z paths) ──
-
 Z32 = bytes(32)
 
-# leaf_0: coinproof_base at slot 0, all-zero entry
+# ── Reconstruct leaf_0 and leaf_1 ──────────────────────────────────────────
 leaf_0 = compute_leaf(0, [Z32]*8, Z32)
+leaf_1 = compute_leaf(1, [Z32]*8, Z32)
 print(f"leaf_0 = {list(leaf_0)}")
+print(f"leaf_1 = {list(leaf_1)}")
 
-# new_root_0: computed with proper Z[h] at every depth (coinproof_base uses idx=0 always)
-inner_board_root = compute_root(leaf_0, 0, [Z[h] for h in range(32)])
-print(f"inner_board_root (new_root_0) = {list(inner_board_root)}")
+# ── Verify inner_board_root (new_root_1) from slot=1 public_inputs ──────────
+pub_path = os.path.join(STEP_DIR, "target/proof/public_inputs")
+with open(pub_path, 'rb') as f:
+    pub_data = f.read()
+total_fields = len(pub_data) // 32
+print(f"coinproof_step (slot=1) public_inputs: {total_fields} fields")
 
-inner_spent             = True   # entry_nullifier=0 == own_nullifier=0
-inner_parent_null_seen  = True   # entry_nullifier=0 == parent_nullifier=0
-inner_rcv_valid         = False
-inner_board_size        = 1
-
-inner_state_hash = state_hash_py(
-    Z32, Z32, inner_board_root,
-    inner_board_size, inner_rcv_valid, 0,
-    inner_spent, Z32, inner_parent_null_seen,
+# state_hash is at fields [97..129] in coinproof_step's public_inputs
+inner_state_hash = bytes(
+    int.from_bytes(pub_data[(97+i)*32:(97+i+1)*32], 'big') for i in range(32)
 )
-print(f"inner_state_hash = {list(inner_state_hash)}")
+print(f"inner_state_hash (from slot=1 proof) = {list(inner_state_hash)}")
 
-# ── Merkle path for slot=1 ──────────────────────────────────────────────────
-# append_path for slot=1:
-#   [0]: leaf_0 (sibling of slot 1 is slot 0 = leaf_0)
-#   [h]: Z[h] for h >= 1 (proper empty subtree hash)
-step_path = [leaf_0] + [Z[h] for h in range(1, 32)]
+# ── Recompute inner state to extract inner_board_root ─────────────────────
+# new_root_1: computed with proper Z paths for slot=1
+new_root_1 = compute_root(leaf_1, 1, [leaf_0] + [Z[h] for h in range(1, 32)])
+print(f"new_root_1 (inner_board_root) = {list(new_root_1)}")
 
-old_root_check = compute_root(Z32, 1, step_path)
-assert old_root_check == inner_board_root, (
-    f"Root mismatch!\n  got: {list(old_root_check)}\n  want: {list(inner_board_root)}")
-print("✓ Merkle root consistency verified (old_root_1 == new_root_0)")
+# Recompute state_hash for slot=1 to cross-check
+inner_board_root = new_root_1
+inner_state_recomputed = state_hash_py(
+    Z32, Z32, inner_board_root,
+    2, False, 0, True, Z32, True,
+)
+if inner_state_recomputed != inner_state_hash:
+    print(f"WARNING: recomputed state_hash != circuit output; using circuit output")
+    print(f"  recomputed: {list(inner_state_recomputed)}")
+    print(f"  circuit:    {list(inner_state_hash)}")
+else:
+    print("✓ inner_state_hash verified")
 
-# ── Read coinproof_base artifacts ────────────────────────────────────────────
-vk_path    = os.path.join(BASE_DIR, "target/vk/vk")
-proof_path = os.path.join(BASE_DIR, "target/proof/proof")
-vkhash_path= os.path.join(BASE_DIR, "target/vk/vk_hash")
+# ── Merkle path for slot=2 ───────────────────────────────────────────────────
+# append_path for slot=2:
+#   [0]: Z[0] = [0;32]   (sibling of slot 2 is slot 3 = empty leaf)
+#   [1]: blake2s(leaf_0 || leaf_1)  (sibling of pair (2,3) is filled pair (0,1))
+#   [h]: Z[h] for h >= 2  (proper empty subtree hash)
+pair_01 = blake2s(leaf_0 + leaf_1)
+step_path = [Z[0], pair_01] + [Z[h] for h in range(2, 32)]
+
+old_root_2 = compute_root(Z32, 2, step_path)
+assert old_root_2 == new_root_1, (
+    f"Root mismatch!\n  old_root_2: {list(old_root_2)}\n  new_root_1: {list(new_root_1)}")
+print("✓ Merkle root consistency verified (old_root_2 == new_root_1)")
+
+# ── Read coinproof_step (slot=1) proof artifacts ────────────────────────────
+vk_path    = os.path.join(STEP_DIR, "target/vk/vk")
+proof_path = os.path.join(STEP_DIR, "target/proof/proof")
+vkhash_path= os.path.join(STEP_DIR, "target/vk/vk_hash")
 
 inner_vk_fields    = read_fields_be(vk_path, 115)
 inner_proof_fields = read_fields_be(proof_path, 457)
@@ -120,24 +138,6 @@ inner_vk_hash      = read_vk_hash(vkhash_path)
 print(f"VK fields: {len(inner_vk_fields)}, proof fields: {len(inner_proof_fields)}")
 print(f"VK hash: {inner_vk_hash[:20]}...")
 
-# Cross-check inner_state_hash against coinproof_base's public_inputs
-pub_path = os.path.join(BASE_DIR, "target/proof/public_inputs")
-with open(pub_path, 'rb') as f:
-    pub_data = f.read()
-total_fields = len(pub_data) // 32
-print(f"coinproof_base public_inputs: {total_fields} fields")
-# state_hash is at fields [97..129] (slot=0 at [64], parent_nullifier at [65..97])
-circuit_state_hash = bytes(
-    int.from_bytes(pub_data[(97+i)*32:(97+i+1)*32], 'big') for i in range(32)
-)
-if circuit_state_hash != inner_state_hash:
-    print(f"WARNING: computed state_hash != circuit output; using circuit output")
-    print(f"  computed: {list(inner_state_hash)}")
-    print(f"  circuit:  {list(circuit_state_hash)}")
-    inner_state_hash = circuit_state_hash
-else:
-    print("✓ State hash verified against circuit output")
-
 # ── Write Prover.toml ─────────────────────────────────────────────────────────
 path_rows = ', '.join(arr32(p) for p in step_path)
 
@@ -145,8 +145,8 @@ lines = [
     # public inputs
     f"owner_pk = {zeros32()}",
     f"coin_commitment = {zeros32()}",
-    f'slot = "0x0000000000000001"',
-    # board entry at slot 1 (all zeros)
+    f'slot = "0x0000000000000002"',
+    # board entry at slot 2 (all zeros)
     f"entry_output_commitments = {arr8x32z()}",
     f'entry_num_outputs = "0x0000000000000000"',
     f"entry_nullifier = {zeros32()}",
@@ -156,16 +156,16 @@ lines = [
     # nullifiers
     f"parent_nullifier = {zeros32()}",
     f"own_nullifier = {zeros32()}",
-    # inner proof (coinproof_base)
+    # inner proof (coinproof_step slot=1)
     f"inner_vk = [{', '.join(inner_vk_fields)}]",
     f"inner_proof = [{', '.join(inner_proof_fields)}]",
     f"inner_vk_hash = {inner_vk_hash}",
-    # inner state witnesses
+    # inner state witnesses (from coinproof_step slot=1)
     f"inner_state_hash = {arr32(inner_state_hash)}",
     f"inner_owner_pk = {zeros32()}",
     f"inner_coin_commitment = {zeros32()}",
     f"inner_board_root = {arr32(inner_board_root)}",
-    f'inner_board_size = "0x0000000000000001"',
+    f'inner_board_size = "0x0000000000000002"',   # slot=1 produced board_size=2
     f"inner_received_at_valid = false",
     f'inner_received_at = "0x0000000000000000"',
     f"inner_spent = true",
