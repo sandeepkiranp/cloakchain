@@ -1,0 +1,7 @@
+[package]
+name = "coinproof_base"
+type = "bin"
+authors = ["CloakChain"]
+compiler_version = ">=1.0.0"
+
+[dependencies]
