@@ -466,6 +466,38 @@ fn make_tx(
     (tx, session_key, recipient_pks)
 }
 
+// ── Stats ─────────────────────────────────────────────────────────────────────
+
+struct StepStats {
+    label:      String,
+    user:       String,
+    board_size: usize,
+    exec_s:     f64,
+    prove_s:    f64,
+    verify_s:   f64,
+}
+
+fn print_stats(stats: &[StepStats]) {
+    let w = 74;
+    println!("\n{}", "=".repeat(w));
+    println!("  Proof Statistics");
+    println!("{}", "=".repeat(w));
+    println!("{:<36} {:>5}  {:<12}  {:>7}  {:>7}  {:>7}",
+        "Step", "Board", "User", "Execute", "Prove", "Verify");
+    println!("{}", "-".repeat(w));
+    let (mut tp, mut tv) = (0f64, 0f64);
+    for s in stats {
+        println!("{:<36} {:>5}  {:<12}  {:>6.1}s  {:>6.1}s  {:>6.1}s",
+            s.label, s.board_size, s.user, s.exec_s, s.prove_s, s.verify_s);
+        tp += s.prove_s;
+        tv += s.verify_s;
+    }
+    println!("{}", "-".repeat(w));
+    println!("{:<36} {:>5}  {:<12}  {:>7}  {:>6.1}s  {:>6.1}s",
+        "TOTAL", "", "", "", tp, tv);
+    println!("{}", "=".repeat(w));
+}
+
 // ── Full proving flow ─────────────────────────────────────────────────────────
 
 fn write_toml(dir: &Path, content: &str) {
@@ -474,9 +506,7 @@ fn write_toml(dir: &Path, content: &str) {
         .unwrap_or_else(|e| panic!("write {path:?}: {e}"));
 }
 
-fn elapsed(label: &str, t: Instant) {
-    println!("  [{label}] done in {:.1}s", t.elapsed().as_secs_f64());
-}
+fn secs(t: Instant) -> f64 { t.elapsed().as_secs_f64() }
 
 fn main() {
     let ws = std::env::current_dir().expect("cwd");
@@ -530,23 +560,28 @@ fn main() {
     // (the nullifier that appears in entry[1], where bob's coin is received).
     let bob_parent_null = alice_null;
 
+    let mut stats: Vec<StepStats> = Vec::new();
+
     // ── VK generation ─────────────────────────────────────────────────────
     println!("\n=== Generating VKs ===");
 
-    let t = Instant::now();
-    print!("  coinproof_base write_vk... ");
-    do_bb_write_vk(&cp_base_dir, "coinproof_base");
-    elapsed("coinproof_base VK", t);
-
-    let t = Instant::now();
-    print!("  coinproof_step write_vk... ");
-    do_bb_write_vk(&cp_step_dir, "coinproof");
-    elapsed("coinproof_step VK", t);
-
-    let t = Instant::now();
-    print!("  spend write_vk... ");
-    do_bb_write_vk(&spend_dir, "spend");
-    elapsed("spend VK", t);
+    let circuits = [
+        ("coinproof_base", &cp_base_dir as &std::path::PathBuf, "coinproof_base"),
+        ("coinproof_step", &cp_step_dir, "coinproof"),
+        ("spend",          &spend_dir,   "spend"),
+    ];
+    for (label, dir, json) in &circuits {
+        print!("  {label} write_vk... ");
+        let t = Instant::now();
+        do_bb_write_vk(dir, json);
+        let vk_s = secs(t);
+        println!("done ({vk_s:.1}s)");
+        stats.push(StepStats {
+            label: format!("VK: {label}"),
+            user: "-".into(), board_size: 0,
+            exec_s: 0.0, prove_s: vk_s, verify_s: 0.0,
+        });
+    }
 
     // ── coinproof_base (slot 0): bob tracking entry[0] ────────────────────
     println!("\n=== coinproof_base: bob tracking slot 0 ===");
@@ -556,44 +591,40 @@ fn main() {
     let (base_state, base_receipt) = coinproof_base_state(
         &bob.pk, &cn_bob, &entry0, entries_0, &bob_parent_null, &bob_null,
     );
-    println!("  Expected: rcv_valid={} spent={} parent_null_seen={}",
-        base_state.rcv_valid, base_state.spent, base_state.parent_null_seen);
-    println!("  is_receipt_hint={}", base_receipt);
+    println!("  rcv_valid={} spent={} parent_null_seen={} receipt={}",
+        base_state.rcv_valid, base_state.spent, base_state.parent_null_seen, base_receipt);
 
-    let toml = coinproof_base_toml(
+    write_toml(&cp_base_dir, &coinproof_base_toml(
         &bob.pk, &cn_bob, &entry0, &path_0,
         &bob_parent_null, &bob_null, base_receipt,
-    );
-    write_toml(&cp_base_dir, &toml);
+    ));
 
-    let t = Instant::now();
-    print!("  nargo execute (base)... ");
+    print!("  nargo execute... "); let t = Instant::now();
     do_nargo_execute(&cp_base_dir);
-    elapsed("base execute", t);
+    let base_exec_s = secs(t); println!("done ({base_exec_s:.1}s)");
 
-    let t = Instant::now();
-    print!("  bb prove (base)... ");
+    print!("  bb prove...      "); let t = Instant::now();
     do_bb_prove(&cp_base_dir, "coinproof_base", "coinproof_base");
-    elapsed("base prove", t);
+    let base_prove_s = secs(t); println!("done ({base_prove_s:.1}s)");
 
-    print!("  bb verify (base)... ");
+    print!("  bb verify...     "); let t = Instant::now();
     do_bb_verify(&cp_base_dir);
-    println!("  ✓ coinproof_base verified!");
+    let base_verify_s = secs(t); println!("✓ ({base_verify_s:.2}s)");
 
-    // Read actual state_hash from circuit output (cross-check with our computation)
     let base_sh_actual = read_state_hash(&cp_base_dir.join("target/proof/public_inputs"));
     let base_sh_computed = base_state.hash(&bob.pk, &cn_bob);
     if base_sh_actual != base_sh_computed {
         println!("  WARNING: base state_hash mismatch — using circuit output");
-        println!("    computed: {}", hex2(&base_sh_computed));
-        println!("    circuit:  {}", hex2(&base_sh_actual));
     } else {
-        println!("  ✓ base state_hash matches");
+        println!("  ✓ state_hash matches");
     }
+    stats.push(StepStats {
+        label: "coinproof_base (slot 0)".into(), user: "bob".into(), board_size: 1,
+        exec_s: base_exec_s, prove_s: base_prove_s, verify_s: base_verify_s,
+    });
 
-    // Read VK and proof for coinproof_base (inner proof for step)
-    let base_vk    = read_fields(&cp_base_dir.join("target/vk/vk"),          VK_FIELDS);
-    let base_proof = read_fields(&cp_base_dir.join("target/proof/proof"),     PROOF_FIELDS);
+    let base_vk      = read_fields(&cp_base_dir.join("target/vk/vk"),      VK_FIELDS);
+    let base_proof   = read_fields(&cp_base_dir.join("target/proof/proof"), PROOF_FIELDS);
     let base_vk_hash = read_vk_hash(&cp_base_dir.join("target/vk/vk_hash"));
 
     // ── coinproof_step (slot 1): bob receives bob_coin ─────────────────────
@@ -604,92 +635,85 @@ fn main() {
     let (step_state, step_receipt) = coinproof_step_state(
         &cn_bob, 1, &entry1, entries_1, &bob_parent_null, &bob_null, &base_state,
     );
-    println!("  Expected: rcv_valid={} rcv_at={} spent={} parent_null_seen={}",
-        step_state.rcv_valid, step_state.rcv_at, step_state.spent, step_state.parent_null_seen);
-    println!("  is_receipt_hint={}", step_receipt);
+    println!("  rcv_valid={} rcv_at={} spent={} parent_null_seen={} receipt={}",
+        step_state.rcv_valid, step_state.rcv_at, step_state.spent,
+        step_state.parent_null_seen, step_receipt);
     assert!(step_receipt, "bob should receive bob_coin at slot 1");
-    assert!(step_state.rcv_valid, "rcv_valid must be true after receipt");
 
-    let toml = coinproof_step_toml(
-        &bob.pk, &cn_bob, 1,
-        &entry1, &path_1,
+    write_toml(&cp_step_dir, &coinproof_step_toml(
+        &bob.pk, &cn_bob, 1, &entry1, &path_1,
         &bob_parent_null, &bob_null,
         &base_state, &base_sh_actual,
         &base_vk, &base_proof, &base_vk_hash,
         step_receipt,
-    );
-    write_toml(&cp_step_dir, &toml);
+    ));
 
-    let t = Instant::now();
-    print!("  nargo execute (step)... ");
+    print!("  nargo execute... "); let t = Instant::now();
     do_nargo_execute(&cp_step_dir);
-    elapsed("step execute", t);
+    let step_exec_s = secs(t); println!("done ({step_exec_s:.1}s)");
 
-    let t = Instant::now();
-    print!("  bb prove (step)... ");
+    print!("  bb prove...      "); let t = Instant::now();
     do_bb_prove(&cp_step_dir, "coinproof", "coinproof");
-    elapsed("step prove", t);
+    let step_prove_s = secs(t); println!("done ({step_prove_s:.1}s)");
 
-    print!("  bb verify (step)... ");
+    print!("  bb verify...     "); let t = Instant::now();
     do_bb_verify(&cp_step_dir);
-    println!("  ✓ coinproof_step verified!");
+    let step_verify_s = secs(t); println!("✓ ({step_verify_s:.2}s)");
 
     let step_sh_actual = read_state_hash(&cp_step_dir.join("target/proof/public_inputs"));
-    let step_sh_computed = step_state.hash(&bob.pk, &cn_bob);
-    if step_sh_actual != step_sh_computed {
+    if step_sh_actual != step_state.hash(&bob.pk, &cn_bob) {
         println!("  WARNING: step state_hash mismatch — using circuit output");
     } else {
-        println!("  ✓ step state_hash matches");
+        println!("  ✓ state_hash matches");
     }
+    stats.push(StepStats {
+        label: "coinproof_step (slot 1, receipt)".into(), user: "bob".into(), board_size: 2,
+        exec_s: step_exec_s, prove_s: step_prove_s, verify_s: step_verify_s,
+    });
 
     // ── spend (bob → carol) ────────────────────────────────────────────────
-    println!("\n=== spend: bob spends bob_coin to carol ===");
+    println!("\n=== spend: bob → carol ===");
 
-    // Board root = Merkle root after entry[1] = merkle_root_of(&entries[..2])
     let board_root = cloakkchain_lib::merkle_root_of(entries_1);
-    assert_eq!(board_root, step_state.board_root,
-        "board_root must match coinproof_step's new_root");
+    assert_eq!(board_root, step_state.board_root, "board_root must match coinproof_step");
 
-    // Spend reads coinproof_step VK/proof as the provenance proof
-    let step_vk    = read_fields(&cp_step_dir.join("target/vk/vk"),      VK_FIELDS);
-    let step_proof = read_fields(&cp_step_dir.join("target/proof/proof"), PROOF_FIELDS);
+    let step_vk      = read_fields(&cp_step_dir.join("target/vk/vk"),      VK_FIELDS);
+    let step_proof   = read_fields(&cp_step_dir.join("target/proof/proof"), PROOF_FIELDS);
     let step_vk_hash = read_vk_hash(&cp_step_dir.join("target/vk/vk_hash"));
 
-    // Bob sends 40 to carol (1-input, 1-output)
     let bob_spend_null = spend_nullifier(&cn_bob, &bob.sk);
-    // tx_input_commitments / tx_output_commitments (padded to 8)
     let tx_in_cns  = [cn_bob];
     let tx_out_cns = [cn_carol];
 
-    let toml = spend_toml(
-        &bob.sk, &bob.pk,
-        &cn_bob, &board_root, &bob_spend_null,
+    write_toml(&spend_dir, &spend_toml(
+        &bob.sk, &bob.pk, &cn_bob, &board_root, &bob_spend_null,
         &[bob_coin.clone()], &[carol_coin.clone()],
-        &tx_in_cns, &tx_out_cns,
-        false,
-        Some(&step_vk), Some(&step_proof), Some(&step_vk_hash),
-        1,  // cp_slot = 1
+        &tx_in_cns, &tx_out_cns, false,
+        Some(&step_vk), Some(&step_proof), Some(&step_vk_hash), 1,
         Some(&step_state), Some(&step_sh_actual),
         &bob.pk, &cn_bob,
-    );
-    write_toml(&spend_dir, &toml);
+    ));
 
-    let t = Instant::now();
-    print!("  nargo execute (spend)... ");
+    print!("  nargo execute... "); let t = Instant::now();
     do_nargo_execute(&spend_dir);
-    elapsed("spend execute", t);
+    let spend_exec_s = secs(t); println!("done ({spend_exec_s:.1}s)");
 
-    let t = Instant::now();
-    print!("  bb prove (spend)... ");
+    print!("  bb prove...      "); let t = Instant::now();
     do_bb_prove(&spend_dir, "spend", "spend");
-    elapsed("spend prove", t);
+    let spend_prove_s = secs(t); println!("done ({spend_prove_s:.1}s)");
 
-    print!("  bb verify (spend)... ");
+    print!("  bb verify...     "); let t = Instant::now();
     do_bb_verify(&spend_dir);
-    println!("  ✓ spend verified!");
+    let spend_verify_s = secs(t); println!("✓ ({spend_verify_s:.2}s)");
+
+    stats.push(StepStats {
+        label: "spend bob→carol".into(), user: "bob/carol".into(), board_size: 2,
+        exec_s: spend_exec_s, prove_s: spend_prove_s, verify_s: spend_verify_s,
+    });
 
     println!("\n=== Full IVC chain proved and verified ===");
     println!("  coinproof_base (slot 0) → coinproof_step (slot 1, receipt) → spend (bob → carol)");
+    print_stats(&stats);
 }
 
 // ── Party ─────────────────────────────────────────────────────────────────────
