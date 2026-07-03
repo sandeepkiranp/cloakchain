@@ -122,9 +122,6 @@ fn main(
     inner_vk: UltraHonkVerificationKey,
     inner_proof: UltraHonkProof,
     inner_vk_hash: Field,
-    // KZG aggregation object from inner proof's public_inputs[0..96].
-    // All zeros when inner proof has no recursion (coinproof_base).
-    inner_agg_fields: [Field; 96],
     // Decoded state from the inner proof (private witnesses; hash verified below).
     inner_state_hash: [u8; 32],
     inner_owner_pk: [u8; 32],
@@ -150,12 +147,23 @@ fn main(
 
     // ---- 2. Inner proof verification (always) -----------------------------
 
-    // Build full 128-field public inputs: [agg_fields(96) || state_hash_bytes(32)]
-    // Layout matches noir-recursive-no-zk public_inputs file: agg at [0..96], outputs at [96..128].
-    let mut inner_pub_fields: [Field; 128] = [0; 128];
-    for i in 0..96 { inner_pub_fields[i] = inner_agg_fields[i]; }
+    // Both coinproof_base and coinproof_step share the same 129-field public input layout:
+    //   [0..32]  owner_pk   (one Field per byte)
+    //   [32..64] coin_commitment
+    //   [64]     slot       (inner slot = current slot - 1)
+    //   [65..97] parent_nullifier
+    //   [97..129] state_hash
+    // coinproof_base has slot=0 (enforced by its circuit). coinproof_step has slot=k-1.
+    // We know inner.owner_pk == owner_pk, inner.coin_commitment == coin_commitment,
+    // inner.parent_nullifier == parent_nullifier (asserted below), so we build from them.
+    let inner_slot: u64 = slot - 1;
+    let mut inner_pub_fields: [Field; 129] = [0; 129];
+    for i in 0..32 { inner_pub_fields[i]      = owner_pk[i] as Field; }
+    for i in 0..32 { inner_pub_fields[32 + i] = coin_commitment[i] as Field; }
+    inner_pub_fields[64] = inner_slot as Field;
+    for i in 0..32 { inner_pub_fields[65 + i] = parent_nullifier[i] as Field; }
     let state_fields = bytes32_to_fields(inner_state_hash);
-    for i in 0..32 { inner_pub_fields[96 + i] = state_fields[i]; }
+    for i in 0..32 { inner_pub_fields[97 + i] = state_fields[i]; }
     verify_honk_proof_non_zk(inner_vk, inner_proof, inner_pub_fields, inner_vk_hash);
 
     let recomputed = state_hash(

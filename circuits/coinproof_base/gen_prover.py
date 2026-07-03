@@ -15,6 +15,7 @@ def arr32x32():
 lines = [
     f'owner_pk = {arr32()}',
     f'coin_commitment = {arr32()}',
+    f'slot = "0x0000000000000000"',
     f'parent_nullifier = {arr32()}',
     f'entry_output_commitments = {arr8x32()}',
     f'entry_num_outputs = "0x0000000000000000"',

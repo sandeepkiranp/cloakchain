@@ -123,10 +123,6 @@ vkhash_path= os.path.join(BASE_DIR, "target/vk/vk_hash")
 
 inner_vk_fields    = read_fields_be(vk_path, 115)
 inner_proof_fields = read_fields_be(proof_path, 457)
-
-# Read inner aggregation fields: public_inputs[0..96] (KZG accumulator, zeros for non-recursive base)
-inner_pub_path = os.path.join(BASE_DIR, "target/proof/public_inputs")
-inner_agg_fields = read_fields_be(inner_pub_path, 96, offset=0)
 inner_vk_hash      = read_vk_hash(vkhash_path)
 
 print(f"VK fields: {len(inner_vk_fields)}, proof fields: {len(inner_proof_fields)}")
@@ -154,8 +150,6 @@ lines = [
     f"inner_vk = [{', '.join(inner_vk_fields)}]",
     f"inner_proof = [{', '.join(inner_proof_fields)}]",
     f"inner_vk_hash = {inner_vk_hash}",
-    # KZG aggregation from inner proof's public_inputs[0..96]
-    f"inner_agg_fields = [{', '.join(inner_agg_fields)}]",
     # inner state witnesses
     f"inner_state_hash = {arr32(inner_state_hash)}",
     f"inner_owner_pk = {zeros32()}",

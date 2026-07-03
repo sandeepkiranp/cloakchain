@@ -91,6 +91,7 @@ fn state_hash(
 fn main(
     owner_pk: pub [u8; 32],
     coin_commitment: pub [u8; 32],
+    slot: pub u64,         // must be 0 for the base case
     parent_nullifier: pub [u8; 32],
 
     entry_output_commitments: [[u8; 32]; MAX_OUTPUT_COMMITMENTS],
@@ -101,6 +102,8 @@ fn main(
     append_path: [[u8; 32]; 32],
     is_receipt_hint: bool,
 ) -> pub [u8; 32] {
+    assert(slot == 0, "slot must be 0 for the base case");
+
     let leaf_0 = compute_leaf(entry_output_commitments, entry_ciphertext_hash);
     let new_root = compute_root(leaf_0, append_path);
 
