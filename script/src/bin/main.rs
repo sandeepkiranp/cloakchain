@@ -107,6 +107,33 @@ fn cp_state_hash(
     Blake2s256::digest(buf).into()
 }
 
+// ── Spend witness for coinproof_step at receipt ───────────────────────────────
+
+struct SpendWitness {
+    vk:      Vec<[u8; 32]>,
+    proof:   Vec<[u8; 32]>,
+    vk_hash: [u8; 32],
+    pk_p:    [u8; 32],
+    cn_in:   [u8; 32],
+    board_root:   [u8; 32],
+    input_null:   [u8; 32],
+    num_outputs:  u64,
+    out_cns:      [[u8; 32]; 8],
+}
+
+impl SpendWitness {
+    fn zeros() -> Self {
+        Self {
+            vk:  vec![[0u8; 32]; VK_FIELDS],
+            proof: vec![[0u8; 32]; PROOF_FIELDS],
+            vk_hash: [0u8; 32],
+            pk_p: [0u8; 32], cn_in: [0u8; 32],
+            board_root: [0u8; 32], input_null: [0u8; 32],
+            num_outputs: 0, out_cns: [[0u8; 32]; 8],
+        }
+    }
+}
+
 // ── Coin state ────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -294,6 +321,7 @@ fn coinproof_step_toml(
     inner: &CoinState, inner_sh: &[u8; 32],
     inner_vk: &[[u8; 32]], inner_proof: &[[u8; 32]], inner_vk_hash: &[u8; 32],
     is_receipt: bool,
+    sw: &SpendWitness,
 ) -> String {
     let ct = ciphertext_hash(entry);
     let num_out = entry.output_commitments.len().min(8) as u64;
@@ -321,6 +349,15 @@ fn coinproof_step_toml(
          inner_spent = {isp}\n\
          inner_parent_nullifier = {ipn}\n\
          inner_parent_nullifier_seen = {ipns}\n\
+         spend_vk = {svk}\n\
+         spend_proof = {spr}\n\
+         spend_vk_hash = {svkh}\n\
+         spend_pk_p = {spp}\n\
+         spend_coin_commitment_in = {sci}\n\
+         spend_board_root = {sbr}\n\
+         spend_input_nullifier = {sin}\n\
+         spend_num_outputs = {sno}\n\
+         spend_output_commitments = {soc}\n\
          is_receipt_hint = {ir}\n",
         op = b32(owner_pk), cn = b32(cn), sl = u64hex(slot),
         oc = b32_pad8(&entry.output_commitments),
@@ -334,6 +371,10 @@ fn coinproof_step_toml(
         irv = boolstr(inner.rcv_valid), ira = u64hex(inner.rcv_at),
         isp = boolstr(inner.spent), ipn = b32(parent_null),
         ipns = boolstr(inner.parent_null_seen),
+        svk = farr(&sw.vk), spr = farr(&sw.proof), svkh = fhex(&sw.vk_hash),
+        spp = b32(&sw.pk_p), sci = b32(&sw.cn_in),
+        sbr = b32(&sw.board_root), sin = b32(&sw.input_null),
+        sno = u64hex(sw.num_outputs), soc = b32_arr(&sw.out_cns),
         ir = boolstr(is_receipt),
     )
 }
@@ -541,7 +582,7 @@ fn main() {
     let alice_change  = coin(0xB2,  60, alice.pk);
     let carol_coin    = coin(0xC1,  40, carol.pk);
 
-    let _cn_genesis = genesis_coin.commitment();
+    let cn_genesis = genesis_coin.commitment();
     let cn_alice   = alice_coin.commitment();
     let cn_bob     = bob_coin.commitment();
     let cn_carol   = carol_coin.commitment();
@@ -568,12 +609,13 @@ fn main() {
     println!("  [1] = {} (alice_change)", hex2(&alice_coin.commitment()));
 
     // Nullifiers
-    let alice_null = tx_input_nullifier(&cn_alice, &alice.sk);
-    let bob_null   = spend_nullifier(&cn_bob,   &bob.sk);
+    let genesis_null   = tx_input_nullifier(&cn_genesis, &GENESIS_SK); // == entry0.nullifier
+    let alice_null     = tx_input_nullifier(&cn_alice, &alice.sk);      // == entry1.nullifier
+    let bob_null       = spend_nullifier(&cn_bob,   &bob.sk);
 
-    // For bob's coinproof, parent_nullifier = alice's tx input_nullifier
-    // (the nullifier that appears in entry[1], where bob's coin is received).
-    let bob_parent_null = alice_null;
+    // parent_nullifier for each coin = nullifier of the tx that sent it
+    let alice_parent_null = genesis_null; // entry[0] sent alice_cn
+    let bob_parent_null   = alice_null;   // entry[1] sent bob_cn
 
     let mut stats: Vec<StepStats> = Vec::new();
 
@@ -609,11 +651,114 @@ fn main() {
         });
     }
 
-    // ── coinproof_base (slot 0): bob tracking entry[0] ────────────────────
+    let entries_0 = &entries[..1];
+    let entries_1 = &entries[..2];
+    let path_0 = append_proof_for(entries_0);
+    let path_1 = append_proof_for(entries_1);
+
+    // VK files are shared: all coinproof_base runs share the same VK,
+    // all spend runs share the same spend VK.
+    let cp_base_vk_hash = read_vk_hash(&cp_base_dir.join("target/vk/vk_hash"));
+    let spend_vk_fields = read_fields(&spend_dir.join("target/vk/vk"), VK_FIELDS);
+    let spend_vk_hash   = read_vk_hash(&spend_dir.join("target/vk/vk_hash"));
+
+    // ── alice's coinproof_base (slot 0): alice receives alice_coin ────────
+    println!("\n=== coinproof_base: alice receiving at slot 0 ===");
+
+    let alice_own_null = spend_nullifier(&cn_alice, &alice.sk);
+    let (alice_base_state, alice_base_rcpt) = coinproof_base_state(
+        &alice.pk, &cn_alice, &entry0, entries_0, &alice_parent_null, &alice_own_null,
+    );
+    println!("  rcv_valid={} spent={} parent_null_seen={} receipt={}",
+        alice_base_state.rcv_valid, alice_base_state.spent,
+        alice_base_state.parent_null_seen, alice_base_rcpt);
+    assert!(alice_base_rcpt, "alice should receive alice_coin at slot 0");
+
+    write_toml(&cp_base_dir, &coinproof_base_toml(
+        &alice.pk, &cn_alice, &entry0, &path_0,
+        &alice_parent_null, &alice_own_null, alice_base_rcpt,
+    ));
+    print!("  nargo execute... "); let t = Instant::now();
+    do_nargo_execute(&cp_base_dir);
+    println!("done ({:.1}s)", secs(t));
+    print!("  bb prove...      "); let t = Instant::now();
+    do_bb_prove(&cp_base_dir, "coinproof_base", "coinproof_base");
+    let alice_cp_prove_s = secs(t); println!("done ({alice_cp_prove_s:.1}s)");
+    print!("  bb verify...     "); let t = Instant::now();
+    do_bb_verify(&cp_base_dir);
+    println!("✓ ({:.2}s)", secs(t));
+
+    let alice_cp_sh = read_state_hash(&cp_base_dir.join("target/proof/public_inputs"));
+    if alice_cp_sh != alice_base_state.hash(&alice.pk, &cn_alice) {
+        println!("  WARNING: alice base state_hash mismatch — using circuit output");
+    } else { println!("  ✓ state_hash matches"); }
+
+    let alice_cp_proof = read_fields(&cp_base_dir.join("target/proof/proof"), PROOF_FIELDS);
+    stats.push(StepStats {
+        label: "coinproof_base (slot 0)".into(), user: "alice".into(), board_size: 1,
+        exec_s: 0.0, prove_s: alice_cp_prove_s, verify_s: 0.0,
+        proof_kb:  kb(&cp_base_dir.join("target/proof/proof")),
+        vk_kb:     kb(&cp_base_dir.join("target/vk/vk")),
+        pubinp_kb: kb(&cp_base_dir.join("target/proof/public_inputs")),
+    });
+
+    // ── alice's spend (alice → bob + change) ──────────────────────────────
+    println!("\n=== spend: alice → bob + change ===");
+
+    let alice_board_root = cloakkchain_lib::merkle_root_of(entries_0);
+    assert_eq!(alice_board_root, alice_base_state.board_root);
+    let alice_tx_in_cns  = [cn_alice];
+    let alice_tx_out_cns = [cn_bob, alice_change.commitment()];
+    let alice_spend_null = tx_input_nullifier(&cn_alice, &alice.sk);
+
+    write_toml(&spend_dir, &spend_toml(
+        &alice.sk, &alice.pk, &cn_alice, &alice_board_root, &alice_spend_null,
+        &[alice_coin.clone()], &[bob_coin.clone(), alice_change.clone()],
+        &alice_tx_in_cns, &alice_tx_out_cns, false,
+        Some(&read_fields(&cp_base_dir.join("target/vk/vk"), VK_FIELDS)),
+        Some(&alice_cp_proof), Some(&cp_base_vk_hash), 0,
+        Some(&alice_base_state), Some(&alice_cp_sh),
+        &alice.pk, &cn_alice,
+    ));
+    print!("  nargo execute... "); let t = Instant::now();
+    do_nargo_execute(&spend_dir);
+    println!("done ({:.1}s)", secs(t));
+    print!("  bb prove...      "); let t = Instant::now();
+    do_bb_prove(&spend_dir, "spend", "spend");
+    let alice_spend_prove_s = secs(t); println!("done ({alice_spend_prove_s:.1}s)");
+    print!("  bb verify...     "); let t = Instant::now();
+    do_bb_verify(&spend_dir);
+    println!("✓ ({:.2}s)", secs(t));
+
+    // Read alice's spend proof before bob's spend overwrites the directory.
+    let alice_spend_proof = read_fields(&spend_dir.join("target/proof/proof"), PROOF_FIELDS);
+    stats.push(StepStats {
+        label: "spend alice→bob".into(), user: "alice/bob".into(), board_size: 1,
+        exec_s: 0.0, prove_s: alice_spend_prove_s, verify_s: 0.0,
+        proof_kb:  kb(&spend_dir.join("target/proof/proof")),
+        vk_kb:     kb(&spend_dir.join("target/vk/vk")),
+        pubinp_kb: kb(&spend_dir.join("target/proof/public_inputs")),
+    });
+
+    // Build spend witness for bob's coinproof_step receipt verification.
+    let mut alice_spend_out_cns = [[0u8; 32]; 8];
+    alice_spend_out_cns[0] = cn_bob;
+    alice_spend_out_cns[1] = alice_change.commitment();
+    let alice_sw = SpendWitness {
+        vk:      spend_vk_fields.clone(),
+        proof:   alice_spend_proof,
+        vk_hash: spend_vk_hash,
+        pk_p:    alice.pk,
+        cn_in:   cn_alice,
+        board_root:  alice_board_root,
+        input_null:  alice_spend_null,
+        num_outputs: 2,
+        out_cns:     alice_spend_out_cns,
+    };
+
+    // ── bob's coinproof_base (slot 0): bob tracking entry[0] ─────────────
     println!("\n=== coinproof_base: bob tracking slot 0 ===");
 
-    let entries_0 = &entries[..1];
-    let path_0 = append_proof_for(entries_0);
     let (base_state, base_receipt) = coinproof_base_state(
         &bob.pk, &cn_bob, &entry0, entries_0, &bob_parent_null, &bob_null,
     );
@@ -624,26 +769,20 @@ fn main() {
         &bob.pk, &cn_bob, &entry0, &path_0,
         &bob_parent_null, &bob_null, base_receipt,
     ));
-
     print!("  nargo execute... "); let t = Instant::now();
     do_nargo_execute(&cp_base_dir);
     let base_exec_s = secs(t); println!("done ({base_exec_s:.1}s)");
-
     print!("  bb prove...      "); let t = Instant::now();
     do_bb_prove(&cp_base_dir, "coinproof_base", "coinproof_base");
     let base_prove_s = secs(t); println!("done ({base_prove_s:.1}s)");
-
     print!("  bb verify...     "); let t = Instant::now();
     do_bb_verify(&cp_base_dir);
     let base_verify_s = secs(t); println!("✓ ({base_verify_s:.2}s)");
 
     let base_sh_actual = read_state_hash(&cp_base_dir.join("target/proof/public_inputs"));
-    let base_sh_computed = base_state.hash(&bob.pk, &cn_bob);
-    if base_sh_actual != base_sh_computed {
+    if base_sh_actual != base_state.hash(&bob.pk, &cn_bob) {
         println!("  WARNING: base state_hash mismatch — using circuit output");
-    } else {
-        println!("  ✓ state_hash matches");
-    }
+    } else { println!("  ✓ state_hash matches"); }
     stats.push(StepStats {
         label: "coinproof_base (slot 0)".into(), user: "bob".into(), board_size: 1,
         exec_s: base_exec_s, prove_s: base_prove_s, verify_s: base_verify_s,
@@ -657,10 +796,8 @@ fn main() {
     let base_vk_hash = read_vk_hash(&cp_base_dir.join("target/vk/vk_hash"));
 
     // ── coinproof_step (slot 1): bob receives bob_coin ─────────────────────
-    println!("\n=== coinproof_step: bob receiving at slot 1 ===");
+    println!("\n=== coinproof_step: bob receiving at slot 1 (verifying alice's spend) ===");
 
-    let entries_1 = &entries[..2];
-    let path_1 = append_proof_for(entries_1);
     let (step_state, step_receipt) = coinproof_step_state(
         &cn_bob, 1, &entry1, entries_1, &bob_parent_null, &bob_null, &base_state,
     );
@@ -675,16 +812,14 @@ fn main() {
         &base_state, &base_sh_actual,
         &base_vk, &base_proof, &base_vk_hash,
         step_receipt,
+        &alice_sw,
     ));
-
     print!("  nargo execute... "); let t = Instant::now();
     do_nargo_execute(&cp_step_dir);
     let step_exec_s = secs(t); println!("done ({step_exec_s:.1}s)");
-
     print!("  bb prove...      "); let t = Instant::now();
     do_bb_prove(&cp_step_dir, "coinproof", "coinproof");
     let step_prove_s = secs(t); println!("done ({step_prove_s:.1}s)");
-
     print!("  bb verify...     "); let t = Instant::now();
     do_bb_verify(&cp_step_dir);
     let step_verify_s = secs(t); println!("✓ ({step_verify_s:.2}s)");
@@ -692,9 +827,7 @@ fn main() {
     let step_sh_actual = read_state_hash(&cp_step_dir.join("target/proof/public_inputs"));
     if step_sh_actual != step_state.hash(&bob.pk, &cn_bob) {
         println!("  WARNING: step state_hash mismatch — using circuit output");
-    } else {
-        println!("  ✓ state_hash matches");
-    }
+    } else { println!("  ✓ state_hash matches"); }
     stats.push(StepStats {
         label: "coinproof_step (slot 1, receipt)".into(), user: "bob".into(), board_size: 2,
         exec_s: step_exec_s, prove_s: step_prove_s, verify_s: step_verify_s,
@@ -725,15 +858,12 @@ fn main() {
         Some(&step_state), Some(&step_sh_actual),
         &bob.pk, &cn_bob,
     ));
-
     print!("  nargo execute... "); let t = Instant::now();
     do_nargo_execute(&spend_dir);
     let spend_exec_s = secs(t); println!("done ({spend_exec_s:.1}s)");
-
     print!("  bb prove...      "); let t = Instant::now();
     do_bb_prove(&spend_dir, "spend", "spend");
     let spend_prove_s = secs(t); println!("done ({spend_prove_s:.1}s)");
-
     print!("  bb verify...     "); let t = Instant::now();
     do_bb_verify(&spend_dir);
     let spend_verify_s = secs(t); println!("✓ ({spend_verify_s:.2}s)");
@@ -747,7 +877,7 @@ fn main() {
     });
 
     println!("\n=== Full IVC chain proved and verified ===");
-    println!("  coinproof_base (slot 0) → coinproof_step (slot 1, receipt) → spend (bob → carol)");
+    println!("  alice_cp_base → alice_spend → bob_cp_base → bob_cp_step (verifies alice spend) → bob_spend");
     print_stats(&stats);
 }
 

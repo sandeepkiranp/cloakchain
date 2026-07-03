@@ -39,6 +39,7 @@ global TREE_DEPTH: u32 = 32;
 global MAX_OUTPUT_COMMITMENTS: u32 = 8;
 global LEAF_BUF_LEN: u32 = 296;
 global STATE_BUF_LEN: u32 = 147;
+global SPEND_STATE_BUF_LEN: u32 = 296; // board_root(32) || num_outputs_le8(8) || cn_0..cn_7(256)
 
 fn compute_root(leaf: [u8; 32], slot: u64, path: [[u8; 32]; 32]) -> [u8; 32] {
     let mut current = leaf;
@@ -68,6 +69,23 @@ fn compute_leaf(
         for j in 0..32 { buf[off + j] = output_commitments[i][j]; }
     }
     for j in 0..32 { buf[264 + j] = ciphertext_hash[j]; }
+    std::hash::blake2s(buf)
+}
+
+// Matches spend_state_hash() in circuits/spend/src/main.nr exactly.
+fn compute_spend_state_hash(
+    board_root: [u8; 32],
+    output_commitments: [[u8; 32]; MAX_OUTPUT_COMMITMENTS],
+    num_outputs: u64,
+) -> [u8; 32] {
+    let mut buf = [0 as u8; SPEND_STATE_BUF_LEN];
+    for i in 0..32 { buf[i] = board_root[i]; }
+    let nb = u64_to_le_bytes(num_outputs);
+    for i in 0..8 { buf[32 + i] = nb[i]; }
+    for i in 0..MAX_OUTPUT_COMMITMENTS {
+        let off = 40 + i * 32;
+        for j in 0..32 { buf[off + j] = output_commitments[i][j]; }
+    }
     std::hash::blake2s(buf)
 }
 
@@ -134,6 +152,17 @@ fn main(
     inner_parent_nullifier: [u8; 32],
     inner_parent_nullifier_seen: bool,
 
+    // --- spend proof at receipt (zeros when not a receipt slot) ---
+    spend_vk: UltraHonkVerificationKey,
+    spend_proof: UltraHonkProof,
+    spend_vk_hash: Field,
+    spend_pk_p: [u8; 32],
+    spend_coin_commitment_in: [u8; 32],
+    spend_board_root: [u8; 32],
+    spend_input_nullifier: [u8; 32],
+    spend_num_outputs: u64,
+    spend_output_commitments: [[u8; 32]; MAX_OUTPUT_COMMITMENTS],
+
     // --- receipt hint ---
     is_receipt_hint: bool,
 ) -> pub [u8; 32] {
@@ -194,6 +223,37 @@ fn main(
         & !inner_received_at_valid
         & !inner_parent_nullifier_seen;
     assert(is_receipt == is_receipt_hint, "receipt hint disagrees with in-circuit detection");
+
+    // ---- 3b. Spend proof verification at receipt --------------------------
+    // The entry that delivers coin_commitment must carry a valid spend proof,
+    // so a malicious board poster cannot fake a receipt without owning the
+    // input coin.
+    if is_receipt_hint {
+        assert(spend_input_nullifier == parent_nullifier,
+            "spend input_nullifier must equal parent_nullifier");
+
+        let mut coin_in_spend = false;
+        for i in 0..MAX_OUTPUT_COMMITMENTS {
+            if (i as u64) < spend_num_outputs {
+                if spend_output_commitments[i] == coin_commitment {
+                    coin_in_spend = true;
+                }
+            }
+        }
+        assert(coin_in_spend, "coin_commitment not in spend output_commitments");
+
+        // Re-derive spend_state_hash from witnesses, then verify the proof.
+        // Spend public inputs: pk_p(32)|coin_commitment_in(32)|board_root(32)|input_nullifier(32)|state_hash(32) = 160 fields
+        let sh = compute_spend_state_hash(spend_board_root, spend_output_commitments, spend_num_outputs);
+        let mut spend_pub: [Field; 160] = [0; 160];
+        for i in 0..32 { spend_pub[i]       = spend_pk_p[i] as Field; }
+        for i in 0..32 { spend_pub[32 + i]  = spend_coin_commitment_in[i] as Field; }
+        for i in 0..32 { spend_pub[64 + i]  = spend_board_root[i] as Field; }
+        for i in 0..32 { spend_pub[96 + i]  = spend_input_nullifier[i] as Field; }
+        let sh_fields = bytes32_to_fields(sh);
+        for i in 0..32 { spend_pub[128 + i] = sh_fields[i]; }
+        verify_honk_proof_non_zk(spend_vk, spend_proof, spend_pub, spend_vk_hash);
+    }
 
     // ---- 4. Nullifier tracking --------------------------------------------
 
