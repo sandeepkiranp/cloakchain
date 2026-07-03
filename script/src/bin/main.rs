@@ -235,6 +235,8 @@ fn run(program: &str, args: &[&str], cwd: &Path) {
     }
 }
 
+fn do_nargo_compile(cwd: &Path) { run("nargo", &["compile"], cwd); }
+
 fn do_nargo_execute(cwd: &Path) { run("nargo", &["execute"], cwd); }
 
 fn do_bb_write_vk(cwd: &Path, json: &str) {
@@ -575,14 +577,24 @@ fn main() {
 
     let mut stats: Vec<StepStats> = Vec::new();
 
-    // ── VK generation ─────────────────────────────────────────────────────
-    println!("\n=== Generating VKs ===");
+    // ── Compile all circuits first so JSON artifacts are fresh ────────────
+    println!("\n=== Compiling circuits ===");
 
     let circuits = [
         ("coinproof_base", &cp_base_dir as &std::path::PathBuf, "coinproof_base"),
         ("coinproof_step", &cp_step_dir, "coinproof"),
         ("spend",          &spend_dir,   "spend"),
     ];
+    for (label, dir, _json) in &circuits {
+        print!("  {label} compile... ");
+        let t = Instant::now();
+        do_nargo_compile(dir);
+        println!("done ({:.1}s)", secs(t));
+    }
+
+    // ── VK generation ─────────────────────────────────────────────────────
+    println!("\n=== Generating VKs ===");
+
     for (label, dir, json) in &circuits {
         print!("  {label} write_vk... ");
         let t = Instant::now();
