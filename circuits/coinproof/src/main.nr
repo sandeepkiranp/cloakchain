@@ -122,6 +122,9 @@ fn main(
     inner_vk: UltraHonkVerificationKey,
     inner_proof: UltraHonkProof,
     inner_vk_hash: Field,
+    // KZG aggregation object from inner proof's public_inputs[0..96].
+    // All zeros when inner proof has no recursion (coinproof_base).
+    inner_agg_fields: [Field; 96],
     // Decoded state from the inner proof (private witnesses; hash verified below).
     inner_state_hash: [u8; 32],
     inner_owner_pk: [u8; 32],
@@ -147,7 +150,12 @@ fn main(
 
     // ---- 2. Inner proof verification (always) -----------------------------
 
-    let inner_pub_fields = bytes32_to_fields(inner_state_hash);
+    // Build full 128-field public inputs: [agg_fields(96) || state_hash_bytes(32)]
+    // Layout matches noir-recursive-no-zk public_inputs file: agg at [0..96], outputs at [96..128].
+    let mut inner_pub_fields: [Field; 128] = [0; 128];
+    for i in 0..96 { inner_pub_fields[i] = inner_agg_fields[i]; }
+    let state_fields = bytes32_to_fields(inner_state_hash);
+    for i in 0..32 { inner_pub_fields[96 + i] = state_fields[i]; }
     verify_honk_proof_non_zk(inner_vk, inner_proof, inner_pub_fields, inner_vk_hash);
 
     let recomputed = state_hash(

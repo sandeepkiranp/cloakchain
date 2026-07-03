@@ -46,17 +46,17 @@ def state_hash_py(owner_pk, coin_cn, board_root, board_size,
     buf[146]    = 1 if par_null_seen else 0
     return blake2s(bytes(buf))
 
-def read_fields_le(path: str, n: int) -> list:
-    """Read n little-endian 32-byte field elements, return as hex strings."""
+def read_fields_be(path: str, n: int, offset: int = 0) -> list:
+    """Read n big-endian 32-byte field elements starting at element offset."""
     with open(path, 'rb') as f:
         data = f.read()
-    return [f'"0x{int.from_bytes(data[i*32:(i+1)*32], "little"):064x}"' for i in range(n)]
+    return [f'"0x{int.from_bytes(data[(offset+i)*32:(offset+i+1)*32], "big"):064x}"' for i in range(n)]
 
 def read_vk_hash(path: str) -> str:
     with open(path, 'rb') as f:
         raw = f.read()
     if len(raw) == 32:
-        return f'"0x{int.from_bytes(raw, "little"):064x}"'
+        return f'"0x{int.from_bytes(raw, "big"):064x}"'
     s = raw.decode().strip()
     return f'"{s}"' if s.startswith("0x") else f'"0x{s}"'
 
@@ -121,8 +121,12 @@ vk_path    = os.path.join(BASE_DIR, "target/vk/vk")
 proof_path = os.path.join(BASE_DIR, "target/proof/proof")
 vkhash_path= os.path.join(BASE_DIR, "target/vk/vk_hash")
 
-inner_vk_fields    = read_fields_le(vk_path, 115)
-inner_proof_fields = read_fields_le(proof_path, 457)
+inner_vk_fields    = read_fields_be(vk_path, 115)
+inner_proof_fields = read_fields_be(proof_path, 457)
+
+# Read inner aggregation fields: public_inputs[0..96] (KZG accumulator, zeros for non-recursive base)
+inner_pub_path = os.path.join(BASE_DIR, "target/proof/public_inputs")
+inner_agg_fields = read_fields_be(inner_pub_path, 96, offset=0)
 inner_vk_hash      = read_vk_hash(vkhash_path)
 
 print(f"VK fields: {len(inner_vk_fields)}, proof fields: {len(inner_proof_fields)}")
@@ -150,6 +154,8 @@ lines = [
     f"inner_vk = [{', '.join(inner_vk_fields)}]",
     f"inner_proof = [{', '.join(inner_proof_fields)}]",
     f"inner_vk_hash = {inner_vk_hash}",
+    # KZG aggregation from inner proof's public_inputs[0..96]
+    f"inner_agg_fields = [{', '.join(inner_agg_fields)}]",
     # inner state witnesses
     f"inner_state_hash = {arr32(inner_state_hash)}",
     f"inner_owner_pk = {zeros32()}",
