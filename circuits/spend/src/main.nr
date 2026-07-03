@@ -162,6 +162,7 @@ fn main(
     coinproof_vk: UltraHonkVerificationKey,
     coinproof_proof: UltraHonkProof,
     coinproof_vk_hash: Field,
+    cp_slot: u64,
     cp_state_hash: [u8; 32],
     cp_owner_pk: [u8; 32],
     cp_coin_commitment: [u8; 32],
@@ -232,7 +233,16 @@ fn main(
         );
         assert(recomputed == cp_state_hash, "coin-proof state witnesses mismatch");
 
-        let cp_pub_fields = bytes32_to_fields(cp_state_hash);
+        // Build 129-field coinproof public inputs (same layout as coinproof_base + coinproof_step):
+        //   [0..32] owner_pk | [32..64] coin_commitment | [64] slot |
+        //   [65..97] parent_nullifier | [97..129] state_hash
+        let mut cp_pub_fields: [Field; 129] = [0; 129];
+        for i in 0..32 { cp_pub_fields[i]      = cp_owner_pk[i] as Field; }
+        for i in 0..32 { cp_pub_fields[32 + i] = cp_coin_commitment[i] as Field; }
+        cp_pub_fields[64] = cp_slot as Field;
+        for i in 0..32 { cp_pub_fields[65 + i] = cp_parent_nullifier[i] as Field; }
+        let cp_state_fields = bytes32_to_fields(cp_state_hash);
+        for i in 0..32 { cp_pub_fields[97 + i] = cp_state_fields[i]; }
         verify_honk_proof_non_zk(coinproof_vk, coinproof_proof, cp_pub_fields, coinproof_vk_hash);
 
         assert(cp_owner_pk == pk_p,              "coin-proof owner must be pk_p");
