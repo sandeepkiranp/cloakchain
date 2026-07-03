@@ -8,10 +8,11 @@
 //   - If entry_k.nullifier == parent_nullifier (before receipt), the creating
 //     transaction was double-spent.
 //
-// All hashes use Blake2s-256 (fixed-size arrays; matches Rust blake2 crate).
-// The previous step is verified recursively via Noir UltraHonk.
-// At the receipt slot the parent spend proof is also verified recursively.
+// ONE recursive verifier: the previous step's coinproof.
+// The creating spend proof is verified in the spend circuit (not here),
+// keeping this circuit to a single recursive call so it remains provable.
 //
+// All hashes use Blake2s-256 (matches Rust blake2 crate).
 // Public output: Blake2s(state_bytes) as [u8; 32].
 
 use bb_proof_verification::{UltraHonkProof, UltraHonkVerificationKey, verify_honk_proof_non_zk};
@@ -33,8 +34,6 @@ fn u64_to_le_bytes(x: u64) -> [u8; 8] {
 
 // ---- Blake2s helpers -------------------------------------------------------
 
-// Blake2s of two concatenated 32-byte values.
-// Matches blake2s_pair() in lib/src/lib.rs.
 fn blake2s_pair(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
     let mut buf = [0 as u8; 64];
     for i in 0..32 { buf[i] = a[i]; }
@@ -42,7 +41,6 @@ fn blake2s_pair(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
     std::hash::blake2s(buf)
 }
 
-// Convert a [u8; 32] to [Field; 32] for passing as public_inputs.
 fn bytes32_to_fields(b: [u8; 32]) -> [Field; 32] {
     let mut out = [0 as Field; 32];
     for i in 0..32 { out[i] = b[i] as Field; }
@@ -53,7 +51,6 @@ fn bytes32_to_fields(b: [u8; 32]) -> [Field; 32] {
 
 global TREE_DEPTH: u32 = 32;
 
-// Recompute the Merkle root from a leaf and its sibling path.
 fn compute_root(leaf: [u8; 32], slot: u64, path: [[u8; 32]; 32]) -> [u8; 32] {
     let mut current = leaf;
     let mut idx = slot;
@@ -74,8 +71,6 @@ fn compute_root(leaf: [u8; 32], slot: u64, path: [[u8; 32]; 32]) -> [u8; 32] {
 global MAX_OUTPUT_COMMITMENTS: u32 = 8;
 
 // Buffer: slot_le8(8) + 8 commitment slots(256) + ciphertext_hash(32) = 296 bytes.
-// Unused commitment slots are zero-padded.
-// Matches merkle_leaf() in lib/src/lib.rs.
 global LEAF_BUF_LEN: u32 = 296;
 
 fn compute_leaf(
@@ -128,27 +123,6 @@ fn state_hash(
     std::hash::blake2s(buf)
 }
 
-// ---- Spend state hash (mirrors circuits/spend/src/main.nr) -----------------
-
-// Layout: board_root(32) + num_outputs_le8(8) + 8 commitment slots(256) = 296 bytes.
-global SPEND_STATE_BUF_LEN: u32 = 296;
-
-fn spend_state_hash(
-    board_root: [u8; 32],
-    output_commitments: [[u8; 32]; MAX_OUTPUT_COMMITMENTS],
-    num_outputs: u64,
-) -> [u8; 32] {
-    let mut buf = [0 as u8; SPEND_STATE_BUF_LEN];
-    for i in 0..32 { buf[i] = board_root[i]; }
-    let nb = u64_to_le_bytes(num_outputs);
-    for i in 0..8 { buf[32 + i] = nb[i]; }
-    for i in 0..MAX_OUTPUT_COMMITMENTS {
-        let off = 40 + i * 32;
-        for j in 0..32 { buf[off + j] = output_commitments[i][j]; }
-    }
-    std::hash::blake2s(buf)
-}
-
 // ---- Main ------------------------------------------------------------------
 
 fn main(
@@ -188,15 +162,11 @@ fn main(
     inner_parent_nullifier: [u8; 32],
     inner_parent_nullifier_seen: bool,
 
-    // --- recursive spend proof (at receipt slot only) ---
-    has_spend_proof: bool,
-    spend_vk: UltraHonkVerificationKey,
-    spend_proof: UltraHonkProof,
-    spend_vk_hash: Field,
-    spend_proof_state_hash: [u8; 32],
-    spend_board_root: [u8; 32],
-    spend_output_commitments: [[u8; 32]; MAX_OUTPUT_COMMITMENTS],
-    spend_num_outputs: u64,
+    // --- receipt flag (no spend proof in circuit; provenance checked in spend circuit) ---
+    // The host asserts coin_commitment appears in entry_output_commitments at this slot
+    // and the parent spend proof's output_commitments include coin_commitment.
+    // This is enforced by the spend circuit when the coin holder eventually spends.
+    is_receipt_hint: bool,
 ) -> pub [u8; 32] {
 
     // ---- 1. Merkle roots --------------------------------------------------
@@ -220,11 +190,11 @@ fn main(
             );
             assert(recomputed == inner_state_hash, "inner state witnesses mismatch");
 
-            assert(inner_owner_pk == owner_pk,               "inner proof: wrong owner");
-            assert(inner_coin_commitment == coin_commitment,  "inner proof: wrong coin");
-            assert(inner_parent_nullifier == parent_nullifier,"inner proof: wrong parent nullifier");
-            assert(inner_board_size == slot,                  "inner proof: wrong board size");
-            assert(inner_board_root == old_root,              "inner proof: wrong board root");
+            assert(inner_owner_pk == owner_pk,                "inner proof: wrong owner");
+            assert(inner_coin_commitment == coin_commitment,   "inner proof: wrong coin");
+            assert(inner_parent_nullifier == parent_nullifier, "inner proof: wrong parent nullifier");
+            assert(inner_board_size == slot,                   "inner proof: wrong board size");
+            assert(inner_board_root == old_root,               "inner proof: wrong board root");
 
             (inner_received_at_valid, inner_received_at, inner_spent, inner_parent_nullifier_seen)
         } else {
@@ -243,38 +213,20 @@ fn main(
         }
     }
 
+    // Receipt: coin appears in this entry AND not already received AND
+    // parent nullifier not seen (creating tx was not a double-spend).
+    // The is_receipt_hint from the host must agree with the in-circuit detection.
     let is_receipt = coin_in_this_entry & !prev_received_at_valid & !prev_parent_nullifier_seen;
+    assert(is_receipt == is_receipt_hint, "receipt hint disagrees with in-circuit detection");
 
-    // ---- 4. Spend proof at receipt slot ------------------------------------
-
-    if is_receipt & has_spend_proof {
-        let recomputed_spend = spend_state_hash(
-            spend_board_root, spend_output_commitments, spend_num_outputs,
-        );
-        assert(recomputed_spend == spend_proof_state_hash, "spend proof witnesses mismatch");
-
-        let spend_pub_fields = bytes32_to_fields(spend_proof_state_hash);
-        verify_honk_proof_non_zk(spend_vk, spend_proof, spend_pub_fields, spend_vk_hash);
-
-        let mut found = false;
-        for i in 0..MAX_OUTPUT_COMMITMENTS {
-            if (i as u64) < spend_num_outputs {
-                if spend_output_commitments[i] == coin_commitment {
-                    found = true;
-                }
-            }
-        }
-        assert(found, "spend proof does not commit to this coin commitment");
-    }
-
-    // ---- 5. Nullifier tracking --------------------------------------------
+    // ---- 4. Nullifier tracking --------------------------------------------
 
     let parent_nullifier_seen = prev_parent_nullifier_seen
         | (!prev_received_at_valid & (entry_nullifier == parent_nullifier));
 
     let spent = prev_spent | (entry_nullifier == own_nullifier);
 
-    // ---- 6. State update --------------------------------------------------
+    // ---- 5. State update --------------------------------------------------
 
     let received_at_valid = prev_received_at_valid | is_receipt;
     let received_at = if is_receipt & !prev_received_at_valid { slot } else { prev_received_at };

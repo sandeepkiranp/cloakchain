@@ -61,15 +61,8 @@ lines.append(f'inner_spent = false')
 lines.append(f'inner_parent_nullifier = {arr32()}')
 lines.append(f'inner_parent_nullifier_seen = false')
 
-# --- spend proof (not used when has_spend_proof = false) ---
-lines.append(f'has_spend_proof = false')
-lines.append(f'spend_vk = {arr_fields(115)}')
-lines.append(f'spend_proof = {arr_fields(457)}')
-lines.append(f'spend_vk_hash = "0x0000000000000000000000000000000000000000000000000000000000000000"')
-lines.append(f'spend_proof_state_hash = {arr32()}')
-lines.append(f'spend_board_root = {arr32()}')
-lines.append(f'spend_output_commitments = {arr8x32()}')
-lines.append(f'spend_num_outputs = "0x0000000000000000"')
+# --- receipt hint (no spend proof in circuit) ---
+lines.append(f'is_receipt_hint = false')
 
 with open('Prover.toml', 'w') as f:
     f.write('\n'.join(lines) + '\n')
