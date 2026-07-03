@@ -1,5 +1,6 @@
+use blake2::{Blake2s256, Digest as Blake2Digest};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 
 pub const GENESIS_SK: [u8; 32] = [0u8; 32];
@@ -30,14 +31,14 @@ pub struct Coin {
 
 impl Coin {
     pub fn commitment(&self) -> [u8; 32] {
-        let mut h = Sha256::new();
-        h.update(self.tag);
-        h.update(self.value.to_le_bytes());
-        h.update(self.rand);
-        h.update(self.owner_pk);
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&h.finalize());
-        out
+        // Layout: tag(32) || value_le8(8) || rand(32) || owner_pk(32) = 104 bytes.
+        // Matches compute_coin_commitment() in circuits/spend/src/main.nr.
+        let mut buf = [0u8; 104];
+        buf[..32].copy_from_slice(&self.tag);
+        buf[32..40].copy_from_slice(&self.value.to_le_bytes());
+        buf[40..72].copy_from_slice(&self.rand);
+        buf[72..104].copy_from_slice(&self.owner_pk);
+        Blake2s256::digest(buf).into()
     }
 }
 
@@ -155,6 +156,11 @@ pub struct BoardEntry {
     pub key_encs: Vec<[u8; 32]>,
     /// `tx.input_nullifier` — looks random, used by IVC for double-spend detection.
     pub nullifier: [u8; 32],
+    /// `tx.output_commitments` — public, committed into the Merkle leaf hash so the
+    /// coin-proof circuit can check receipt without decrypting the ciphertext.
+    /// Commitments reveal nothing about coin values or recipients beyond what a
+    /// sender already knows when posting.
+    pub output_commitments: Vec<[u8; 32]>,
 }
 
 /// Encrypt `tx` for the given `recipient_pks` and `session_key`.
@@ -187,7 +193,7 @@ pub fn encrypt_tx(
         enc
     }).collect();
 
-    BoardEntry { ciphertext, ek_pk, key_encs, nullifier: tx.input_nullifier }
+    BoardEntry { ciphertext, ek_pk, key_encs, nullifier: tx.input_nullifier, output_commitments: tx.output_commitments.clone() }
 }
 
 /// Decrypt a board entry using the recipient's private key.
@@ -289,24 +295,31 @@ pub fn decrypt_note(session_key: &[u8; 32], index: usize, note_enc: &[u8]) -> Op
 /// Maximum tree depth. Supports up to 2^32 ≈ 4 billion board entries.
 pub const TREE_DEPTH: usize = 32;
 
-/// Leaf hash = SHA256(slot_as_u64_le || ciphertext). Including the slot index
-/// prevents permuting entries while keeping a valid root.
+/// Compute `Blake2s256(ciphertext)` — the pre-image fed into the Merkle leaf.
+/// The circuit receives this as `entry_ciphertext_hash` (can't hash variable-length
+/// data in-circuit at reasonable cost).
+pub fn ciphertext_hash(entry: &BoardEntry) -> [u8; 32] {
+    Blake2s256::digest(&entry.ciphertext).into()
+}
+
+/// Leaf hash = Blake2s(slot_le8 || cn_0..cn_7 (8 slots, zero-padded) || blake2s(ciphertext)).
+/// Total buffer: 8 + 8*32 + 32 = 296 bytes — fixed-size, matches the Noir circuit.
+/// Matches compute_leaf() in circuits/coinproof/src/main.nr.
 pub fn merkle_leaf(slot: usize, entry: &BoardEntry) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update((slot as u64).to_le_bytes());
-    h.update(&entry.ciphertext);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&h.finalize());
-    out
+    let mut buf = [0u8; 296];
+    buf[..8].copy_from_slice(&(slot as u64).to_le_bytes());
+    for (i, cn) in entry.output_commitments.iter().enumerate().take(8) {
+        buf[8 + i * 32..8 + (i + 1) * 32].copy_from_slice(cn);
+    }
+    buf[264..296].copy_from_slice(&ciphertext_hash(entry));
+    Blake2s256::digest(buf).into()
 }
 
 fn merkle_combine(l: &[u8; 32], r: &[u8; 32]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(l);
-    h.update(r);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&h.finalize());
-    out
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(l);
+    buf[32..].copy_from_slice(r);
+    Blake2s256::digest(buf).into()
 }
 
 /// Precomputed hashes of empty subtrees at each depth.
@@ -663,15 +676,13 @@ pub fn check_spend(
 
     let anchor = merkle_root_of(&prior_entries);
 
-    // Compute and verify the spender's own nullifier.
-    // This replaces the old sender_pk check and also serves as the double-spend guard.
-    let own_nullifier = {
-        let mut h = Sha256::new();
-        h.update(coin_commitment);
-        h.update(sk_p);
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&h.finalize());
-        out
+    // Nullifier = Blake2s(coin_commitment || sk_p).
+    // Matches blake2s_64(coin_commitment, sk_p) in circuits/spend/src/main.nr.
+    let own_nullifier: [u8; 32] = {
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(&coin_commitment);
+        buf[32..].copy_from_slice(&sk_p);
+        Blake2s256::digest(buf).into()
     };
     if tx_star.input_nullifier != own_nullifier {
         return Err("tx* input_nullifier does not match H(coin_commitment || sk_p)");
@@ -816,10 +827,11 @@ mod tests {
         let note_encs: Vec<Vec<u8>> = outputs.iter().enumerate()
             .map(|(i, (c, _))| build_note_enc(&session_key, i, c))
             .collect();
-        let input_nullifier = {
-            let mut h = Sha256::new();
-            h.update(input_commitments[0]); h.update(sender_sk);
-            let mut out = [0u8; 32]; out.copy_from_slice(&h.finalize()); out
+        let input_nullifier: [u8; 32] = {
+            let mut buf = [0u8; 64];
+            buf[..32].copy_from_slice(&input_commitments[0]);
+            buf[32..].copy_from_slice(&sender_sk);
+            Blake2s256::digest(buf).into()
         };
         let tx = Transaction { id, input_commitments, output_commitments, note_encs, input_nullifier, spend_proof: vec![] };
         (tx, session_key, recipient_pks)
@@ -835,10 +847,11 @@ mod tests {
         entries: &[BoardEntry],
         parent_nullifier: [u8; 32],
     ) -> Vec<CoinProofPublicValues> {
-        let own_nullifier = {
-            let mut h = Sha256::new();
-            h.update(coin_commitment); h.update(owner_sk);
-            let mut out = [0u8; 32]; out.copy_from_slice(&h.finalize()); out
+        let own_nullifier: [u8; 32] = {
+            let mut buf = [0u8; 64];
+            buf[..32].copy_from_slice(&coin_commitment);
+            buf[32..].copy_from_slice(&owner_sk);
+            Blake2s256::digest(buf).into()
         };
         let mut out = Vec::new();
         let mut inner: Option<CoinProofPublicValues> = None;

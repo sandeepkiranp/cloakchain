@@ -1,0 +1,8 @@
+[package]
+name = "coinproof"
+type = "bin"
+authors = ["CloakChain"]
+compiler_version = ">=1.0.0"
+
+[dependencies]
+bb_proof_verification = { path = "../bb_pv_local" }

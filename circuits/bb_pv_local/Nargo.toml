@@ -1,0 +1,7 @@
+[package]
+name = "bb_proof_verification"
+type = "lib"
+authors = ["Aztec"]
+compiler_version = ">=1.0.0"
+
+[dependencies]
