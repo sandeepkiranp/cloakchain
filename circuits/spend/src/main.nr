@@ -139,8 +139,8 @@ fn main(
     // --- board anchor ---
     board_root: pub [u8; 32],
 
-    // --- transaction witnesses (private) ---
-    input_nullifier: [u8; 32],
+    // --- spend nullifier (public so validators can bind it to BoardEntry.nullifier) ---
+    input_nullifier: pub [u8; 32],
     input_tags:       [[u8; 32]; MAX_INPUTS],
     input_values:     [u64;       MAX_INPUTS],
     input_rands:      [[u8; 32]; MAX_INPUTS],
