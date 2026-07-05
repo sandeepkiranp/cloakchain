@@ -1,7 +1,8 @@
 //! CloakChain IVC orchestrator — Noir/bb backend.
 //!
 //! Drives the full proving chain:
-//!   coinproof_base (slot 0) → coinproof_step (slot 1, receipt) → spend (bob → carol)
+//!   coinproof_base (alice/bob/carol) × coinproof_step × 4 + spend × 2
+//!   Genesis → Alice (slot 0) → Alice spends → Bob receives (slot 1) → Bob spends → Carol receives (slot 2)
 //!
 //! Requires nargo and bb to be on $PATH.
 //! Run from the workspace root: `cargo run --release`
@@ -897,13 +898,188 @@ fn main() {
         pubinp_kb: kb(&spend_dir.join("target/proof/public_inputs")),
     });
 
+    // ── Entry[2]: bob → carol (with bob's spend proof embedded) ─────────────
+    println!("\n=== Building entry[2]: bob → carol ===");
+
+    let bob_spend_proof_fields = read_fields(&spend_dir.join("target/proof/proof"), PROOF_FIELDS);
+    let bob_spend_vk_fields    = read_fields(&spend_dir.join("target/vk/vk"),       VK_FIELDS);
+    let bob_spend_vk_hash      = read_vk_hash(&spend_dir.join("target/vk/vk_hash"));
+
+    let carol_null        = spend_nullifier(&cn_carol, &carol.sk);
+    let carol_parent_null = bob_spend_null;
+
+    let mut bob_sw_out_cns = [[0u8; 32]; 8];
+    bob_sw_out_cns[0] = cn_carol;
+    let bob_sw = SpendWitness {
+        vk:         bob_spend_vk_fields,
+        proof:      bob_spend_proof_fields,
+        vk_hash:    bob_spend_vk_hash,
+        pk_p:       bob.pk,
+        cn_in:      cn_bob,
+        board_root: board_root,
+        input_null: bob_spend_null,
+        num_outputs: 1,
+        out_cns:    bob_sw_out_cns,
+    };
+
+    let (tx2, s2, r2) = make_tx(2, bob.sk,
+        &[bob_coin.clone()], &[(carol_coin.clone(), carol.pk)]);
+    let mut tx2_with_proof = tx2.clone();
+    tx2_with_proof.spend_proof = bincode::serialize(&bob_sw).unwrap();
+    let entry2 = encrypt_tx(&tx2_with_proof, &r2, s2);
+    entries.push(entry2);
+
+    println!("entry[2] output_commitments: {} coins", entries[2].output_commitments.len());
+    println!("  [0] = {} (carol_coin)", hex2(&cn_carol));
+
+    // ── carol's coinproof_base (slot 0) ───────────────────────────────────────
+    println!("\n=== coinproof_base: carol tracking slot 0 ===");
+
+    let entries_carol_0 = vec![entries[0].clone()];
+    let path_carol_0 = append_proof_for(&entries_carol_0);
+    let (carol_base_state, carol_base_rcpt) = coinproof_base_state(
+        &carol.pk, &cn_carol, &entries_carol_0[0], &entries_carol_0,
+        &carol_parent_null, &carol_null,
+    );
+    println!("  rcv_valid={} spent={} parent_null_seen={} receipt={}",
+        carol_base_state.rcv_valid, carol_base_state.spent,
+        carol_base_state.parent_null_seen, carol_base_rcpt);
+
+    write_toml(&cp_base_dir, &coinproof_base_toml(
+        &carol.pk, &cn_carol, &entries_carol_0[0], &path_carol_0,
+        &carol_parent_null, &carol_null, carol_base_rcpt,
+    ));
+    print!("  nargo execute... "); let t = Instant::now();
+    do_nargo_execute(&cp_base_dir);
+    let carol_base_exec_s = secs(t); println!("done ({carol_base_exec_s:.1}s)");
+    print!("  bb prove...      "); let t = Instant::now();
+    do_bb_prove(&cp_base_dir, "coinproof_base", "coinproof_base");
+    let carol_base_prove_s = secs(t); println!("done ({carol_base_prove_s:.1}s)");
+    print!("  bb verify...     "); let t = Instant::now();
+    do_bb_verify(&cp_base_dir);
+    let carol_base_verify_s = secs(t); println!("✓ ({carol_base_verify_s:.2}s)");
+
+    let carol_base_sh = read_state_hash(&cp_base_dir.join("target/proof/public_inputs"));
+    if carol_base_sh != carol_base_state.hash(&carol.pk, &cn_carol) {
+        println!("  WARNING: carol base state_hash mismatch — using circuit output");
+    } else { println!("  ✓ state_hash matches"); }
+
+    let carol_base_vk    = read_fields(&cp_base_dir.join("target/vk/vk"),      VK_FIELDS);
+    let carol_base_proof = read_fields(&cp_base_dir.join("target/proof/proof"), PROOF_FIELDS);
+    let carol_base_vk_hash = read_vk_hash(&cp_base_dir.join("target/vk/vk_hash"));
+
+    stats.push(StepStats {
+        label: "coinproof_base (slot 0)".into(), user: "carol".into(), board_size: 1,
+        exec_s: carol_base_exec_s, prove_s: carol_base_prove_s, verify_s: carol_base_verify_s,
+        entry_kb:  entry_kb(&entries[0]),
+        proof_kb:  kb(&cp_base_dir.join("target/proof/proof")),
+        vk_kb:     kb(&cp_base_dir.join("target/vk/vk")),
+        pubinp_kb: kb(&cp_base_dir.join("target/proof/public_inputs")),
+    });
+
+    // ── carol's coinproof_step (slot 1, no receipt) ───────────────────────────
+    println!("\n=== coinproof_step: carol tracking slot 1 (no receipt) ===");
+
+    let entries_carol_1 = entries[..2].to_vec();
+    let path_carol_1 = append_proof_for(&entries_carol_1);
+    let (carol_step1_state, carol_step1_rcpt) = coinproof_step_state(
+        &cn_carol, 1, &entries_carol_1[1], &entries_carol_1,
+        &carol_parent_null, &carol_null, &carol_base_state,
+    );
+    println!("  rcv_valid={} spent={} parent_null_seen={} receipt={}",
+        carol_step1_state.rcv_valid, carol_step1_state.spent,
+        carol_step1_state.parent_null_seen, carol_step1_rcpt);
+
+    write_toml(&cp_step_dir, &coinproof_step_toml(
+        &carol.pk, &cn_carol, 1, &entries_carol_1[1], &path_carol_1,
+        &carol_parent_null, &carol_null,
+        &carol_base_state, &carol_base_sh,
+        &carol_base_vk, &carol_base_proof, &carol_base_vk_hash,
+        carol_step1_rcpt,
+        &SpendWitness::zeros(),
+    ));
+    print!("  nargo execute... "); let t = Instant::now();
+    do_nargo_execute(&cp_step_dir);
+    let carol_s1_exec_s = secs(t); println!("done ({carol_s1_exec_s:.1}s)");
+    print!("  bb prove...      "); let t = Instant::now();
+    do_bb_prove(&cp_step_dir, "coinproof", "coinproof");
+    let carol_s1_prove_s = secs(t); println!("done ({carol_s1_prove_s:.1}s)");
+    print!("  bb verify...     "); let t = Instant::now();
+    do_bb_verify(&cp_step_dir);
+    let carol_s1_verify_s = secs(t); println!("✓ ({carol_s1_verify_s:.2}s)");
+
+    let carol_step1_sh = read_state_hash(&cp_step_dir.join("target/proof/public_inputs"));
+    if carol_step1_sh != carol_step1_state.hash(&carol.pk, &cn_carol) {
+        println!("  WARNING: carol step1 state_hash mismatch — using circuit output");
+    } else { println!("  ✓ state_hash matches"); }
+
+    let carol_step1_vk    = read_fields(&cp_step_dir.join("target/vk/vk"),      VK_FIELDS);
+    let carol_step1_proof = read_fields(&cp_step_dir.join("target/proof/proof"), PROOF_FIELDS);
+    let carol_step1_vk_hash = read_vk_hash(&cp_step_dir.join("target/vk/vk_hash"));
+
+    stats.push(StepStats {
+        label: "coinproof_step (slot 1, no rcpt)".into(), user: "carol".into(), board_size: 2,
+        exec_s: carol_s1_exec_s, prove_s: carol_s1_prove_s, verify_s: carol_s1_verify_s,
+        entry_kb:  entry_kb(&entries_carol_1[1]),
+        proof_kb:  kb(&cp_step_dir.join("target/proof/proof")),
+        vk_kb:     kb(&cp_step_dir.join("target/vk/vk")),
+        pubinp_kb: kb(&cp_step_dir.join("target/proof/public_inputs")),
+    });
+
+    // ── carol's coinproof_step (slot 2, receipt — verifies bob's spend) ───────
+    println!("\n=== coinproof_step: carol receiving at slot 2 (verifying bob's spend) ===");
+
+    let entries_carol_2 = entries[..3].to_vec();
+    let path_carol_2 = append_proof_for(&entries_carol_2);
+    let (carol_step2_state, carol_step2_rcpt) = coinproof_step_state(
+        &cn_carol, 2, &entries_carol_2[2], &entries_carol_2,
+        &carol_parent_null, &carol_null, &carol_step1_state,
+    );
+    println!("  rcv_valid={} rcv_at={} spent={} parent_null_seen={} receipt={}",
+        carol_step2_state.rcv_valid, carol_step2_state.rcv_at, carol_step2_state.spent,
+        carol_step2_state.parent_null_seen, carol_step2_rcpt);
+    assert!(carol_step2_rcpt, "carol should receive carol_coin at slot 2");
+
+    write_toml(&cp_step_dir, &coinproof_step_toml(
+        &carol.pk, &cn_carol, 2, &entries_carol_2[2], &path_carol_2,
+        &carol_parent_null, &carol_null,
+        &carol_step1_state, &carol_step1_sh,
+        &carol_step1_vk, &carol_step1_proof, &carol_step1_vk_hash,
+        carol_step2_rcpt,
+        &bob_sw,
+    ));
+    print!("  nargo execute... "); let t = Instant::now();
+    do_nargo_execute(&cp_step_dir);
+    let carol_s2_exec_s = secs(t); println!("done ({carol_s2_exec_s:.1}s)");
+    print!("  bb prove...      "); let t = Instant::now();
+    do_bb_prove(&cp_step_dir, "coinproof", "coinproof");
+    let carol_s2_prove_s = secs(t); println!("done ({carol_s2_prove_s:.1}s)");
+    print!("  bb verify...     "); let t = Instant::now();
+    do_bb_verify(&cp_step_dir);
+    let carol_s2_verify_s = secs(t); println!("✓ ({carol_s2_verify_s:.2}s)");
+
+    let carol_step2_sh = read_state_hash(&cp_step_dir.join("target/proof/public_inputs"));
+    if carol_step2_sh != carol_step2_state.hash(&carol.pk, &cn_carol) {
+        println!("  WARNING: carol step2 state_hash mismatch — using circuit output");
+    } else { println!("  ✓ state_hash matches"); }
+
+    stats.push(StepStats {
+        label: "coinproof_step (slot 2, receipt)".into(), user: "carol".into(), board_size: 3,
+        exec_s: carol_s2_exec_s, prove_s: carol_s2_prove_s, verify_s: carol_s2_verify_s,
+        entry_kb:  entry_kb(&entries_carol_2[2]),
+        proof_kb:  kb(&cp_step_dir.join("target/proof/proof")),
+        vk_kb:     kb(&cp_step_dir.join("target/vk/vk")),
+        pubinp_kb: kb(&cp_step_dir.join("target/proof/public_inputs")),
+    });
+
     let board_total_bytes: usize = entries.iter()
         .map(|e| bincode::serialize(e).unwrap().len())
         .sum();
     let board_total_kb = board_total_bytes as f64 / 1024.0;
 
     println!("\n=== Full IVC chain proved and verified ===");
-    println!("  alice_cp_base → alice_spend → bob_cp_base → bob_cp_step (verifies alice spend) → bob_spend");
+    println!("  alice_cp_base → alice_spend → bob_cp_base → bob_cp_step (verifies alice spend)");
+    println!("  → bob_spend → carol_cp_base → carol_cp_step_1 → carol_cp_step_2 (verifies bob spend)");
     print_stats(&stats, board_total_kb);
 }
 
