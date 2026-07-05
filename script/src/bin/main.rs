@@ -519,6 +519,7 @@ struct StepStats {
     exec_s:     f64,
     prove_s:    f64,
     verify_s:   f64,
+    entry_kb:   Option<f64>,
     proof_kb:   Option<f64>,
     vk_kb:      Option<f64>,
     pubinp_kb:  Option<f64>,
@@ -528,29 +529,33 @@ fn kb(path: &Path) -> Option<f64> {
     std::fs::metadata(path).ok().map(|m| m.len() as f64 / 1024.0)
 }
 
+fn entry_kb(entry: &BoardEntry) -> Option<f64> {
+    Some(bincode::serialize(entry).unwrap().len() as f64 / 1024.0)
+}
+
 fn fmt_kb(v: Option<f64>) -> String {
     v.map_or("     —".into(), |k| format!("{k:>5.1} KB"))
 }
 
 fn print_stats(stats: &[StepStats], board_total_kb: f64) {
-    let w = 96;
+    let w = 107;
     println!("\n{}", "=".repeat(w));
     println!("  Proof Statistics");
     println!("{}", "=".repeat(w));
-    println!("{:<34} {:>5}  {:<9}  {:>7}  {:>7}  {:>7}  {:>8}  {:>8}  {:>8}",
-        "Step", "Board", "User", "Execute", "Prove", "Verify", "Proof", "VK", "PubInp");
+    println!("{:<34} {:>5}  {:<9}  {:>7}  {:>7}  {:>7}  {:>8}  {:>8}  {:>8}  {:>8}",
+        "Step", "Board", "User", "Execute", "Prove", "Verify", "Entry", "Proof", "VK", "PubInp");
     println!("{}", "-".repeat(w));
     let (mut tp, mut tv) = (0f64, 0f64);
     for s in stats {
-        println!("{:<34} {:>5}  {:<9}  {:>6.1}s  {:>6.1}s  {:>6.2}s  {}  {}  {}",
+        println!("{:<34} {:>5}  {:<9}  {:>6.1}s  {:>6.1}s  {:>6.2}s  {}  {}  {}  {}",
             s.label, s.board_size, s.user,
             s.exec_s, s.prove_s, s.verify_s,
-            fmt_kb(s.proof_kb), fmt_kb(s.vk_kb), fmt_kb(s.pubinp_kb));
+            fmt_kb(s.entry_kb), fmt_kb(s.proof_kb), fmt_kb(s.vk_kb), fmt_kb(s.pubinp_kb));
         tp += s.prove_s;
         tv += s.verify_s;
     }
     println!("{}", "-".repeat(w));
-    println!("{:<34} {:>5}  {:<9}  {:>7}  {:>6.1}s  {:>6.2}s  (board: {:.1} KB)",
+    println!("{:<34} {:>5}  {:<9}  {:>7}  {:>6.1}s  {:>6.2}s  (board total: {:.1} KB)",
         "TOTAL", "", "", "", tp, tv, board_total_kb);
     println!("{}", "=".repeat(w));
 }
@@ -648,7 +653,7 @@ fn main() {
             label: format!("VK: {label}"),
             user: "-".into(), board_size: 0,
             exec_s: 0.0, prove_s: vk_s, verify_s: 0.0,
-            proof_kb: None, vk_kb: kb(&dir.join("target/vk/vk")), pubinp_kb: None,
+            entry_kb: None, proof_kb: None, vk_kb: kb(&dir.join("target/vk/vk")), pubinp_kb: None,
         });
     }
 
@@ -696,6 +701,7 @@ fn main() {
     stats.push(StepStats {
         label: "coinproof_base (slot 0)".into(), user: "alice".into(), board_size: 1,
         exec_s: 0.0, prove_s: alice_cp_prove_s, verify_s: 0.0,
+        entry_kb:  entry_kb(&entry0),
         proof_kb:  kb(&cp_base_dir.join("target/proof/proof")),
         vk_kb:     kb(&cp_base_dir.join("target/vk/vk")),
         pubinp_kb: kb(&cp_base_dir.join("target/proof/public_inputs")),
@@ -734,6 +740,7 @@ fn main() {
     stats.push(StepStats {
         label: "spend alice→bob".into(), user: "alice/bob".into(), board_size: 1,
         exec_s: 0.0, prove_s: alice_spend_prove_s, verify_s: 0.0,
+        entry_kb:  None,
         proof_kb:  kb(&spend_dir.join("target/proof/proof")),
         vk_kb:     kb(&spend_dir.join("target/vk/vk")),
         pubinp_kb: kb(&spend_dir.join("target/proof/public_inputs")),
@@ -797,6 +804,7 @@ fn main() {
     stats.push(StepStats {
         label: "coinproof_base (slot 0)".into(), user: "bob".into(), board_size: 1,
         exec_s: base_exec_s, prove_s: base_prove_s, verify_s: base_verify_s,
+        entry_kb:  entry_kb(&entry0),
         proof_kb:  kb(&cp_base_dir.join("target/proof/proof")),
         vk_kb:     kb(&cp_base_dir.join("target/vk/vk")),
         pubinp_kb: kb(&cp_base_dir.join("target/proof/public_inputs")),
@@ -842,6 +850,7 @@ fn main() {
     stats.push(StepStats {
         label: "coinproof_step (slot 1, receipt)".into(), user: "bob".into(), board_size: 2,
         exec_s: step_exec_s, prove_s: step_prove_s, verify_s: step_verify_s,
+        entry_kb:  entry_kb(entry1),
         proof_kb:  kb(&cp_step_dir.join("target/proof/proof")),
         vk_kb:     kb(&cp_step_dir.join("target/vk/vk")),
         pubinp_kb: kb(&cp_step_dir.join("target/proof/public_inputs")),
@@ -882,6 +891,7 @@ fn main() {
     stats.push(StepStats {
         label: "spend bob→carol".into(), user: "bob/carol".into(), board_size: 2,
         exec_s: spend_exec_s, prove_s: spend_prove_s, verify_s: spend_verify_s,
+        entry_kb:  None,
         proof_kb:  kb(&spend_dir.join("target/proof/proof")),
         vk_kb:     kb(&spend_dir.join("target/vk/vk")),
         pubinp_kb: kb(&spend_dir.join("target/proof/public_inputs")),
