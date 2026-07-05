@@ -109,6 +109,7 @@ fn cp_state_hash(
 
 // ── Spend witness for coinproof_step at receipt ───────────────────────────────
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct SpendWitness {
     vk:      Vec<[u8; 32]>,
     proof:   Vec<[u8; 32]>,
@@ -531,7 +532,7 @@ fn fmt_kb(v: Option<f64>) -> String {
     v.map_or("     —".into(), |k| format!("{k:>5.1} KB"))
 }
 
-fn print_stats(stats: &[StepStats]) {
+fn print_stats(stats: &[StepStats], board_total_kb: f64) {
     let w = 96;
     println!("\n{}", "=".repeat(w));
     println!("  Proof Statistics");
@@ -549,8 +550,8 @@ fn print_stats(stats: &[StepStats]) {
         tv += s.verify_s;
     }
     println!("{}", "-".repeat(w));
-    println!("{:<34} {:>5}  {:<9}  {:>7}  {:>6.1}s  {:>6.2}s",
-        "TOTAL", "", "", "", tp, tv);
+    println!("{:<34} {:>5}  {:<9}  {:>7}  {:>6.1}s  {:>6.2}s  (board: {:.1} KB)",
+        "TOTAL", "", "", "", tp, tv, board_total_kb);
     println!("{}", "=".repeat(w));
 }
 
@@ -600,7 +601,7 @@ fn main() {
         &[alice_coin.clone()], &[(bob_coin.clone(), bob.pk), (alice_change.clone(), alice.pk)]);
     let entry1 = encrypt_tx(&tx1, &r1, s1);
 
-    let entries = vec![entry0.clone(), entry1.clone()];
+    let mut entries = vec![entry0.clone(), entry1.clone()];
 
     println!("entry[0] output_commitments: {} coins", entry0.output_commitments.len());
     println!("  [0] = {} (alice_coin)", hex2(&cn_alice));
@@ -651,10 +652,8 @@ fn main() {
         });
     }
 
-    let entries_0 = &entries[..1];
-    let entries_1 = &entries[..2];
-    let path_0 = append_proof_for(entries_0);
-    let path_1 = append_proof_for(entries_1);
+    let entries_0 = vec![entry0.clone()];
+    let path_0 = append_proof_for(&entries_0);
 
     // VK files are shared: all coinproof_base runs share the same VK,
     // all spend runs share the same spend VK.
@@ -667,7 +666,7 @@ fn main() {
 
     let alice_own_null = spend_nullifier(&cn_alice, &alice.sk);
     let (alice_base_state, alice_base_rcpt) = coinproof_base_state(
-        &alice.pk, &cn_alice, &entry0, entries_0, &alice_parent_null, &alice_own_null,
+        &alice.pk, &cn_alice, &entry0, &entries_0, &alice_parent_null, &alice_own_null,
     );
     println!("  rcv_valid={} spent={} parent_null_seen={} receipt={}",
         alice_base_state.rcv_valid, alice_base_state.spent,
@@ -705,7 +704,7 @@ fn main() {
     // ── alice's spend (alice → bob + change) ──────────────────────────────
     println!("\n=== spend: alice → bob + change ===");
 
-    let alice_board_root = cloakkchain_lib::merkle_root_of(entries_0);
+    let alice_board_root = cloakkchain_lib::merkle_root_of(&entries_0);
     assert_eq!(alice_board_root, alice_base_state.board_root);
     let alice_tx_in_cns  = [cn_alice];
     let alice_tx_out_cns = [cn_bob, alice_change.commitment()];
@@ -756,11 +755,23 @@ fn main() {
         out_cns:     alice_spend_out_cns,
     };
 
+    // Embed the spend proof into entry1 so the board is self-contained.
+    // Re-encrypt tx1 with the same session key — deterministic ek_sk keeps
+    // ek_pk and key_encs unchanged; only the ciphertext grows.
+    let mut tx1_with_proof = tx1.clone();
+    tx1_with_proof.spend_proof = bincode::serialize(&alice_sw).unwrap();
+    entries[1] = encrypt_tx(&tx1_with_proof, &r1, s1);
+    let entry1 = &entries[1];
+
+    // entries_1 and path_1 must be derived after entry1 is finalised.
+    let entries_1 = &entries[..2];
+    let path_1 = append_proof_for(entries_1);
+
     // ── bob's coinproof_base (slot 0): bob tracking entry[0] ─────────────
     println!("\n=== coinproof_base: bob tracking slot 0 ===");
 
     let (base_state, base_receipt) = coinproof_base_state(
-        &bob.pk, &cn_bob, &entry0, entries_0, &bob_parent_null, &bob_null,
+        &bob.pk, &cn_bob, &entry0, &entries_0, &bob_parent_null, &bob_null,
     );
     println!("  rcv_valid={} spent={} parent_null_seen={} receipt={}",
         base_state.rcv_valid, base_state.spent, base_state.parent_null_seen, base_receipt);
@@ -876,9 +887,14 @@ fn main() {
         pubinp_kb: kb(&spend_dir.join("target/proof/public_inputs")),
     });
 
+    let board_total_bytes: usize = entries.iter()
+        .map(|e| bincode::serialize(e).unwrap().len())
+        .sum();
+    let board_total_kb = board_total_bytes as f64 / 1024.0;
+
     println!("\n=== Full IVC chain proved and verified ===");
     println!("  alice_cp_base → alice_spend → bob_cp_base → bob_cp_step (verifies alice spend) → bob_spend");
-    print_stats(&stats);
+    print_stats(&stats, board_total_kb);
 }
 
 // ── Party ─────────────────────────────────────────────────────────────────────
