@@ -143,9 +143,12 @@ fn main(
     assert(is_receipt == is_receipt_hint, "receipt hint disagrees with in-circuit detection");
 
     // Sliding-window search over the raw 328-byte leaf buffer.
-    // Matches SP1's bincode::serialize(&entry).windows(32).any(|w| w == nullifier).
+    // Guard parent_nullifier: all-zero means "no parent to track" (genesis/mint).
+    // Without the guard, zero-padded unused output commitment slots would give a
+    // false positive whenever parent_nullifier == [0u8; 32].
     let leaf_buf = compute_leaf_buf(entry_output_commitments, entry_ciphertext_hash, entry_nullifier);
-    let parent_nullifier_seen = buf_contains(leaf_buf, parent_nullifier);
+    let zero32 = [0 as u8; 32];
+    let parent_nullifier_seen = (parent_nullifier != zero32) & buf_contains(leaf_buf, parent_nullifier);
     let spent                 = buf_contains(leaf_buf, own_nullifier);
 
     let received_at_valid = is_receipt;

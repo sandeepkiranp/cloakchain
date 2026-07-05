@@ -588,7 +588,9 @@ pub fn check_coin_proof_step(
         (pra, ps, pns, Some(inner))
     };
 
-    let raw = bincode::serialize(&entry_k).unwrap_or_default();
+    // Scan the same 328-byte leaf buffer that the Noir circuit uses, not the
+    // full bincode-serialized BoardEntry. Keeps lib, script, and circuit in sync.
+    let leaf_raw = merkle_leaf_buf(slot, &entry_k);
 
     let mut received_at = prev_received_at;
     let mut receipt: Option<ReceiptInfo> = None;
@@ -624,11 +626,15 @@ pub fn check_coin_proof_step(
     // Only scan for parent_nullifier while the coin has not yet been received.
     // Once received_at is set, further appearances of parent_nullifier on the
     // board are irrelevant and must not be able to retroactively invalidate it.
+    // All-zero parent_nullifier means "no parent to track" (genesis/mint coins).
+    // Skip the scan to avoid false positives from zero-padded unused output commitment
+    // slots in the leaf buffer.
     let parent_nullifier_seen = prev_parent_nullifier_seen
         || (prev_received_at.is_none()
-            && raw.windows(32).any(|w| w == parent_nullifier));
+            && parent_nullifier != [0u8; 32]
+            && leaf_raw.windows(32).any(|w| w == parent_nullifier));
     let spent = prev_spent
-        || raw.windows(32).any(|w| w == own_nullifier);
+        || leaf_raw.windows(32).any(|w| w == own_nullifier);
 
     let justification = match maybe_inner {
         None    => CoinProofJustification::Base { receipt },

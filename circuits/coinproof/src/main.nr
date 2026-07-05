@@ -282,8 +282,11 @@ fn main(
 
     // ---- 4. Nullifier tracking --------------------------------------------
     // Sliding-window search over the raw 328-byte leaf buffer.
-    // Matches SP1's bincode::serialize(&entry).windows(32).any(|w| w == nullifier).
-    let entry_has_parent_null = buf_contains(leaf_buf_k, parent_nullifier);
+    // Guard parent_nullifier: all-zero means "no parent to track" (genesis/mint).
+    // Without the guard, zero-padded unused output commitment slots would give a
+    // false positive whenever parent_nullifier == [0u8; 32].
+    let zero32 = [0 as u8; 32];
+    let entry_has_parent_null = (parent_nullifier != zero32) & buf_contains(leaf_buf_k, parent_nullifier);
     let entry_has_own_null    = buf_contains(leaf_buf_k, own_nullifier);
 
     let parent_nullifier_seen = inner_parent_nullifier_seen
