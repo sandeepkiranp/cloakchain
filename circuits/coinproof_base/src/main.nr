@@ -30,7 +30,7 @@ fn blake2s_pair(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
 
 global TREE_DEPTH: u32 = 32;
 global MAX_OUTPUT_COMMITMENTS: u32 = 8;
-global LEAF_BUF_LEN: u32 = 296;
+global LEAF_BUF_LEN: u32 = 328; // slot(8) + output_commitments(256) + ciphertext_hash(32) + nullifier(32)
 global STATE_BUF_LEN: u32 = 147;
 
 fn compute_root(leaf: [u8; 32], path: [[u8; 32]; 32]) -> [u8; 32] {
@@ -51,6 +51,7 @@ fn compute_root(leaf: [u8; 32], path: [[u8; 32]; 32]) -> [u8; 32] {
 fn compute_leaf(
     output_commitments: [[u8; 32]; MAX_OUTPUT_COMMITMENTS],
     ciphertext_hash: [u8; 32],
+    nullifier: [u8; 32],
 ) -> [u8; 32] {
     let mut buf = [0 as u8; LEAF_BUF_LEN];
     // slot = 0, so slot_le8 = [0; 8], already zeroed in the buffer
@@ -59,6 +60,7 @@ fn compute_leaf(
         for j in 0..32 { buf[off + j] = output_commitments[i][j]; }
     }
     for j in 0..32 { buf[264 + j] = ciphertext_hash[j]; }
+    for j in 0..32 { buf[296 + j] = nullifier[j]; }
     std::hash::blake2s(buf)
 }
 
@@ -104,7 +106,7 @@ fn main(
 ) -> pub [u8; 32] {
     assert(slot == 0, "slot must be 0 for the base case");
 
-    let leaf_0 = compute_leaf(entry_output_commitments, entry_ciphertext_hash);
+    let leaf_0 = compute_leaf(entry_output_commitments, entry_ciphertext_hash, entry_nullifier);
     let new_root = compute_root(leaf_0, append_path);
 
     // Receipt: coin appears in entry 0 (no parent_nullifier seen yet).

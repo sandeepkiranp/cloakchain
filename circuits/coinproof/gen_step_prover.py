@@ -21,12 +21,13 @@ Z = [bytes(32)]
 for _ in range(32):
     Z.append(blake2s(Z[-1] + Z[-1]))
 
-def compute_leaf(slot: int, out_cns: list, ct_hash: bytes) -> bytes:
-    buf = bytearray(296)
+def compute_leaf(slot: int, out_cns: list, ct_hash: bytes, nullifier: bytes = bytes(32)) -> bytes:
+    buf = bytearray(328)
     buf[0:8] = u64_le(slot)
     for i, cn in enumerate(out_cns):
         buf[8 + i*32 : 8 + i*32 + 32] = cn
     buf[264:296] = ct_hash
+    buf[296:328] = nullifier
     return blake2s(bytes(buf))
 
 def compute_root(leaf: bytes, slot: int, path: list) -> bytes:
