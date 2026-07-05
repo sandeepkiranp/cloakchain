@@ -112,7 +112,6 @@ fn cp_state_hash(
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SpendWitness {
-    vk:      Vec<[u8; 32]>,
     proof:   Vec<[u8; 32]>,
     vk_hash: [u8; 32],
     pk_p:    [u8; 32],
@@ -126,7 +125,6 @@ struct SpendWitness {
 impl SpendWitness {
     fn zeros() -> Self {
         Self {
-            vk:  vec![[0u8; 32]; VK_FIELDS],
             proof: vec![[0u8; 32]; PROOF_FIELDS],
             vk_hash: [0u8; 32],
             pk_p: [0u8; 32], cn_in: [0u8; 32],
@@ -323,6 +321,7 @@ fn coinproof_step_toml(
     inner: &CoinState, inner_sh: &[u8; 32],
     inner_vk: &[[u8; 32]], inner_proof: &[[u8; 32]], inner_vk_hash: &[u8; 32],
     is_receipt: bool,
+    spend_vk: &[[u8; 32]],
     sw: &SpendWitness,
 ) -> String {
     let ct = ciphertext_hash(entry);
@@ -373,7 +372,7 @@ fn coinproof_step_toml(
         irv = boolstr(inner.rcv_valid), ira = u64hex(inner.rcv_at),
         isp = boolstr(inner.spent), ipn = b32(parent_null),
         ipns = boolstr(inner.parent_null_seen),
-        svk = farr(&sw.vk), spr = farr(&sw.proof), svkh = fhex(&sw.vk_hash),
+        svk = farr(spend_vk), spr = farr(&sw.proof), svkh = fhex(&sw.vk_hash),
         spp = b32(&sw.pk_p), sci = b32(&sw.cn_in),
         sbr = b32(&sw.board_root), sin = b32(&sw.input_null),
         sno = u64hex(sw.num_outputs), soc = b32_arr(&sw.out_cns),
@@ -752,7 +751,6 @@ fn main() {
     alice_spend_out_cns[0] = cn_bob;
     alice_spend_out_cns[1] = alice_change.commitment();
     let alice_sw = SpendWitness {
-        vk:      spend_vk_fields.clone(),
         proof:   alice_spend_proof,
         vk_hash: spend_vk_hash,
         pk_p:    alice.pk,
@@ -832,6 +830,7 @@ fn main() {
         &base_state, &base_sh_actual,
         &base_vk, &base_proof, &base_vk_hash,
         step_receipt,
+        &spend_vk_fields,
         &alice_sw,
     ));
     print!("  nargo execute... "); let t = Instant::now();
@@ -902,7 +901,6 @@ fn main() {
     println!("\n=== Building entry[2]: bob → carol ===");
 
     let bob_spend_proof_fields = read_fields(&spend_dir.join("target/proof/proof"), PROOF_FIELDS);
-    let bob_spend_vk_fields    = read_fields(&spend_dir.join("target/vk/vk"),       VK_FIELDS);
     let bob_spend_vk_hash      = read_vk_hash(&spend_dir.join("target/vk/vk_hash"));
 
     let carol_null        = spend_nullifier(&cn_carol, &carol.sk);
@@ -911,7 +909,6 @@ fn main() {
     let mut bob_sw_out_cns = [[0u8; 32]; 8];
     bob_sw_out_cns[0] = cn_carol;
     let bob_sw = SpendWitness {
-        vk:         bob_spend_vk_fields,
         proof:      bob_spend_proof_fields,
         vk_hash:    bob_spend_vk_hash,
         pk_p:       bob.pk,
@@ -996,6 +993,7 @@ fn main() {
         &carol_base_state, &carol_base_sh,
         &carol_base_vk, &carol_base_proof, &carol_base_vk_hash,
         carol_step1_rcpt,
+        &spend_vk_fields,
         &SpendWitness::zeros(),
     ));
     print!("  nargo execute... "); let t = Instant::now();
@@ -1046,6 +1044,7 @@ fn main() {
         &carol_step1_state, &carol_step1_sh,
         &carol_step1_vk, &carol_step1_proof, &carol_step1_vk_hash,
         carol_step2_rcpt,
+        &spend_vk_fields,
         &bob_sw,
     ));
     print!("  nargo execute... "); let t = Instant::now();
