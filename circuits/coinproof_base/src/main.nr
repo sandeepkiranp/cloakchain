@@ -31,6 +31,7 @@ fn blake2s_pair(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
 global TREE_DEPTH: u32 = 32;
 global MAX_OUTPUT_COMMITMENTS: u32 = 8;
 global LEAF_BUF_LEN: u32 = 328; // slot(8) + output_commitments(256) + ciphertext_hash(32) + nullifier(32)
+global LEAF_WINDOWS: u32 = 297;  // LEAF_BUF_LEN - 32 + 1
 global STATE_BUF_LEN: u32 = 147;
 
 fn compute_root(leaf: [u8; 32], path: [[u8; 32]; 32]) -> [u8; 32] {
@@ -48,11 +49,11 @@ fn compute_root(leaf: [u8; 32], path: [[u8; 32]; 32]) -> [u8; 32] {
     current
 }
 
-fn compute_leaf(
+fn compute_leaf_buf(
     output_commitments: [[u8; 32]; MAX_OUTPUT_COMMITMENTS],
     ciphertext_hash: [u8; 32],
     nullifier: [u8; 32],
-) -> [u8; 32] {
+) -> [u8; LEAF_BUF_LEN] {
     let mut buf = [0 as u8; LEAF_BUF_LEN];
     // slot = 0, so slot_le8 = [0; 8], already zeroed in the buffer
     for i in 0..MAX_OUTPUT_COMMITMENTS {
@@ -61,7 +62,27 @@ fn compute_leaf(
     }
     for j in 0..32 { buf[264 + j] = ciphertext_hash[j]; }
     for j in 0..32 { buf[296 + j] = nullifier[j]; }
-    std::hash::blake2s(buf)
+    buf
+}
+
+fn compute_leaf(
+    output_commitments: [[u8; 32]; MAX_OUTPUT_COMMITMENTS],
+    ciphertext_hash: [u8; 32],
+    nullifier: [u8; 32],
+) -> [u8; 32] {
+    std::hash::blake2s(compute_leaf_buf(output_commitments, ciphertext_hash, nullifier))
+}
+
+// Sliding-window search: does `needle` appear as any 32-byte substring of `buf`?
+// Matches SP1's bincode::serialize(&entry).windows(32).any(|w| w == needle).
+fn buf_contains(buf: [u8; LEAF_BUF_LEN], needle: [u8; 32]) -> bool {
+    let mut found = false;
+    for i in 0..LEAF_WINDOWS {
+        let mut window = [0 as u8; 32];
+        for j in 0..32 { window[j] = buf[i + j]; }
+        if window == needle { found = true; }
+    }
+    found
 }
 
 fn state_hash(
@@ -121,9 +142,11 @@ fn main(
     let is_receipt = coin_in_entry;
     assert(is_receipt == is_receipt_hint, "receipt hint disagrees with in-circuit detection");
 
-    // parent_nullifier_seen: check if entry_0.nullifier == parent_nullifier.
-    let parent_nullifier_seen = entry_nullifier == parent_nullifier;
-    let spent = entry_nullifier == own_nullifier;
+    // Sliding-window search over the raw 328-byte leaf buffer.
+    // Matches SP1's bincode::serialize(&entry).windows(32).any(|w| w == nullifier).
+    let leaf_buf = compute_leaf_buf(entry_output_commitments, entry_ciphertext_hash, entry_nullifier);
+    let parent_nullifier_seen = buf_contains(leaf_buf, parent_nullifier);
+    let spent                 = buf_contains(leaf_buf, own_nullifier);
 
     let received_at_valid = is_receipt;
     let received_at: u64 = if is_receipt { 0 } else { 0 };

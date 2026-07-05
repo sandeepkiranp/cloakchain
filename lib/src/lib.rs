@@ -305,7 +305,7 @@ pub fn ciphertext_hash(entry: &BoardEntry) -> [u8; 32] {
 /// Leaf hash = Blake2s(slot_le8 || cn_0..cn_7 (8 slots, zero-padded) || blake2s(ciphertext) || nullifier).
 /// Total buffer: 8 + 8*32 + 32 + 32 = 328 bytes — fixed-size, matches the Noir circuit.
 /// Matches compute_leaf() in circuits/coinproof/src/main.nr.
-pub fn merkle_leaf(slot: usize, entry: &BoardEntry) -> [u8; 32] {
+pub fn merkle_leaf_buf(slot: usize, entry: &BoardEntry) -> [u8; 328] {
     let mut buf = [0u8; 328];
     buf[..8].copy_from_slice(&(slot as u64).to_le_bytes());
     for (i, cn) in entry.output_commitments.iter().enumerate().take(8) {
@@ -313,7 +313,11 @@ pub fn merkle_leaf(slot: usize, entry: &BoardEntry) -> [u8; 32] {
     }
     buf[264..296].copy_from_slice(&ciphertext_hash(entry));
     buf[296..328].copy_from_slice(&entry.nullifier);
-    Blake2s256::digest(buf).into()
+    buf
+}
+
+pub fn merkle_leaf(slot: usize, entry: &BoardEntry) -> [u8; 32] {
+    Blake2s256::digest(merkle_leaf_buf(slot, entry)).into()
 }
 
 fn merkle_combine(l: &[u8; 32], r: &[u8; 32]) -> [u8; 32] {

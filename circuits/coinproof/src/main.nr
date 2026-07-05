@@ -38,6 +38,7 @@ fn bytes32_to_fields(b: [u8; 32]) -> [Field; 32] {
 global TREE_DEPTH: u32 = 32;
 global MAX_OUTPUT_COMMITMENTS: u32 = 8;
 global LEAF_BUF_LEN: u32 = 328; // slot(8) + output_commitments(256) + ciphertext_hash(32) + nullifier(32)
+global LEAF_WINDOWS: u32 = 297;  // LEAF_BUF_LEN - 32 + 1
 global STATE_BUF_LEN: u32 = 147;
 global SPEND_STATE_BUF_LEN: u32 = 296; // board_root(32) || num_outputs_le8(8) || cn_0..cn_7(256)
 
@@ -56,12 +57,12 @@ fn compute_root(leaf: [u8; 32], slot: u64, path: [[u8; 32]; 32]) -> [u8; 32] {
     current
 }
 
-fn compute_leaf(
+fn compute_leaf_buf(
     slot: u64,
     output_commitments: [[u8; 32]; MAX_OUTPUT_COMMITMENTS],
     ciphertext_hash: [u8; 32],
     nullifier: [u8; 32],
-) -> [u8; 32] {
+) -> [u8; LEAF_BUF_LEN] {
     let mut buf = [0 as u8; LEAF_BUF_LEN];
     let sb = u64_to_le_bytes(slot);
     for i in 0..8 { buf[i] = sb[i]; }
@@ -71,7 +72,28 @@ fn compute_leaf(
     }
     for j in 0..32 { buf[264 + j] = ciphertext_hash[j]; }
     for j in 0..32 { buf[296 + j] = nullifier[j]; }
-    std::hash::blake2s(buf)
+    buf
+}
+
+fn compute_leaf(
+    slot: u64,
+    output_commitments: [[u8; 32]; MAX_OUTPUT_COMMITMENTS],
+    ciphertext_hash: [u8; 32],
+    nullifier: [u8; 32],
+) -> [u8; 32] {
+    std::hash::blake2s(compute_leaf_buf(slot, output_commitments, ciphertext_hash, nullifier))
+}
+
+// Sliding-window search: does `needle` appear as any 32-byte substring of `buf`?
+// Matches SP1's bincode::serialize(&entry).windows(32).any(|w| w == needle).
+fn buf_contains(buf: [u8; LEAF_BUF_LEN], needle: [u8; 32]) -> bool {
+    let mut found = false;
+    for i in 0..LEAF_WINDOWS {
+        let mut window = [0 as u8; 32];
+        for j in 0..32 { window[j] = buf[i + j]; }
+        if window == needle { found = true; }
+    }
+    found
 }
 
 // Matches spend_state_hash() in circuits/spend/src/main.nr exactly.
@@ -173,7 +195,8 @@ fn main(
 
     let zero_leaf = [0 as u8; 32];
     let old_root = compute_root(zero_leaf, slot, append_path);
-    let leaf_k = compute_leaf(slot, entry_output_commitments, entry_ciphertext_hash, entry_nullifier);
+    let leaf_buf_k = compute_leaf_buf(slot, entry_output_commitments, entry_ciphertext_hash, entry_nullifier);
+    let leaf_k = std::hash::blake2s(leaf_buf_k);
     let new_root = compute_root(leaf_k, slot, append_path);
 
     // ---- 2. Inner proof verification (always) -----------------------------
@@ -258,11 +281,15 @@ fn main(
     }
 
     // ---- 4. Nullifier tracking --------------------------------------------
+    // Sliding-window search over the raw 328-byte leaf buffer.
+    // Matches SP1's bincode::serialize(&entry).windows(32).any(|w| w == nullifier).
+    let entry_has_parent_null = buf_contains(leaf_buf_k, parent_nullifier);
+    let entry_has_own_null    = buf_contains(leaf_buf_k, own_nullifier);
 
     let parent_nullifier_seen = inner_parent_nullifier_seen
-        | (!inner_received_at_valid & (entry_nullifier == parent_nullifier));
+        | (!inner_received_at_valid & entry_has_parent_null);
 
-    let spent = inner_spent | (entry_nullifier == own_nullifier);
+    let spent = inner_spent | entry_has_own_null;
 
     // ---- 5. State update --------------------------------------------------
 

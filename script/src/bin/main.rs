@@ -166,8 +166,9 @@ fn coinproof_base_state(
     let new_root = cloakkchain_lib::compute_root_from_path(leaf, 0, &path);
 
     let coin_in = entry.output_commitments.contains(cn);
-    let parent_null_seen = entry.nullifier == *parent_null;
-    let spent = entry.nullifier == *own_null;
+    let raw = cloakkchain_lib::merkle_leaf_buf(0, entry);
+    let parent_null_seen = raw.windows(32).any(|w| w == parent_null);
+    let spent            = raw.windows(32).any(|w| w == own_null);
 
     let state = CoinState {
         board_root: new_root, board_size: 1,
@@ -191,9 +192,12 @@ fn coinproof_step_state(
     let coin_in = entry.output_commitments.contains(cn);
     let is_receipt = coin_in && !inner.rcv_valid && !inner.parent_null_seen;
 
+    let raw = cloakkchain_lib::merkle_leaf_buf(slot, entry);
+    let entry_has_parent_null = raw.windows(32).any(|w| w == parent_null);
+    let entry_has_own_null    = raw.windows(32).any(|w| w == own_null);
     let parent_null_seen = inner.parent_null_seen
-        || (!inner.rcv_valid && entry.nullifier == *parent_null);
-    let spent = inner.spent || (entry.nullifier == *own_null);
+        || (!inner.rcv_valid && entry_has_parent_null);
+    let spent = inner.spent || entry_has_own_null;
     let rcv_valid = inner.rcv_valid || is_receipt;
     let rcv_at = if is_receipt && !inner.rcv_valid { slot as u64 } else { inner.rcv_at };
 
