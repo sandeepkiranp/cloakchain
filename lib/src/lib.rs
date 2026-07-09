@@ -471,14 +471,14 @@ impl CoinProofPublicValues {
 
 /// The spend proof stored in `tx.spend_proof` for in-circuit chain verification.
 ///
-/// Contains the bincode-serialised compressed STARK from the spend program (~1.21 MB),
+/// Contains the bincode-serialised SP1ProofWithPublicValues from the spend program,
 /// the spend proof public values, and the spend vkey — everything the coin-proof IVC
 /// needs to call `verify_sp1_proof` at the receipt slot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpendProofPackage {
-    /// `bincode::serialize(&SP1ProofWithPublicValues)` of the compressed STARK.
-    /// HOST extracts this and passes it as `stdin.write_proof(...)` hint.
-    pub compressed_proof_bytes: Vec<u8>,
+    /// `bincode::serialize(&SP1ProofWithPublicValues)` of the spend proof.
+    /// HOST extracts this and passes it as a `stdin.write_proof(...)` hint.
+    pub proof_bytes: Vec<u8>,
     /// `ValidPublicValues::encode()` — the spend proof's committed public values.
     /// zkVM uses this for `SHA256(pv_encode)` as the proof digest.
     pub pv_encode: Vec<u8>,
@@ -589,9 +589,9 @@ pub fn check_coin_proof_step(
                     if !pv.output_commitments.contains(&coin_commitment) {
                         return Err("parent spend proof does not commit to this coin commitment");
                     }
-                    // Non-empty compressed_proof_bytes → real proof; program verifies it.
+                    // Non-empty proof_bytes → real proof; program verifies it.
                     // Empty → mock/execute mode; output_commitments check is sufficient.
-                    if !pkg.compressed_proof_bytes.is_empty() {
+                    if !pkg.proof_bytes.is_empty() {
                         receipt = Some(ReceiptInfo {
                             spend_vkey: pkg.spend_vkey,
                             pv_encode:  pkg.pv_encode,
