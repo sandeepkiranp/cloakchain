@@ -111,7 +111,7 @@ impl<'a> Wallet<'a> {
             let own_null    = nullifier(*cn, self.party.sk);
             let mut stdin = build_coinproof_stdin(
                 coinproof_vkey, self.party.sk, *cn, entry, slot, &ap,
-                Some(&inner_pv), parent_null, own_null, None,
+                Some(&inner_pv), parent_null, own_null,
             );
             let SP1Proof::Compressed(c) = inner_proof.proof.clone() else { panic!("expected compressed coin-proof") };
             stdin.write_proof(*c, coinproof_pk.verifying_key().vk.clone());
@@ -154,22 +154,11 @@ impl<'a> Wallet<'a> {
     ) {
         let own_null = nullifier(cn, self.party.sk);
 
-        // Helper: extract the Groth16 spend proof hint from a receipt entry.
-        let spend_hint = |entry: &BoardEntry| -> (Vec<u8>, String) {
-            let tx = lib_scan_entry(&self.party.sk, entry)
-                .expect("bootstrap: cannot decrypt receipt entry");
-            let pkg: SpendProofPackage = bincode::deserialize(&tx.spend_proof)
-                .expect("bootstrap: tx.spend_proof is not a SpendProofPackage");
-            (pkg.proof_bytes.clone(), pkg.spend_vkey_hash.clone())
-        };
-
         // Slot 0: base case.
         let ap0 = append_proof_for(&all_entries[..1]);
-        let sp0 = if up_to_slot == 0 { let (b, k) = spend_hint(&all_entries[0]); Some((b, k)) } else { None };
         let stdin = build_coinproof_stdin(
             coinproof_vkey, self.party.sk, cn, &all_entries[0], 0, &ap0,
             None, parent_nullifier, own_null,
-            sp0.as_ref().map(|(b, k)| (b.as_slice(), k.as_str())),
         );
         let label = format!("{} coin-proof slot 0 (base)", self.party.name);
         let rec = self.run_coinproof_step(stdin, &label, 1, coinproof_pk, client, stats);
@@ -180,11 +169,9 @@ impl<'a> Wallet<'a> {
             let rec = self.coins.get(&cn).unwrap();
             let inner_pv    = rec.pv.clone();
             let inner_proof = rec.proof.clone();
-            let sp = if s == up_to_slot { let (b, k) = spend_hint(&all_entries[s]); Some((b, k)) } else { None };
             let mut stdin = build_coinproof_stdin(
                 coinproof_vkey, self.party.sk, cn, &all_entries[s], s, &aps,
                 Some(&inner_pv), parent_nullifier, own_null,
-                sp.as_ref().map(|(b, k)| (b.as_slice(), k.as_str())),
             );
             let SP1Proof::Compressed(c) = inner_proof.proof.clone() else { panic!("expected compressed coin-proof") };
             stdin.write_proof(*c, coinproof_pk.verifying_key().vk.clone());
@@ -412,7 +399,6 @@ fn build_coinproof_stdin(
     entry_k: &BoardEntry, slot: usize, append_path: &[[u8; 32]],
     inner: Option<&CoinProofPublicValues>,
     parent_nullifier: [u8; 32], own_nullifier: [u8; 32],
-    spend_proof: Option<(&[u8], &str)>,
 ) -> SP1Stdin {
     let mut stdin = SP1Stdin::new();
     stdin.write(coinproof_vkey);
@@ -425,11 +411,6 @@ fn build_coinproof_stdin(
     if let Some(pv) = inner { stdin.write(pv); }
     stdin.write(&parent_nullifier);
     stdin.write(&own_nullifier);
-    stdin.write(&spend_proof.is_some());
-    if let Some((proof_bytes, vkey_hash)) = spend_proof {
-        stdin.write_vec(proof_bytes.to_vec());
-        stdin.write(&vkey_hash.to_string());
-    }
     stdin
 }
 
@@ -544,7 +525,7 @@ fn main() {
             let on = nullifier(cn_alice, owner_sk);
             let stdin = build_coinproof_stdin(
                 &coinproof_vkey, owner_sk, cn_alice,
-                &entries[0], 0, &ap0, None, pn, on, None,
+                &entries[0], 0, &ap0, None, pn, on,
             );
             let t = Instant::now();
             let (output, report) = client.execute(CLOAKKCHAIN_COINPROOF_ELF, stdin).run().unwrap();

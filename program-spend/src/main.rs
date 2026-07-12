@@ -2,7 +2,10 @@
 sp1_zkvm::entrypoint!(main);
 
 use sha2::{Digest, Sha256};
-use cloakkchain_lib::{check_spend, BoardEntry, Coin, CoinProofPublicValues, Transaction};
+use cloakkchain_lib::{
+    check_spend, scan_entry, BoardEntry, Coin, CoinProofPublicValues, SpendProofPackage,
+    Transaction,
+};
 
 pub fn main() {
     let vkey: [u32; 8]             = sp1_zkvm::io::read();
@@ -17,6 +20,13 @@ pub fn main() {
     let is_genesis: bool           = sp1_zkvm::io::read();
     let coin_proof: Option<CoinProofPublicValues> =
         if is_genesis { None } else { Some(sp1_zkvm::io::read()) };
+
+    // Extract receipt entry before prior_entries is consumed by check_spend.
+    // The receipt is the board slot where we received the coin being spent;
+    // its spend proof proves our coin was legitimately created.
+    let receipt_entry: Option<BoardEntry> = coin_proof.as_ref().and_then(|cp| {
+        cp.received_at.map(|at| prior_entries[at as usize].clone())
+    });
 
     let public_values = check_spend(
         vkey,
@@ -33,12 +43,28 @@ pub fn main() {
     )
     .expect("the Valid relation does not hold for this transaction");
 
-    // Non-genesis: verify the spender's coin-proof (compressed STARK) via
-    // the deferred verify syscall. The proof was passed by the host via
-    // stdin.write_proof; pv_digest is SHA-256 of the committed public values.
     if let Some(cp) = &coin_proof {
+        // Verify the spender's coin-proof (compressed STARK) via deferred syscall.
         let pv_digest: [u8; 32] = Sha256::digest(&cp.encode()).into();
         sp1_zkvm::lib::verify::verify_sp1_proof(&coin_proof_vkey, &pv_digest);
+
+        // Verify the spend proof that created our coin (at the receipt slot).
+        // Ensures no coin can be minted from a fake or invalid spend proof.
+        if let Some(entry) = receipt_entry {
+            let receipt_tx = scan_entry(&sk_p, &entry)
+                .expect("cannot decrypt receipt entry with spender sk");
+            let pkg: SpendProofPackage = bincode::deserialize(&receipt_tx.spend_proof)
+                .expect("malformed SpendProofPackage in receipt entry");
+            if !pkg.proof_bytes.is_empty() {
+                sp1_verifier::Groth16Verifier::verify(
+                    &pkg.proof_bytes,
+                    &pkg.pv_encode,
+                    &pkg.spend_vkey_hash,
+                    *sp1_verifier::GROTH16_VK_BYTES,
+                )
+                .expect("receipt spend proof verification failed");
+            }
+        }
     }
 
     sp1_zkvm::io::commit_slice(&public_values.encode());
