@@ -566,6 +566,7 @@ dependencies = [
  "bincode",
  "cloakkchain-lib",
  "sha2",
+ "sp1-verifier",
  "sp1-zkvm",
 ]
 

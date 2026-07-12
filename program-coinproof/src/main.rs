@@ -2,10 +2,12 @@
 //!
 //! Uses `owner_sk` (private key) for X25519 ECDH decryption in `scan_entry`.
 //!
-//! At the receipt slot the justification carries `ReceiptInfo` (spend proof public
-//! values).  We call `Groth16Verifier::verify` on the spend proof bytes that the
-//! HOST passes via `stdin.write_vec` — establishing a cryptographic chain of custody
-//! without requiring a compressed STARK hint.
+//! Inner coin-proof (slot k-1) and spend proof (at receipt slot) are both
+//! verified via `Groth16Verifier::verify`. The HOST passes both as raw bytes
+//! via `stdin.write_vec` — no `write_proof` / `verify_sp1_proof` used.
+//!
+//! Public values for verification come from `check_coin_proof_step` return
+//! values (board-derived, trusted) — not from separate stdin writes.
 
 #![no_main]
 sp1_zkvm::entrypoint!(main);
@@ -13,7 +15,6 @@ sp1_zkvm::entrypoint!(main);
 use cloakkchain_lib::{
     check_coin_proof_step, BoardEntry, CoinProofJustification, CoinProofPublicValues,
 };
-use sha2::{Digest, Sha256};
 
 pub fn main() {
     let vkey: [u32; 8]            = sp1_zkvm::io::read();
@@ -25,23 +26,31 @@ pub fn main() {
     let has_inner: bool           = sp1_zkvm::io::read();
     let inner: Option<CoinProofPublicValues> =
         if has_inner { Some(sp1_zkvm::io::read()) } else { None };
-    let parent_nullifier: [u8; 32] = sp1_zkvm::io::read();
-    let own_nullifier: [u8; 32]    = sp1_zkvm::io::read();
+    // Groth16 inner coin-proof bytes — only present when has_inner.
+    let inner_proof_bytes: Vec<u8>  = if has_inner { sp1_zkvm::io::read_vec() } else { vec![] };
+    let inner_vkey_hash: String     = if has_inner { sp1_zkvm::io::read() } else { String::new() };
+    let parent_nullifier: [u8; 32]  = sp1_zkvm::io::read();
+    let own_nullifier: [u8; 32]     = sp1_zkvm::io::read();
     // Groth16 spend proof hint — only present at the receipt slot in prove mode.
-    let has_spend_proof: bool      = sp1_zkvm::io::read();
-    let spend_proof_bytes: Vec<u8> = if has_spend_proof { sp1_zkvm::io::read_vec() } else { vec![] };
-    let spend_vkey_hash: String    = if has_spend_proof { sp1_zkvm::io::read() } else { String::new() };
+    let has_spend_proof: bool       = sp1_zkvm::io::read();
+    let spend_proof_bytes: Vec<u8>  = if has_spend_proof { sp1_zkvm::io::read_vec() } else { vec![] };
+    let spend_vkey_hash: String     = if has_spend_proof { sp1_zkvm::io::read() } else { String::new() };
 
     let (public_values, justification) =
         check_coin_proof_step(vkey, owner_sk, coin_commitment, entry_k, slot, append_path,
             inner, parent_nullifier, own_nullifier)
             .expect("the CoinProof relation does not hold for this step");
 
-    // Verify the recursive inner coin-proof (all steps except base case).
-    // The HOST passes the compressed inner proof as write_proof hint #1.
+    // Verify the inner coin-proof as Groth16 (all steps except base case).
+    // pv comes from check_coin_proof_step (board-derived, trusted) — not from stdin.
     if let CoinProofJustification::Step { inner_public_values, .. } = &justification {
-        let digest: [u8; 32] = Sha256::digest(inner_public_values.encode()).into();
-        sp1_zkvm::lib::verify::verify_sp1_proof(&vkey, &digest);
+        sp1_verifier::Groth16Verifier::verify(
+            &inner_proof_bytes,
+            &inner_public_values.encode(),
+            &inner_vkey_hash,
+            *sp1_verifier::GROTH16_VK_BYTES,
+        )
+        .expect("inner coin-proof Groth16 verification failed");
     }
 
     // At the receipt slot: verify the parent's Groth16 spend proof.
