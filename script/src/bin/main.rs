@@ -12,7 +12,10 @@
 //! ```
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+#[cfg(target_os = "linux")]
+extern crate libc;
 
 use clap::Parser;
 use cloakkchain_lib::{
@@ -198,6 +201,7 @@ impl<'a> Wallet<'a> {
         client: &C,
         stats: &mut Vec<ProveStats>,
     ) -> CoinRecord {
+        pause_between_proofs();
         let t = Instant::now();
         let proof = client.prove(coinproof_pk, stdin).groth16().run()
             .unwrap_or_else(|e| panic!("coin-proof step failed: {e}"));
@@ -298,6 +302,17 @@ fn coin(seed: u8, value: u64, owner_pk: [u8; 32]) -> Coin {
 }
 
 /// Compute `H(coin_commitment || sk)` — the spending nullifier.
+/// Sleep briefly and tell the allocator to return freed pages to the OS.
+/// The SP1 Groth16 circuit (R1CS + proving key) consumes ~40–60 GB; without
+/// this pause the OS doesn't reclaim those pages before the next proof loads
+/// the same data, causing an OOM kill on machines with ≤64 GB RAM.
+fn pause_between_proofs() {
+    println!("  [gc-pause] releasing memory before next proof (60 s) …");
+    std::thread::sleep(Duration::from_secs(60));
+    #[cfg(target_os = "linux")]
+    unsafe { libc::malloc_trim(0); }
+}
+
 fn nullifier(cn: [u8; 32], sk: [u8; 32]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new(); h.update(cn); h.update(sk);
@@ -535,6 +550,7 @@ fn main() {
     // Slot 1: Alice sends 40 to Bob + 60 change — built after Alice received her coin
     // =========================================================================
     println!("\n--- Slot 1: Alice spends to Bob + change (1 input → 2 outputs) ---");
+    pause_between_proofs();
     let (mut tx1, s1, r1) = make_tx(1, alice.sk, &[alice_coin.clone()],
         &[(bob_coin.clone(), bob.pk), (alice_change.clone(), alice.pk)]);
     let alice_record = alice_wallet.get(&cn_alice).expect("Alice must have cn_alice proof");
@@ -570,6 +586,7 @@ fn main() {
     // Slot 2: Bob sends 40 to Carol — built after Bob received his coin
     // =========================================================================
     println!("\n--- Slot 2: Bob spends to Carol (1 input → 1 output) ---");
+    pause_between_proofs();
     let (mut tx2, s2, r2) = make_tx(2, bob.sk, &[bob_coin.clone()], &[(carol_coin.clone(), carol.pk)]);
     let bob_record = bob_wallet.get(&cn_bob).expect("Bob must have cn_bob proof");
     let bob_cp_bytes = bob_record.proof.bytes();
