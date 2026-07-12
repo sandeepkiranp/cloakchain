@@ -12,10 +12,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
-
-#[cfg(target_os = "linux")]
-extern crate libc;
+use std::time::Instant;
 
 use clap::Parser;
 use cloakkchain_lib::{
@@ -41,6 +38,15 @@ struct Args {
     execute: bool,
     #[arg(long)]
     prove: bool,
+    // Hidden flags used when this binary re-invokes itself as a proving subprocess.
+    // Each proof runs in its own process so the Go/gnark circuit memory is fully
+    // returned to the OS between proofs (prevents OOM on machines with ≤64 GB RAM).
+    #[arg(long, hide = true)]
+    internal_prove_elf: Option<String>,
+    #[arg(long, hide = true)]
+    internal_prove_stdin: Option<std::path::PathBuf>,
+    #[arg(long, hide = true)]
+    internal_prove_output: Option<std::path::PathBuf>,
 }
 
 // ---- Party ------------------------------------------------------------------
@@ -201,10 +207,8 @@ impl<'a> Wallet<'a> {
         client: &C,
         stats: &mut Vec<ProveStats>,
     ) -> CoinRecord {
-        pause_between_proofs();
         let t = Instant::now();
-        let proof = client.prove(coinproof_pk, stdin).groth16().run()
-            .unwrap_or_else(|e| panic!("coin-proof step failed: {e}"));
+        let proof = prove_groth16_subprocess("coinproof", &stdin);
         let prove_secs = t.elapsed().as_secs_f64();
         let t = Instant::now();
         client.verify(&proof, coinproof_pk.verifying_key(), None).expect("coin-proof verify failed");
@@ -302,15 +306,56 @@ fn coin(seed: u8, value: u64, owner_pk: [u8; 32]) -> Coin {
 }
 
 /// Compute `H(coin_commitment || sk)` — the spending nullifier.
-/// Sleep briefly and tell the allocator to return freed pages to the OS.
-/// The SP1 Groth16 circuit (R1CS + proving key) consumes ~40–60 GB; without
-/// this pause the OS doesn't reclaim those pages before the next proof loads
-/// the same data, causing an OOM kill on machines with ≤64 GB RAM.
-fn pause_between_proofs() {
-    println!("  [gc-pause] releasing memory before next proof (60 s) …");
-    std::thread::sleep(Duration::from_secs(60));
-    #[cfg(target_os = "linux")]
-    unsafe { libc::malloc_trim(0); }
+/// Run a single Groth16 proof in a fresh child process.
+///
+/// The SP1/gnark Groth16 circuit (R1CS + proving key) consumes ~40–60 GB
+/// via CGo/Go's allocator.  Go's GC does not return that memory to the OS
+/// quickly enough for a second proof to fit in 64 GB RAM.  Forking into a
+/// subprocess means the OS fully reclaims all Go pages when the child exits,
+/// so every proof starts with a clean slate.
+fn prove_groth16_subprocess(elf_id: &str, stdin: &SP1Stdin) -> SP1ProofWithPublicValues {
+    let tmp = std::env::temp_dir();
+    let stdin_path  = tmp.join(format!("cloakchain_{elf_id}_stdin.bin"));
+    let proof_path  = tmp.join(format!("cloakchain_{elf_id}_proof.bin"));
+
+    let stdin_bytes = bincode::serialize(stdin).expect("serialize SP1Stdin");
+    std::fs::write(&stdin_path, stdin_bytes).expect("write stdin file");
+
+    println!("  [subprocess] proving {} in child process …", elf_id);
+    let exe = std::env::current_exe().expect("current_exe");
+    let status = std::process::Command::new(&exe)
+        .args([
+            "--internal-prove-elf",    elf_id,
+            "--internal-prove-stdin",  stdin_path.to_str().unwrap(),
+            "--internal-prove-output", proof_path.to_str().unwrap(),
+        ])
+        .envs(std::env::vars())
+        .status()
+        .expect("spawn proving subprocess");
+    assert!(status.success(), "proving subprocess for {elf_id} exited with {status}");
+
+    let proof_bytes = std::fs::read(&proof_path).expect("read proof file");
+    let proof: SP1ProofWithPublicValues =
+        bincode::deserialize(&proof_bytes).expect("deserialize SP1ProofWithPublicValues");
+    let _ = std::fs::remove_file(&stdin_path);
+    let _ = std::fs::remove_file(&proof_path);
+    proof
+}
+
+/// Entry point when this binary is re-invoked as a proving subprocess.
+fn run_internal_prove(elf_id: &str, stdin_path: &std::path::Path, output_path: &std::path::Path) {
+    let elf = match elf_id {
+        "spend"     => CLOAKKCHAIN_SPEND_ELF,
+        "coinproof" => CLOAKKCHAIN_COINPROOF_ELF,
+        other       => panic!("unknown elf id: {other}"),
+    };
+    let stdin_bytes = std::fs::read(stdin_path).expect("read stdin file");
+    let stdin: SP1Stdin = bincode::deserialize(&stdin_bytes).expect("deserialize SP1Stdin");
+    let client = ProverClient::from_env();
+    let pk = client.setup(elf).expect("setup");
+    let proof = client.prove(&pk, stdin).groth16().run().expect("groth16 prove");
+    let proof_bytes = bincode::serialize(&proof).expect("serialize proof");
+    std::fs::write(output_path, proof_bytes).expect("write proof file");
 }
 
 fn nullifier(cn: [u8; 32], sk: [u8; 32]) -> [u8; 32] {
@@ -423,6 +468,18 @@ fn main() {
     dotenv::dotenv().ok();
 
     let args = Args::parse();
+
+    // Subprocess mode: prove one program and exit.  Memory is fully freed when
+    // this process exits, so the parent can start the next proof with clean RAM.
+    if let (Some(elf_id), Some(stdin_path), Some(output_path)) = (
+        &args.internal_prove_elf,
+        &args.internal_prove_stdin,
+        &args.internal_prove_output,
+    ) {
+        run_internal_prove(elf_id, stdin_path, output_path);
+        return;
+    }
+
     if args.execute == args.prove {
         eprintln!("Error: specify either --execute or --prove");
         std::process::exit(1);
@@ -526,7 +583,7 @@ fn main() {
     let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn_genesis,
         &entries, &tx0, &[genesis_coin.clone()], &[alice_coin.clone()], true, None, None);
     let t = Instant::now();
-    let genesis_proof = client.prove(&spend_pk, stdin).groth16().run().expect("genesis prove");
+    let genesis_proof = prove_groth16_subprocess("spend", &stdin);
     let prove_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
     client.verify(&genesis_proof, spend_pk.verifying_key(), None).expect("genesis verify");
@@ -550,7 +607,6 @@ fn main() {
     // Slot 1: Alice sends 40 to Bob + 60 change — built after Alice received her coin
     // =========================================================================
     println!("\n--- Slot 1: Alice spends to Bob + change (1 input → 2 outputs) ---");
-    pause_between_proofs();
     let (mut tx1, s1, r1) = make_tx(1, alice.sk, &[alice_coin.clone()],
         &[(bob_coin.clone(), bob.pk), (alice_change.clone(), alice.pk)]);
     let alice_record = alice_wallet.get(&cn_alice).expect("Alice must have cn_alice proof");
@@ -562,7 +618,7 @@ fn main() {
         false, Some(&alice_record.pv),
         Some((&alice_cp_bytes, &alice_cp_vkey_hash)));
     let t = Instant::now();
-    let alice_spend_proof = client.prove(&spend_pk, stdin).groth16().run().expect("alice spend prove");
+    let alice_spend_proof = prove_groth16_subprocess("spend", &stdin);
     let prove_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
     client.verify(&alice_spend_proof, spend_pk.verifying_key(), None).expect("alice spend verify");
@@ -586,7 +642,6 @@ fn main() {
     // Slot 2: Bob sends 40 to Carol — built after Bob received his coin
     // =========================================================================
     println!("\n--- Slot 2: Bob spends to Carol (1 input → 1 output) ---");
-    pause_between_proofs();
     let (mut tx2, s2, r2) = make_tx(2, bob.sk, &[bob_coin.clone()], &[(carol_coin.clone(), carol.pk)]);
     let bob_record = bob_wallet.get(&cn_bob).expect("Bob must have cn_bob proof");
     let bob_cp_bytes = bob_record.proof.bytes();
@@ -597,7 +652,7 @@ fn main() {
         false, Some(&bob_record.pv),
         Some((&bob_cp_bytes, &bob_cp_vkey_hash)));
     let t = Instant::now();
-    let bob_spend_proof = client.prove(&spend_pk, stdin).groth16().run().expect("bob spend prove");
+    let bob_spend_proof = prove_groth16_subprocess("spend", &stdin);
     let prove_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
     client.verify(&bob_spend_proof, spend_pk.verifying_key(), None).expect("bob spend verify");

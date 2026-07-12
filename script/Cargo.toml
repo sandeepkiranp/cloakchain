@@ -23,7 +23,6 @@ tracing = "0.1.40"
 hex = "0.4.3"
 cloakkchain-lib = { path = "../lib" }
 dotenv = "0.15.0"
-libc = "0.2"
 
 [build-dependencies]
 sp1-build = { version = "6.0.1" }
