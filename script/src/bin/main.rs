@@ -105,16 +105,16 @@ impl<'a> Wallet<'a> {
         for cn in &tracked {
             let record = self.coins.get(cn).unwrap();
             if record.slot_covered() >= slot { continue; }
-            let inner_pv = record.pv.clone();
+            let inner_pv    = record.pv.clone();
+            let inner_proof = record.proof.clone();
             let parent_null = inner_pv.parent_nullifier;
             let own_null    = nullifier(*cn, self.party.sk);
-            let inner_proof_bytes = record.proof.bytes();
-            let inner_vkey_hash   = coinproof_pk.verifying_key().bytes32();
-            let stdin = build_coinproof_stdin(
+            let mut stdin = build_coinproof_stdin(
                 coinproof_vkey, self.party.sk, *cn, entry, slot, &ap,
-                Some((&inner_pv, &inner_proof_bytes, &inner_vkey_hash)),
-                parent_null, own_null, None,
+                Some(&inner_pv), parent_null, own_null, None,
             );
+            let SP1Proof::Compressed(c) = inner_proof.proof.clone() else { panic!("expected compressed coin-proof") };
+            stdin.write_proof(*c, coinproof_pk.verifying_key().vk.clone());
             let label = format!("{} coin-proof slot {} (step)", self.party.name, slot);
             let rec = self.run_coinproof_step(stdin, &label, slot + 1, coinproof_pk, client, stats);
             self.coins.insert(*cn, rec);
@@ -178,16 +178,16 @@ impl<'a> Wallet<'a> {
         for s in 1..=up_to_slot {
             let aps = append_proof_for(&all_entries[..=s]);
             let rec = self.coins.get(&cn).unwrap();
-            let inner_pv = rec.pv.clone();
-            let inner_proof_bytes = rec.proof.bytes();
-            let inner_vkey_hash   = coinproof_pk.verifying_key().bytes32();
+            let inner_pv    = rec.pv.clone();
+            let inner_proof = rec.proof.clone();
             let sp = if s == up_to_slot { let (b, k) = spend_hint(&all_entries[s]); Some((b, k)) } else { None };
-            let stdin = build_coinproof_stdin(
+            let mut stdin = build_coinproof_stdin(
                 coinproof_vkey, self.party.sk, cn, &all_entries[s], s, &aps,
-                Some((&inner_pv, &inner_proof_bytes, &inner_vkey_hash)),
-                parent_nullifier, own_null,
+                Some(&inner_pv), parent_nullifier, own_null,
                 sp.as_ref().map(|(b, k)| (b.as_slice(), k.as_str())),
             );
+            let SP1Proof::Compressed(c) = inner_proof.proof.clone() else { panic!("expected compressed coin-proof") };
+            stdin.write_proof(*c, coinproof_pk.verifying_key().vk.clone());
             let label = if s == up_to_slot {
                 format!("{} coin-proof slot {} (received)", self.party.name, s)
             } else {
@@ -208,7 +208,8 @@ impl<'a> Wallet<'a> {
         stats: &mut Vec<ProveStats>,
     ) -> CoinRecord {
         let t = Instant::now();
-        let proof = prove_groth16_subprocess("coinproof", &stdin);
+        let proof = client.prove(coinproof_pk, stdin).compressed().run()
+            .unwrap_or_else(|e| panic!("coin-proof step failed: {e}"));
         let prove_secs = t.elapsed().as_secs_f64();
         let t = Instant::now();
         client.verify(&proof, coinproof_pk.verifying_key(), None).expect("coin-proof verify failed");
@@ -403,10 +404,13 @@ fn make_tx(
 
 // ---- stdin builders ---------------------------------------------------------
 
+/// Build stdin for a coinproof step.  The inner compressed proof (if any) is
+/// NOT written here — callers must call `stdin.write_proof(inner, vk)` after
+/// this returns so the deferred `verify_sp1_proof` syscall can find it.
 fn build_coinproof_stdin(
     coinproof_vkey: &[u32; 8], owner_sk: [u8; 32], coin_commitment: [u8; 32],
     entry_k: &BoardEntry, slot: usize, append_path: &[[u8; 32]],
-    inner: Option<(&CoinProofPublicValues, &[u8], &str)>,
+    inner: Option<&CoinProofPublicValues>,
     parent_nullifier: [u8; 32], own_nullifier: [u8; 32],
     spend_proof: Option<(&[u8], &str)>,
 ) -> SP1Stdin {
@@ -418,11 +422,7 @@ fn build_coinproof_stdin(
     stdin.write(&slot);
     stdin.write(&append_path.to_vec());
     stdin.write(&inner.is_some());
-    if let Some((pv, proof_bytes, vkey_hash)) = inner {
-        stdin.write(pv);
-        stdin.write_vec(proof_bytes.to_vec());
-        stdin.write(&vkey_hash.to_string());
-    }
+    if let Some(pv) = inner { stdin.write(pv); }
     stdin.write(&parent_nullifier);
     stdin.write(&own_nullifier);
     stdin.write(&spend_proof.is_some());
@@ -433,13 +433,15 @@ fn build_coinproof_stdin(
     stdin
 }
 
+/// Build stdin for a spend proof.  The coin-proof (compressed) is NOT written
+/// here — callers must call `stdin.write_proof(coin_proof, vk)` after this
+/// returns so the deferred `verify_sp1_proof` syscall can find it.
 fn build_spend_stdin(
     spend_vkey: &[u32; 8], coinproof_vkey: &[u32; 8],
     sender: &Party, coin_commitment: [u8; 32],
     prior_entries: &[BoardEntry], tx_star: &Transaction,
     input_coins: &[Coin], output_coins: &[Coin],
     is_genesis: bool, coin_proof: Option<&CoinProofPublicValues>,
-    coin_proof_groth16: Option<(&[u8], &str)>,
 ) -> SP1Stdin {
     let mut stdin = SP1Stdin::new();
     stdin.write(spend_vkey);
@@ -453,10 +455,6 @@ fn build_spend_stdin(
     stdin.write(&output_coins.to_vec());
     stdin.write(&is_genesis);
     if let Some(cp) = coin_proof { stdin.write(cp); }
-    if let Some((proof_bytes, vkey_hash)) = coin_proof_groth16 {
-        stdin.write_vec(proof_bytes.to_vec());
-        stdin.write(&vkey_hash.to_string());
-    }
     stdin
 }
 
@@ -522,7 +520,7 @@ fn main() {
         // Slot 0: genesis mint — tx0 is built here, not upfront.
         let (mut tx0, s0, r0) = make_tx(0, GENESIS_SK, &[genesis_coin.clone()], &[(alice_coin.clone(), alice.pk)]);
         let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn_genesis,
-            &entries, &tx0, &[genesis_coin.clone()], &[alice_coin.clone()], true, None, None);
+            &entries, &tx0, &[genesis_coin.clone()], &[alice_coin.clone()], true, None);
         let t = Instant::now();
         let (output, report) = client.execute(CLOAKKCHAIN_SPEND_ELF, stdin).run().unwrap();
         let exec_ms = t.elapsed().as_millis();
@@ -581,7 +579,7 @@ fn main() {
     println!("\n--- Slot 0: genesis mint (1 input → 1 output) ---");
     let (mut tx0, s0, r0) = make_tx(0, GENESIS_SK, &[genesis_coin.clone()], &[(alice_coin.clone(), alice.pk)]);
     let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn_genesis,
-        &entries, &tx0, &[genesis_coin.clone()], &[alice_coin.clone()], true, None, None);
+        &entries, &tx0, &[genesis_coin.clone()], &[alice_coin.clone()], true, None);
     let t = Instant::now();
     let genesis_proof = prove_groth16_subprocess("spend", &stdin);
     let prove_secs = t.elapsed().as_secs_f64();
@@ -610,13 +608,12 @@ fn main() {
     let (mut tx1, s1, r1) = make_tx(1, alice.sk, &[alice_coin.clone()],
         &[(bob_coin.clone(), bob.pk), (alice_change.clone(), alice.pk)]);
     let alice_record = alice_wallet.get(&cn_alice).expect("Alice must have cn_alice proof");
-    let alice_cp_bytes = alice_record.proof.bytes();
-    let alice_cp_vkey_hash = coinproof_pk.verifying_key().bytes32();
-    let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &alice, cn_alice,
+    let mut stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &alice, cn_alice,
         &entries, &tx1,
         &[alice_coin.clone()], &[bob_coin.clone(), alice_change.clone()],
-        false, Some(&alice_record.pv),
-        Some((&alice_cp_bytes, &alice_cp_vkey_hash)));
+        false, Some(&alice_record.pv));
+    let SP1Proof::Compressed(cp) = alice_record.proof.proof.clone() else { panic!("expected compressed") };
+    stdin.write_proof(*cp, coinproof_pk.verifying_key().vk.clone());
     let t = Instant::now();
     let alice_spend_proof = prove_groth16_subprocess("spend", &stdin);
     let prove_secs = t.elapsed().as_secs_f64();
@@ -644,13 +641,12 @@ fn main() {
     println!("\n--- Slot 2: Bob spends to Carol (1 input → 1 output) ---");
     let (mut tx2, s2, r2) = make_tx(2, bob.sk, &[bob_coin.clone()], &[(carol_coin.clone(), carol.pk)]);
     let bob_record = bob_wallet.get(&cn_bob).expect("Bob must have cn_bob proof");
-    let bob_cp_bytes = bob_record.proof.bytes();
-    let bob_cp_vkey_hash = coinproof_pk.verifying_key().bytes32();
-    let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &bob, cn_bob,
+    let mut stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &bob, cn_bob,
         &entries, &tx2,
         &[bob_coin.clone()], &[carol_coin.clone()],
-        false, Some(&bob_record.pv),
-        Some((&bob_cp_bytes, &bob_cp_vkey_hash)));
+        false, Some(&bob_record.pv));
+    let SP1Proof::Compressed(cp) = bob_record.proof.proof.clone() else { panic!("expected compressed") };
+    stdin.write_proof(*cp, coinproof_pk.verifying_key().vk.clone());
     let t = Instant::now();
     let bob_spend_proof = prove_groth16_subprocess("spend", &stdin);
     let prove_secs = t.elapsed().as_secs_f64();
