@@ -471,25 +471,27 @@ impl CoinProofPublicValues {
 
 /// The spend proof stored in `tx.spend_proof` for in-circuit chain verification.
 ///
-/// Contains the bincode-serialised compressed STARK from the spend program (~1.21 MB),
-/// the spend proof public values, and the spend vkey — everything the coin-proof IVC
-/// needs to call `verify_sp1_proof` at the receipt slot.
+/// Contains the Groth16 proof bytes from `proof.bytes()`, the spend proof public
+/// values, and the spend vkey hash — everything the coin-proof IVC needs to call
+/// `Groth16Verifier::verify` at the receipt slot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpendProofPackage {
-    /// `bincode::serialize(&SP1ProofWithPublicValues)` of the compressed STARK.
-    /// HOST extracts this and passes it as `stdin.write_proof(...)` hint.
-    pub compressed_proof_bytes: Vec<u8>,
+    /// `SP1ProofWithPublicValues::bytes()` of the Groth16 spend proof.
+    /// HOST passes this via `stdin.write_vec()`; program calls `Groth16Verifier::verify`.
+    /// Empty in execute/mock mode — logical output_commitments check is sufficient then.
+    pub proof_bytes: Vec<u8>,
     /// `ValidPublicValues::encode()` — the spend proof's committed public values.
-    /// zkVM uses this for `SHA256(pv_encode)` as the proof digest.
+    /// Checked in `check_coin_proof_step` to verify the spend commits to this coin.
     pub pv_encode: Vec<u8>,
-    /// Spend program vkey hash (`spend_pk.verifying_key().hash_u32()`).
-    pub spend_vkey: [u32; 8],
+    /// Spend program vkey hash from `spend_pk.verifying_key().bytes32()`.
+    pub spend_vkey_hash: String,
 }
 
 /// What the program must verify at the receipt slot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceiptInfo {
-    pub spend_vkey: [u32; 8],
+    /// `ValidPublicValues::encode()` from the spend proof package — used by the
+    /// program as `sp1_public_inputs` when calling `Groth16Verifier::verify`.
     pub pv_encode: Vec<u8>,
 }
 
@@ -589,13 +591,10 @@ pub fn check_coin_proof_step(
                     if !pv.output_commitments.contains(&coin_commitment) {
                         return Err("parent spend proof does not commit to this coin commitment");
                     }
-                    // Non-empty compressed_proof_bytes → real proof; program verifies it.
+                    // Non-empty proof_bytes → real Groth16 proof; program verifies it.
                     // Empty → mock/execute mode; output_commitments check is sufficient.
-                    if !pkg.compressed_proof_bytes.is_empty() {
-                        receipt = Some(ReceiptInfo {
-                            spend_vkey: pkg.spend_vkey,
-                            pv_encode:  pkg.pv_encode,
-                        });
+                    if !pkg.proof_bytes.is_empty() {
+                        receipt = Some(ReceiptInfo { pv_encode: pkg.pv_encode });
                     }
                 }
                 received_at = Some(slot as u64);

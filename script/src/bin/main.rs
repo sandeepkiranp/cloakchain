@@ -103,7 +103,7 @@ impl<'a> Wallet<'a> {
                 else { panic!("compressed required") };
             let mut stdin = build_coinproof_stdin(
                 coinproof_vkey, self.party.sk, *cn, entry, slot, &ap,
-                Some(&inner_pv), parent_null, own_null,
+                Some(&inner_pv), parent_null, own_null, None,
             );
             stdin.write_proof(*inner_c, coinproof_pk.verifying_key().vk.clone());
             let label = format!("{} coin-proof slot {} (step)", self.party.name, slot);
@@ -145,30 +145,23 @@ impl<'a> Wallet<'a> {
     ) {
         let own_null = nullifier(cn, self.party.sk);
 
-        // Helper: extract the compressed spend proof hint from a receipt entry.
-        let spend_hint = |entry: &BoardEntry| {
+        // Helper: extract the Groth16 spend proof hint from a receipt entry.
+        let spend_hint = |entry: &BoardEntry| -> (Vec<u8>, String) {
             let tx = lib_scan_entry(&self.party.sk, entry)
                 .expect("bootstrap: cannot decrypt receipt entry");
             let pkg: SpendProofPackage = bincode::deserialize(&tx.spend_proof)
                 .expect("bootstrap: tx.spend_proof is not a SpendProofPackage");
-            let proof_with_pv: SP1ProofWithPublicValues =
-                bincode::deserialize(&pkg.compressed_proof_bytes)
-                .expect("bootstrap: cannot deserialize compressed spend proof");
-            let SP1Proof::Compressed(c) = proof_with_pv.proof.clone()
-                else { panic!("spend proof must be compressed") };
-            *c
+            (pkg.proof_bytes.clone(), pkg.spend_vkey_hash.clone())
         };
 
         // Slot 0: base case.
         let ap0 = append_proof_for(&all_entries[..1]);
-        let mut stdin = build_coinproof_stdin(
+        let sp0 = if up_to_slot == 0 { let (b, k) = spend_hint(&all_entries[0]); Some((b, k)) } else { None };
+        let stdin = build_coinproof_stdin(
             coinproof_vkey, self.party.sk, cn, &all_entries[0], 0, &ap0,
             None, parent_nullifier, own_null,
+            sp0.as_ref().map(|(b, k)| (b.as_slice(), k.as_str())),
         );
-        // If the coin is received at slot 0, also pass the spend proof hint.
-        if up_to_slot == 0 {
-            stdin.write_proof(spend_hint(&all_entries[0]), spend_pk.verifying_key().vk.clone());
-        }
         let label = format!("{} coin-proof slot 0 (base)", self.party.name);
         let rec = self.run_coinproof_step(stdin, &label, 1, coinproof_pk, client, stats);
         self.coins.insert(cn, rec);
@@ -179,16 +172,14 @@ impl<'a> Wallet<'a> {
             let inner_pv = rec.pv.clone();
             let SP1Proof::Compressed(inner_c) = rec.proof.proof.clone()
                 else { panic!("compressed required") };
+            let sp = if s == up_to_slot { let (b, k) = spend_hint(&all_entries[s]); Some((b, k)) } else { None };
             let mut stdin = build_coinproof_stdin(
                 coinproof_vkey, self.party.sk, cn, &all_entries[s], s, &aps,
                 Some(&inner_pv), parent_nullifier, own_null,
+                sp.as_ref().map(|(b, k)| (b.as_slice(), k.as_str())),
             );
             // Inner coin-proof hint (always for s > 0).
             stdin.write_proof(*inner_c, coinproof_pk.verifying_key().vk.clone());
-            // At the receipt slot, also pass the spend proof hint.
-            if s == up_to_slot {
-                stdin.write_proof(spend_hint(&all_entries[s]), spend_pk.verifying_key().vk.clone());
-            }
             let label = if s == up_to_slot {
                 format!("{} coin-proof slot {} (received)", self.party.name, s)
             } else {
@@ -318,11 +309,11 @@ fn nullifier(cn: [u8; 32], sk: [u8; 32]) -> [u8; 32] {
 /// Packages everything the coin-proof IVC needs to verify the spend proof at receipt.
 fn build_spend_proof_package(
     proof: &SP1ProofWithPublicValues,
-    spend_vkey: &[u32; 8],
+    spend_vkey_hash: String,
 ) -> SpendProofPackage {
-    let compressed_proof_bytes = bincode::serialize(proof).expect("serialize compressed proof");
+    let proof_bytes = proof.bytes();
     let pv_encode = proof.public_values.as_slice().to_vec();
-    SpendProofPackage { compressed_proof_bytes, pv_encode, spend_vkey: *spend_vkey }
+    SpendProofPackage { proof_bytes, pv_encode, spend_vkey_hash }
 }
 
 /// Build a Transaction using X25519 note encryption via session_key.
@@ -358,6 +349,7 @@ fn build_coinproof_stdin(
     entry_k: &BoardEntry, slot: usize, append_path: &[[u8; 32]],
     inner: Option<&CoinProofPublicValues>,
     parent_nullifier: [u8; 32], own_nullifier: [u8; 32],
+    spend_proof: Option<(&[u8], &str)>,
 ) -> SP1Stdin {
     let mut stdin = SP1Stdin::new();
     stdin.write(coinproof_vkey);
@@ -370,6 +362,11 @@ fn build_coinproof_stdin(
     if let Some(pv) = inner { stdin.write(pv); }
     stdin.write(&parent_nullifier);
     stdin.write(&own_nullifier);
+    stdin.write(&spend_proof.is_some());
+    if let Some((proof_bytes, vkey_hash)) = spend_proof {
+        stdin.write_vec(proof_bytes.to_vec());
+        stdin.write(&vkey_hash.to_string());
+    }
     stdin
 }
 
@@ -451,13 +448,13 @@ fn main() {
         let exec_ms = t.elapsed().as_millis();
         let pv: ValidPublicValues = bincode::deserialize(output.as_slice()).expect("decode");
         assert_eq!(pv.board_root, merkle_root_of(&entries));
-        // In execute mode there is no real compressed proof. Store a mock package
-        // with empty compressed_proof_bytes so check_coin_proof_step validates
-        // output_commitments but skips the verify_sp1_proof cryptographic check.
+        // In execute mode there is no real proof. Store a mock package with empty
+        // proof_bytes so check_coin_proof_step validates output_commitments but the
+        // program skips Groth16Verifier (has_spend_proof = false).
         let mock_pkg = SpendProofPackage {
-            compressed_proof_bytes: vec![],
+            proof_bytes: vec![],
             pv_encode: pv.encode(),
-            spend_vkey: [0u32; 8],
+            spend_vkey_hash: String::new(),
         };
         tx0.spend_proof = bincode::serialize(&mock_pkg).expect("serialize mock pkg");
         entries.push(encrypt_tx(&tx0, &r0, s0)); // board now has slot 0
@@ -469,7 +466,7 @@ fn main() {
             let on = nullifier(cn_alice, owner_sk);
             let stdin = build_coinproof_stdin(
                 &coinproof_vkey, owner_sk, cn_alice,
-                &entries[0], 0, &ap0, None, pn, on,
+                &entries[0], 0, &ap0, None, pn, on, None,
             );
             let t = Instant::now();
             let (output, report) = client.execute(CLOAKKCHAIN_COINPROOF_ELF, stdin).run().unwrap();
@@ -506,14 +503,14 @@ fn main() {
     let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn_genesis,
         &entries, &tx0, &[genesis_coin.clone()], &[alice_coin.clone()], true, None);
     let t = Instant::now();
-    let genesis_proof = client.prove(&spend_pk, stdin).compressed().run().expect("genesis prove");
+    let genesis_proof = client.prove(&spend_pk, stdin).groth16().run().expect("genesis prove");
     let prove_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
     client.verify(&genesis_proof, spend_pk.verifying_key(), None).expect("genesis verify");
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
     let pv: ValidPublicValues = bincode::deserialize(genesis_proof.public_values.as_slice()).expect("decode");
     assert_eq!(pv.board_root, merkle_root_of(&entries));
-    let genesis_pkg = build_spend_proof_package(&genesis_proof, &spend_vkey);
+    let genesis_pkg = build_spend_proof_package(&genesis_proof, spend_pk.verifying_key().bytes32());
     let genesis_proof_size = bincode::serialize(&genesis_pkg).map(|v| v.len()).unwrap_or(0);
     tx0.spend_proof = bincode::serialize(&genesis_pkg).expect("serialize spend proof package");
     entries.push(encrypt_tx(&tx0, &r0, s0));
@@ -542,19 +539,19 @@ fn main() {
         stdin.write_proof(*inner, coinproof_pk.verifying_key().vk.clone());
     }
     let t = Instant::now();
-    let alice_spend_proof = client.prove(&spend_pk, stdin).compressed().run().expect("alice spend prove");
+    let alice_spend_proof = client.prove(&spend_pk, stdin).groth16().run().expect("alice spend prove");
     let prove_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
     client.verify(&alice_spend_proof, spend_pk.verifying_key(), None).expect("alice spend verify");
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
     let pv: ValidPublicValues = bincode::deserialize(alice_spend_proof.public_values.as_slice()).expect("decode");
     assert_eq!(pv.board_root, merkle_root_of(&entries));
-    let alice_pkg = build_spend_proof_package(&alice_spend_proof, &spend_vkey);
+    let alice_pkg = build_spend_proof_package(&alice_spend_proof, spend_pk.verifying_key().bytes32());
     let alice_proof_size = bincode::serialize(&alice_pkg).map(|v| v.len()).unwrap_or(0);
     tx1.spend_proof = bincode::serialize(&alice_pkg).expect("serialize spend proof package");
     entries.push(encrypt_tx(&tx1, &r1, s1));
     let e1_bytes = bincode::serialize(&entries[1]).map(|v| v.len()).unwrap_or(0);
-    stats.push(ProveStats { name: "Slot 1: Alice's spend (compressed)".into(), board_size: 2, prove_secs, verify_ms, proof_bytes: Some(alice_proof_size), entry_bytes: Some(e1_bytes) });
+    stats.push(ProveStats { name: "Slot 1: Alice's spend (groth16)".into(), board_size: 2, prove_secs, verify_ms, proof_bytes: Some(alice_proof_size), entry_bytes: Some(e1_bytes) });
     println!("  Proved & verified ({prove_secs:.1} s) — proof {} — entry {}", fmt_bytes(alice_proof_size), fmt_bytes(e1_bytes));
 
     println!("--- Wallets scanning slot 1 ---");
@@ -577,19 +574,19 @@ fn main() {
         stdin.write_proof(*inner, coinproof_pk.verifying_key().vk.clone());
     }
     let t = Instant::now();
-    let bob_spend_proof = client.prove(&spend_pk, stdin).compressed().run().expect("bob spend prove");
+    let bob_spend_proof = client.prove(&spend_pk, stdin).groth16().run().expect("bob spend prove");
     let prove_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
     client.verify(&bob_spend_proof, spend_pk.verifying_key(), None).expect("bob spend verify");
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
     let pv: ValidPublicValues = bincode::deserialize(bob_spend_proof.public_values.as_slice()).expect("decode");
     assert_eq!(pv.board_root, merkle_root_of(&entries));
-    let bob_pkg = build_spend_proof_package(&bob_spend_proof, &spend_vkey);
+    let bob_pkg = build_spend_proof_package(&bob_spend_proof, spend_pk.verifying_key().bytes32());
     let bob_proof_size = bincode::serialize(&bob_pkg).map(|v| v.len()).unwrap_or(0);
     tx2.spend_proof = bincode::serialize(&bob_pkg).expect("serialize spend proof package");
     entries.push(encrypt_tx(&tx2, &r2, s2));
     let e2_bytes = bincode::serialize(&entries[2]).map(|v| v.len()).unwrap_or(0);
-    stats.push(ProveStats { name: "Slot 2: Bob's spend (compressed)".into(), board_size: 3, prove_secs, verify_ms, proof_bytes: Some(bob_proof_size), entry_bytes: Some(e2_bytes) });
+    stats.push(ProveStats { name: "Slot 2: Bob's spend (groth16)".into(), board_size: 3, prove_secs, verify_ms, proof_bytes: Some(bob_proof_size), entry_bytes: Some(e2_bytes) });
     println!("  Proved & verified ({prove_secs:.1} s) — proof {} — entry {}", fmt_bytes(bob_proof_size), fmt_bytes(e2_bytes));
 
     println!("--- Wallets scanning slot 2 ---");
