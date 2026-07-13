@@ -1,5 +1,5 @@
 [workspace]
-members = ["lib", "program-spend", "program-coinproof", "script"]
+members = ["lib", "program-spend", "program-coinproof", "program-vfy-g16", "script"]
 resolver = "2"
 
 [workspace.dependencies]

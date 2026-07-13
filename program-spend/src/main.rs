@@ -1,6 +1,7 @@
 #![no_main]
 sp1_zkvm::entrypoint!(main);
 
+use sha2::{Digest, Sha256};
 use cloakkchain_lib::{check_spend, BoardEntry, Coin, CoinProofPublicValues, Transaction};
 
 pub fn main() {
@@ -16,9 +17,6 @@ pub fn main() {
     let is_genesis: bool           = sp1_zkvm::io::read();
     let coin_proof: Option<CoinProofPublicValues> =
         if is_genesis { None } else { Some(sp1_zkvm::io::read()) };
-    // Groth16 coin-proof bytes + vkey hash, empty for genesis.
-    let coin_proof_bytes: Vec<u8>    = if is_genesis { vec![] } else { sp1_zkvm::io::read_vec() };
-    let coin_proof_vkey_hash: String = if is_genesis { String::new() } else { sp1_zkvm::io::read() };
 
     let public_values = check_spend(
         vkey,
@@ -35,17 +33,11 @@ pub fn main() {
     )
     .expect("the Valid relation does not hold for this transaction");
 
-    // Non-genesis: verify spender's coin-proof via Groth16.
-    // Empty bytes in execute/mock mode → skipped.
+    // Non-genesis: verify spender's coin-proof via deferred compressed-STARK check.
+    // Consumes the proof written via stdin.write_proof.
     if let Some(cp) = &coin_proof {
-        if !coin_proof_bytes.is_empty() {
-            sp1_verifier::Groth16Verifier::verify(
-                &coin_proof_bytes,
-                &cp.encode(),
-                &coin_proof_vkey_hash,
-                *sp1_verifier::GROTH16_VK_BYTES,
-            ).expect("coin-proof Groth16 verification failed");
-        }
+        let pv_digest: [u8; 32] = Sha256::digest(&cp.encode()).into();
+        sp1_zkvm::lib::verify::verify_sp1_proof(&coin_proof_vkey, &pv_digest);
     }
 
     sp1_zkvm::io::commit_slice(&public_values.encode());
