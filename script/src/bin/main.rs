@@ -39,6 +39,8 @@ struct Args {
     execute: bool,
     #[arg(long)]
     prove: bool,
+    #[arg(long, help = "Generate one Groth16 spend proof then execute VFY_G16_ELF to measure cycles — no full proving")]
+    bench_vfy_g16: bool,
     // Hidden flags used when this binary re-invokes itself as a proving subprocess.
     // Each proof runs in its own process so the Go/gnark circuit memory is fully
     // returned to the OS between proofs (prevents OOM on machines with ≤64 GB RAM).
@@ -525,9 +527,49 @@ fn main() {
         return;
     }
 
-    if args.execute == args.prove {
-        eprintln!("Error: specify either --execute or --prove");
+    let mode_count = [args.execute, args.prove, args.bench_vfy_g16].iter().filter(|&&b| b).count();
+    if mode_count != 1 {
+        eprintln!("Error: specify exactly one of --execute, --prove, --bench-vfy-g16");
         std::process::exit(1);
+    }
+
+    // ---- --bench-vfy-g16 -------------------------------------------------------
+    if args.bench_vfy_g16 {
+        let client       = ProverClient::from_env();
+        let spend_pk     = client.setup(CLOAKKCHAIN_SPEND_ELF).expect("setup spend elf");
+        let coinproof_pk = client.setup(CLOAKKCHAIN_COINPROOF_ELF).expect("setup coinproof elf");
+        let spend_vkey   = spend_pk.verifying_key().hash_u32();
+        let coinproof_vkey = coinproof_pk.verifying_key().hash_u32();
+
+        let genesis_b = Party { name: "Genesis", sk: GENESIS_SK, pk: genesis_pk() };
+        let alice_b   = Party::new("Alice", 1);
+        let genesis_coin_b = coin(0xA1, 100, genesis_b.pk);
+        let alice_coin_b   = coin(0xA2, 100, alice_b.pk);
+        let cn_genesis_b   = genesis_coin_b.commitment();
+        let entries_b: Vec<BoardEntry> = vec![];
+
+        println!("--- Step 1: generating genesis spend proof (Groth16) ---");
+        let (tx0_b, _, _) = make_tx(0, GENESIS_SK,
+            &[genesis_coin_b.clone()], &[(alice_coin_b.clone(), alice_b.pk)]);
+        let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis_b, cn_genesis_b,
+            &entries_b, &tx0_b, &[genesis_coin_b.clone()], &[alice_coin_b.clone()], true, None);
+        let t = Instant::now();
+        let spend_proof = prove_subprocess("spend", &stdin);
+        println!("  generated in {:.1}s ({} bytes)", t.elapsed().as_secs_f64(), spend_proof.bytes().len());
+
+        println!("--- Step 2: executing VFY_G16_ELF to measure cycles ---");
+        let proof_bytes    = spend_proof.bytes();
+        let pv_encode      = spend_proof.public_values.as_slice().to_vec();
+        let spend_vkey_hash = spend_pk.verifying_key().bytes32();
+        let vfy_stdin = build_vfy_g16_stdin(&proof_bytes, &pv_encode, &spend_vkey_hash);
+        let t = Instant::now();
+        let (_, report) = client.execute(VFY_G16_ELF, vfy_stdin).run()
+            .expect("VFY_G16_ELF execute failed");
+        let exec_ms = t.elapsed().as_millis();
+        println!("\n  VFY_G16 cycles : {}", fmt_cycles(report.total_instruction_count()));
+        println!("  execute time   : {} ms", exec_ms);
+        println!("{}", report);
+        return;
     }
 
     let alice   = Party::new("Alice",   1);
