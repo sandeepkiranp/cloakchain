@@ -4,5 +4,5 @@ name = "cloakkchain-program-vfy-g16"
 edition = "2021"
 
 [dependencies]
-sp1-zkvm = { version = "6.0.1", features = ["lib", "verify"] }
-sp1-verifier = { version = "6.2.3", default-features = false }
+sp1-zkvm                     = { version = "6.0.1", features = ["lib", "verify"] }
+cloakkchain-groth16-verifier = { path = "../groth16-verifier" }
