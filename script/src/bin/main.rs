@@ -363,15 +363,20 @@ fn prove_subprocess(elf_id: &str, stdin: &SP1Stdin) -> SP1ProofWithPublicValues 
 
     println!("  [subprocess] proving {} in child process …", elf_id);
     let exe = std::env::current_exe().expect("current_exe");
-    let status = std::process::Command::new(&exe)
-        .args([
-            "--internal-prove-elf",    elf_id,
-            "--internal-prove-stdin",  stdin_path.to_str().unwrap(),
-            "--internal-prove-output", proof_path.to_str().unwrap(),
-        ])
-        .envs(std::env::vars())
-        .status()
-        .expect("spawn proving subprocess");
+    // For vfy-g16 (636K cycles with BN254 precompiles), the default 16M shard size
+    // puts everything in 1 shard, which triggers a BaseAlu padding DivF bug in
+    // SP1 6.2.3's recursion circuit when used as an inner proof.  Force a smaller
+    // shard size so vfy-g16 spans multiple shards (≥2) and avoids the bug.
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args([
+        "--internal-prove-elf",    elf_id,
+        "--internal-prove-stdin",  stdin_path.to_str().unwrap(),
+        "--internal-prove-output", proof_path.to_str().unwrap(),
+    ]).envs(std::env::vars());
+    if elf_id == "vfy-g16" {
+        cmd.env("SHARD_SIZE", "262144"); // 1 << 18; forces 3 shards from 636K cycles
+    }
+    let status = cmd.status().expect("spawn proving subprocess");
     assert!(status.success(), "proving subprocess for {elf_id} exited with {status}");
 
     let proof_bytes = std::fs::read(&proof_path).expect("read proof file");
