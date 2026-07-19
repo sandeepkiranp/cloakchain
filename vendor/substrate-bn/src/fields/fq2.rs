@@ -138,7 +138,7 @@ impl Fq2 {
 
     #[inline]
     pub(crate) fn add_inp(&mut self, other: &Fq2) {
-        #[cfg(target_os = "zkvm")]
+        #[cfg(all(target_os = "zkvm", feature = "bn254-precompiles"))]
         {
             let lhs = cast_mut::<Fq2, [u32; 16]>(self);
             let rhs = cast_ref::<Fq2, [u32; 16]>(&other);
@@ -146,7 +146,7 @@ impl Fq2 {
                 sp1_lib::syscall_bn254_fp2_addmod(lhs.as_mut_ptr() as *mut u64, rhs.as_ptr() as *const u64);
             }
         }
-        #[cfg(not(target_os = "zkvm"))]
+        #[cfg(not(all(target_os = "zkvm", feature = "bn254-precompiles")))]
         {
             *self = self.cpu_add(*other);
         }
@@ -154,7 +154,7 @@ impl Fq2 {
 
     #[inline]
     pub(crate) fn sub_inp(&mut self, other: &Fq2) {
-        #[cfg(target_os = "zkvm")]
+        #[cfg(all(target_os = "zkvm", feature = "bn254-precompiles"))]
         {
             let lhs = cast_mut::<Fq2, [u32; 16]>(self);
             let rhs = cast_ref::<Fq2, [u32; 16]>(&other);
@@ -162,7 +162,7 @@ impl Fq2 {
                 sp1_lib::syscall_bn254_fp2_submod(lhs.as_mut_ptr() as *mut u64, rhs.as_ptr() as *const u64);
             }
         }
-        #[cfg(not(target_os = "zkvm"))]
+        #[cfg(not(all(target_os = "zkvm", feature = "bn254-precompiles")))]
         {
             *self = self.cpu_sub(*other);
         }
@@ -170,7 +170,7 @@ impl Fq2 {
 
     #[inline]
     pub(crate) fn mul_inp(&mut self, other: &Fq2) {
-        #[cfg(target_os = "zkvm")]
+        #[cfg(all(target_os = "zkvm", feature = "bn254-precompiles"))]
         {
             let lhs = cast_mut::<Fq2, [u32; 16]>(self);
             let rhs = cast_ref::<Fq2, [u32; 16]>(&other);
@@ -178,7 +178,7 @@ impl Fq2 {
                 sp1_lib::syscall_bn254_fp2_mulmod(lhs.as_mut_ptr() as *mut u64, rhs.as_ptr() as *const u64);
             }
         }
-        #[cfg(not(target_os = "zkvm"))]
+        #[cfg(not(all(target_os = "zkvm", feature = "bn254-precompiles")))]
         {
             *self = self.cpu_mul(*other);
         }
@@ -186,14 +186,14 @@ impl Fq2 {
 
     #[inline]
     pub fn square_inp(&mut self) {
-        #[cfg(target_os = "zkvm")]
+        #[cfg(all(target_os = "zkvm", feature = "bn254-precompiles"))]
         {
             let lhs = cast_mut::<Fq2, [u32; 16]>(self);
             unsafe {
                 sp1_lib::syscall_bn254_fp2_mulmod(lhs.as_mut_ptr() as *mut u64, lhs.as_ptr() as *const u64);
             }
         }
-        #[cfg(not(target_os = "zkvm"))]
+        #[cfg(not(all(target_os = "zkvm", feature = "bn254-precompiles")))]
         {
             *self = self.cpu_mul(*self);
         }
@@ -201,14 +201,14 @@ impl Fq2 {
 
     #[inline]
     pub fn double_inp(&mut self) {
-        #[cfg(target_os = "zkvm")]
+        #[cfg(all(target_os = "zkvm", feature = "bn254-precompiles"))]
         {
             let lhs = cast_mut::<Fq2, [u32; 16]>(self);
             unsafe {
                 sp1_lib::syscall_bn254_fp2_addmod(lhs.as_mut_ptr() as *mut u64, lhs.as_ptr() as *const u64);
             }
         }
-        #[cfg(not(target_os = "zkvm"))]
+        #[cfg(not(all(target_os = "zkvm", feature = "bn254-precompiles")))]
         {
             *self = self.cpu_add(*self);
         }

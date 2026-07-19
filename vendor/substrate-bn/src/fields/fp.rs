@@ -516,7 +516,7 @@ impl Fq {
     #[inline]
     #[allow(dead_code)]
     pub(crate) fn add_inp(&mut self, other: &Fq) {
-        #[cfg(target_os = "zkvm")]
+        #[cfg(all(target_os = "zkvm", feature = "bn254-precompiles"))]
         {
             let mut lhs = cast_mut::<Fq, [u32; 8]>(self);
             let rhs = cast_ref::<Fq, [u32; 8]>(&other);
@@ -524,7 +524,7 @@ impl Fq {
                 sp1_lib::syscall_bn254_fp_addmod(lhs.as_mut_ptr() as *mut u64, rhs.as_ptr() as *const u64);
             }
         }
-        #[cfg(not(target_os = "zkvm"))]
+        #[cfg(not(all(target_os = "zkvm", feature = "bn254-precompiles")))]
         {
             *self = self.cpu_add(*other);
         }
@@ -533,7 +533,7 @@ impl Fq {
     #[inline]
     #[allow(dead_code)]
     pub(crate) fn sub_inp(&mut self, other: &Fq) {
-        #[cfg(target_os = "zkvm")]
+        #[cfg(all(target_os = "zkvm", feature = "bn254-precompiles"))]
         {
             let mut lhs = cast_mut::<Fq, [u32; 8]>(self);
             let rhs = cast_ref::<Fq, [u32; 8]>(&other);
@@ -541,7 +541,7 @@ impl Fq {
                 sp1_lib::syscall_bn254_fp_submod(lhs.as_mut_ptr() as *mut u64, rhs.as_ptr() as *const u64);
             }
         }
-        #[cfg(not(target_os = "zkvm"))]
+        #[cfg(not(all(target_os = "zkvm", feature = "bn254-precompiles")))]
         {
             *self = self.cpu_sub(*other);
         }
@@ -550,7 +550,7 @@ impl Fq {
     #[inline]
     #[allow(dead_code)]
     pub(crate) fn mul_inp(&mut self, other: &Fq) {
-        #[cfg(target_os = "zkvm")]
+        #[cfg(all(target_os = "zkvm", feature = "bn254-precompiles"))]
         {
             let lhs = cast_mut::<Fq, [u32; 8]>(self);
             let rhs = cast_ref::<Fq, [u32; 8]>(&other);
@@ -558,7 +558,7 @@ impl Fq {
                 sp1_lib::syscall_bn254_fp_mulmod(lhs.as_mut_ptr() as *mut u64, rhs.as_ptr() as *const u64);
             }
         }
-        #[cfg(not(target_os = "zkvm"))]
+        #[cfg(not(all(target_os = "zkvm", feature = "bn254-precompiles")))]
         {
             *self = self.cpu_mul(*other);
         }
