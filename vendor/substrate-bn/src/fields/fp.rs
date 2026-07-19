@@ -277,11 +277,11 @@ impl MulAssign for Fr {
             let modulus = cast::<[u128; 2], [u32; 8]>(Fr::modulus().0);
             unsafe {
                 sp1_lib::sys_bigint(
-                    &mut result as *mut [u32; 8],
+                    &mut result as *mut [u32; 8] as *mut [u64; 4],
                     0,
-                    &lhs as *const [u32; 8],
-                    &rhs as *const [u32; 8],
-                    &modulus as *const [u32; 8],
+                    &lhs as *const [u32; 8] as *const [u64; 4],
+                    &rhs as *const [u32; 8] as *const [u64; 4],
+                    &modulus as *const [u32; 8] as *const [u64; 4],
                 );
                 self.0 = U256::from(cast::<[u32; 8], [u64; 4]>(result));
             }
@@ -521,7 +521,7 @@ impl Fq {
             let mut lhs = cast_mut::<Fq, [u32; 8]>(self);
             let rhs = cast_ref::<Fq, [u32; 8]>(&other);
             unsafe {
-                sp1_lib::syscall_bn254_fp_addmod(lhs.as_mut_ptr(), rhs.as_ptr());
+                sp1_lib::syscall_bn254_fp_addmod(lhs.as_mut_ptr() as *mut u64, rhs.as_ptr() as *const u64);
             }
         }
         #[cfg(not(target_os = "zkvm"))]
@@ -538,7 +538,7 @@ impl Fq {
             let mut lhs = cast_mut::<Fq, [u32; 8]>(self);
             let rhs = cast_ref::<Fq, [u32; 8]>(&other);
             unsafe {
-                sp1_lib::syscall_bn254_fp_submod(lhs.as_mut_ptr(), rhs.as_ptr());
+                sp1_lib::syscall_bn254_fp_submod(lhs.as_mut_ptr() as *mut u64, rhs.as_ptr() as *const u64);
             }
         }
         #[cfg(not(target_os = "zkvm"))]
@@ -555,7 +555,7 @@ impl Fq {
             let lhs = cast_mut::<Fq, [u32; 8]>(self);
             let rhs = cast_ref::<Fq, [u32; 8]>(&other);
             unsafe {
-                sp1_lib::syscall_bn254_fp_mulmod(lhs.as_mut_ptr(), rhs.as_ptr());
+                sp1_lib::syscall_bn254_fp_mulmod(lhs.as_mut_ptr() as *mut u64, rhs.as_ptr() as *const u64);
             }
         }
         #[cfg(not(target_os = "zkvm"))]

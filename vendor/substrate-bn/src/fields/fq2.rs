@@ -143,7 +143,7 @@ impl Fq2 {
             let lhs = cast_mut::<Fq2, [u32; 16]>(self);
             let rhs = cast_ref::<Fq2, [u32; 16]>(&other);
             unsafe {
-                sp1_lib::syscall_bn254_fp2_addmod(lhs.as_mut_ptr(), rhs.as_ptr());
+                sp1_lib::syscall_bn254_fp2_addmod(lhs.as_mut_ptr() as *mut u64, rhs.as_ptr() as *const u64);
             }
         }
         #[cfg(not(target_os = "zkvm"))]
@@ -159,7 +159,7 @@ impl Fq2 {
             let lhs = cast_mut::<Fq2, [u32; 16]>(self);
             let rhs = cast_ref::<Fq2, [u32; 16]>(&other);
             unsafe {
-                sp1_lib::syscall_bn254_fp2_submod(lhs.as_mut_ptr(), rhs.as_ptr());
+                sp1_lib::syscall_bn254_fp2_submod(lhs.as_mut_ptr() as *mut u64, rhs.as_ptr() as *const u64);
             }
         }
         #[cfg(not(target_os = "zkvm"))]
@@ -175,7 +175,7 @@ impl Fq2 {
             let lhs = cast_mut::<Fq2, [u32; 16]>(self);
             let rhs = cast_ref::<Fq2, [u32; 16]>(&other);
             unsafe {
-                sp1_lib::syscall_bn254_fp2_mulmod(lhs.as_mut_ptr(), rhs.as_ptr());
+                sp1_lib::syscall_bn254_fp2_mulmod(lhs.as_mut_ptr() as *mut u64, rhs.as_ptr() as *const u64);
             }
         }
         #[cfg(not(target_os = "zkvm"))]
@@ -190,7 +190,7 @@ impl Fq2 {
         {
             let lhs = cast_mut::<Fq2, [u32; 16]>(self);
             unsafe {
-                sp1_lib::syscall_bn254_fp2_mulmod(lhs.as_mut_ptr(), lhs.as_ptr());
+                sp1_lib::syscall_bn254_fp2_mulmod(lhs.as_mut_ptr() as *mut u64, lhs.as_ptr() as *const u64);
             }
         }
         #[cfg(not(target_os = "zkvm"))]
@@ -205,7 +205,7 @@ impl Fq2 {
         {
             let lhs = cast_mut::<Fq2, [u32; 16]>(self);
             unsafe {
-                sp1_lib::syscall_bn254_fp2_addmod(lhs.as_mut_ptr(), lhs.as_ptr());
+                sp1_lib::syscall_bn254_fp2_addmod(lhs.as_mut_ptr() as *mut u64, lhs.as_ptr() as *const u64);
             }
         }
         #[cfg(not(target_os = "zkvm"))]
