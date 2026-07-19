@@ -1,0 +1,34 @@
+[package]
+name = "substrate-bn"
+version = "0.6.0"
+authors = [
+    "Sean Bowe <ewillbefull@gmail.com>",
+    "Parity Technologies <admin@parity.io>",
+    "Nathan <n@push0.dev>"
+]
+description = "Pairing cryptography with the Barreto-Naehrig curve"
+keywords = ["pairing", "crypto", "cryptography"]
+readme = "README.md"
+homepage = "https://github.com/paritytech/bn"
+repository = "https://github.com/paritytech/bn"
+license = "MIT OR Apache-2.0"
+edition = "2018"
+
+[features]
+default = []
+
+[dependencies]
+rand = { version = "0.8.5", default-features = false }
+byteorder = { version = "1.0", features = ["i128"], default-features = false }
+crunchy = "0.2.1"
+lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
+rustc-hex = { version = "2", default-features = false }
+cfg-if = "1.0.0"
+bytemuck = { version = "1.16.1", features = ["derive"] }
+num-bigint = { version = "0.4.6", default-features = false }
+
+[target.'cfg(target_os = "zkvm")'.dependencies]
+sp1-lib = { version = "6.0.1" }
+
+[dev-dependencies]
+rand = { version = "0.8.3", features = ["std_rng"] }
