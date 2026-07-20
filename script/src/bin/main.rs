@@ -373,16 +373,18 @@ fn prove_subprocess(elf_id: &str, stdin: &SP1Stdin) -> SP1ProofWithPublicValues 
         "--internal-prove-stdin",  stdin_path.to_str().unwrap(),
         "--internal-prove-output", proof_path.to_str().unwrap(),
     ]).envs(std::env::vars());
-    // Both vfy-g16 (636K cycles, BN254 precompiles) and coinproof (reads a large
-    // compressed inner proof from stdin) end up as single-shard programs under
-    // the default 16M shard size.  A single-shard compressed STARK triggers a
-    // BaseAlu padding DivF bug in SP1 6.2.3.  Force smaller shard sizes so each
-    // program spans ≥2 shards and the recursion tree is non-degenerate.
+    // SP1 6.2.3 recursion compress fix: the circuit divides by the combined BN254
+    // chip evaluation (address 316465 in the recursion program) loaded from the
+    // proof at step 1.  VFY-G16 fires BN254 precompiles (substrate-bn) → eval≠0.
+    // coinproof now fires 8 dummy BN254 ecalls → eval≠0 for all BN254 chip types.
+    // SHARD_SIZE=262144 kept so both programs span multiple shards; RECURSION_DIAG
+    // activates the write-tracker in vendor/sp1-recursion-executor to post-mortem
+    // any remaining DivF failure.
     match elf_id {
-        "vfy-g16"   => { cmd.env("SHARD_SIZE", "262144"); } // 1<<18; 636K/262144 ≈ 3 shards
+        "vfy-g16"   => { cmd.env("SHARD_SIZE", "262144"); } // 1<<18; 636K cycles ≈ 3 shards
         "coinproof" => {
-            cmd.env("SHARD_SIZE", "262144")  // 1<<18; coinproof ≈ 3.6M cycles → 14 shards
-               .env("RECURSION_DIAG", "1"); // dump write history on DivF failure
+            cmd.env("SHARD_SIZE", "262144")  // 1<<18; ~3M cycles ≈ 12 shards
+               .env("RECURSION_DIAG", "1"); // remove once fix confirmed working
         }
         _ => {}
     }

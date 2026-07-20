@@ -7,23 +7,46 @@ use cloakkchain_lib::{
 };
 
 pub fn main() {
-    // SP1 6.2.3 single-shard DivF workaround: the recursion circuit emits an
-    // unsatisfiable DivF(in2=0, in1≠0) for single-shard programs; multi-shard
-    // programs use a different recursion path that avoids the bug.
+    // SP1 6.2.3 recursion workaround: the compress circuit reads a combined BN254
+    // chip evaluation from the proof at initialisation; when coinproof makes zero
+    // BN254 precompile calls that evaluation is 0, and the circuit later computes
+    // DivF(1, 0) → panic.  VFY-G16 uses BN254 arithmetic (via substrate-bn) so
+    // its evaluation is always non-zero.  One dummy call per BN254 chip type
+    // ensures every chip has ≥1 event → evaluation ≠ 0 → DivF succeeds.
     //
-    // Pure RISC-V arithmetic loop: ~6 instructions/iter (mul + add + black_box
-    // sw/lw + counter + branch).  100K iters ≈ 600K cycles → 3 shards at
-    // SHARD_SIZE=262144, guaranteed without relying on precompile call costs.
-    {
-        let mut acc = 0u32;
-        for i in 0u32..100_000 {
-            acc = core::hint::black_box(acc).wrapping_mul(1_664_525).wrapping_add(i);
-        }
-        // Diagnostic: emits to host stdout during SP1 execution (fd=1 → "stdout: …").
-        // Confirms (a) this ELF build contains the loop and (b) the loop ran.
-        println!("[COINPROOF-DIAG] cycle-pad acc={acc:#010x}");
-        let _ = core::hint::black_box(acc);
+    // Chips activated: BN254_FP_{ADD,SUB,MUL}, BN254_FP2_{ADD,SUB,MUL},
+    //                  BN254_{ADD,DOUBLE}  (8 ecalls total, ~negligible cycles).
+    unsafe {
+        // --- BN254 Fp field arithmetic (256-bit limbs, 4 × u64 LE) ---
+        let mut fp_a = core::hint::black_box([1u64, 0, 0, 0]); // Fp element 1
+        let fp_b     = core::hint::black_box([2u64, 0, 0, 0]); // Fp element 2
+        sp1_zkvm::syscalls::syscall_bn254_fp_addmod(fp_a.as_mut_ptr(), fp_b.as_ptr()); // 1+2=3
+        sp1_zkvm::syscalls::syscall_bn254_fp_submod(fp_a.as_mut_ptr(), fp_b.as_ptr()); // 3-2=1
+        sp1_zkvm::syscalls::syscall_bn254_fp_mulmod(fp_a.as_mut_ptr(), fp_b.as_ptr()); // 1*2=2
+        let _ = core::hint::black_box(fp_a);
+
+        // --- BN254 Fp2 field arithmetic (512-bit limbs, 8 × u64 LE) ---
+        let mut fp2_a = core::hint::black_box([1u64, 0, 0, 0, 0, 0, 0, 0]); // (1, 0)
+        let fp2_b     = core::hint::black_box([2u64, 0, 0, 0, 0, 0, 0, 0]); // (2, 0)
+        sp1_zkvm::syscalls::syscall_bn254_fp2_addmod(fp2_a.as_mut_ptr(), fp2_b.as_ptr()); // (3,0)
+        sp1_zkvm::syscalls::syscall_bn254_fp2_submod(fp2_a.as_mut_ptr(), fp2_b.as_ptr()); // (1,0)
+        sp1_zkvm::syscalls::syscall_bn254_fp2_mulmod(fp2_a.as_mut_ptr(), fp2_b.as_ptr()); // (2,0)
+        let _ = core::hint::black_box(fp2_a);
+
+        // --- BN254 group operations (affine point = Gx ++ Gy, 8 × u64 LE) ---
+        // BN254 generator G satisfies y² = x³ + 3: (1)³ + 3 = 4 = (2)². ✓
+        let mut g  = core::hint::black_box([1u64, 0, 0, 0, 2, 0, 0, 0]); // G
+        let orig_g = core::hint::black_box([1u64, 0, 0, 0, 2, 0, 0, 0]); // G (copy for add)
+        sp1_zkvm::syscalls::syscall_bn254_double(
+            core::hint::black_box(&mut g) as *mut [u64; 8]                // g = 2G
+        );
+        sp1_zkvm::syscalls::syscall_bn254_add(
+            core::hint::black_box(&mut g) as *mut [u64; 8],               // g = 3G
+            &orig_g as *const [u64; 8],
+        );
+        let _ = core::hint::black_box(g);
     }
+    println!("[COINPROOF-DIAG] BN254 chip activation OK");
 
     let vkey: [u32; 8]             = sp1_zkvm::io::read();
     let vfy_g16_vkey: [u32; 8]     = sp1_zkvm::io::read();
