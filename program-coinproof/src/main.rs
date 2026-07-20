@@ -7,46 +7,34 @@ use cloakkchain_lib::{
 };
 
 pub fn main() {
-    // SP1 6.2.3 recursion workaround: the compress circuit reads a combined BN254
-    // chip evaluation from the proof at initialisation; when coinproof makes zero
-    // BN254 precompile calls that evaluation is 0, and the circuit later computes
-    // DivF(1, 0) → panic.  VFY-G16 uses BN254 arithmetic (via substrate-bn) so
-    // its evaluation is always non-zero.  One dummy call per BN254 chip type
-    // ensures every chip has ≥1 event → evaluation ≠ 0 → DivF succeeds.
+    // SP1 6.2.3 recursion workaround: the compress circuit evaluates every chip's
+    // log-up polynomial at a random challenge point.  For a chip with zero events
+    // the polynomial is identically 0, so that evaluation = 0.  For one specific
+    // chip (Uint256MulModUser, activated by the UINT256_MUL / sys_bigint ecall)
+    // the circuit computes SubF(1, eval) / eval; when eval = 0 this gives DivF(1, 0)
+    // → panic at step ~174554.
     //
-    // Chips activated: BN254_FP_{ADD,SUB,MUL}, BN254_FP2_{ADD,SUB,MUL},
-    //                  BN254_{ADD,DOUBLE}  (8 ecalls total, ~negligible cycles).
+    // VFY-G16 avoids the crash because substrate-bn calls sys_bigint hundreds of
+    // times during Groth16 verification (U256 modular multiply in arith.rs:333),
+    // making the Uint256MulModUser evaluation non-zero.
+    //
+    // Fix: one dummy sys_bigint call gives coinproof ≥1 UINT256_MUL event so the
+    // chip evaluation polynomial is non-zero → DivF succeeds.
     unsafe {
-        // --- BN254 Fp field arithmetic (256-bit limbs, 4 × u64 LE) ---
-        let mut fp_a = core::hint::black_box([1u64, 0, 0, 0]); // Fp element 1
-        let fp_b     = core::hint::black_box([2u64, 0, 0, 0]); // Fp element 2
-        sp1_zkvm::syscalls::syscall_bn254_fp_addmod(fp_a.as_mut_ptr(), fp_b.as_ptr()); // 1+2=3
-        sp1_zkvm::syscalls::syscall_bn254_fp_submod(fp_a.as_mut_ptr(), fp_b.as_ptr()); // 3-2=1
-        sp1_zkvm::syscalls::syscall_bn254_fp_mulmod(fp_a.as_mut_ptr(), fp_b.as_ptr()); // 1*2=2
-        let _ = core::hint::black_box(fp_a);
-
-        // --- BN254 Fp2 field arithmetic (512-bit limbs, 8 × u64 LE) ---
-        let mut fp2_a = core::hint::black_box([1u64, 0, 0, 0, 0, 0, 0, 0]); // (1, 0)
-        let fp2_b     = core::hint::black_box([2u64, 0, 0, 0, 0, 0, 0, 0]); // (2, 0)
-        sp1_zkvm::syscalls::syscall_bn254_fp2_addmod(fp2_a.as_mut_ptr(), fp2_b.as_ptr()); // (3,0)
-        sp1_zkvm::syscalls::syscall_bn254_fp2_submod(fp2_a.as_mut_ptr(), fp2_b.as_ptr()); // (1,0)
-        sp1_zkvm::syscalls::syscall_bn254_fp2_mulmod(fp2_a.as_mut_ptr(), fp2_b.as_ptr()); // (2,0)
-        let _ = core::hint::black_box(fp2_a);
-
-        // --- BN254 group operations (affine point = Gx ++ Gy, 8 × u64 LE) ---
-        // BN254 generator G satisfies y² = x³ + 3: (1)³ + 3 = 4 = (2)². ✓
-        let mut g  = core::hint::black_box([1u64, 0, 0, 0, 2, 0, 0, 0]); // G
-        let orig_g = core::hint::black_box([1u64, 0, 0, 0, 2, 0, 0, 0]); // G (copy for add)
-        sp1_zkvm::syscalls::syscall_bn254_double(
-            core::hint::black_box(&mut g) as *mut [u64; 8]                // g = 2G
+        // 2 × 3 mod 7 = 6  — any valid modular multiplication activates the chip.
+        let x          = core::hint::black_box([2u64, 0, 0, 0]);
+        let y          = core::hint::black_box([3u64, 0, 0, 0]);
+        let modulus    = core::hint::black_box([7u64, 0, 0, 0]);
+        let mut result = core::mem::MaybeUninit::<[u64; 4]>::uninit();
+        sp1_zkvm::syscalls::sys_bigint(
+            result.as_mut_ptr() as *mut [u64; 4],
+            0,
+            &x       as *const [u64; 4],
+            &y       as *const [u64; 4],
+            &modulus as *const [u64; 4],
         );
-        sp1_zkvm::syscalls::syscall_bn254_add(
-            core::hint::black_box(&mut g) as *mut [u64; 8],               // g = 3G
-            &orig_g as *const [u64; 8],
-        );
-        let _ = core::hint::black_box(g);
+        let _ = core::hint::black_box(result.assume_init());
     }
-    println!("[COINPROOF-DIAG] BN254 chip activation OK");
 
     let vkey: [u32; 8]             = sp1_zkvm::io::read();
     let vfy_g16_vkey: [u32; 8]     = sp1_zkvm::io::read();

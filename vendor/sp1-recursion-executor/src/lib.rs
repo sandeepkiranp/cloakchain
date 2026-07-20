@@ -81,8 +81,14 @@ impl<F: PrimeField64> Address<F> {
 
 // ─── Write-tracker diagnostic ─────────────────────────────────────────────────
 // Set RECURSION_DIAG=1 to activate.  On a DivF out-of-domain panic, dumps the
-// write history for the watched addresses and the last 100 instructions so we
-// can identify which computation produced the zero denominator.
+// write history for the watched addresses and the last 100 instructions.
+//
+// Root cause of the crash (SP1 6.2.3, coinproof without sys_bigint):
+//   address 316465 holds the Uint256MulModUser chip's log-up evaluation loaded
+//   from the core proof at step 1.  When coinproof makes zero UINT256_MUL
+//   (sys_bigint) calls the evaluation polynomial is identically 0.  The compress
+//   circuit computes SubF(1, eval)/eval; with eval=0 this gives DivF(1, 0)→panic
+//   at step ~174554.  Fix: one dummy sys_bigint call in program-coinproof/main.rs.
 
 struct ExecDiag {
     active: bool,
