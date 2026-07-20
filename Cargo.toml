@@ -5,3 +5,8 @@ resolver = "2"
 [workspace.dependencies]
 alloy-sol-types = "*"
 
+# SP1 6.2.3 BaseAlu padding bug: DivF with mult=0 (disabled row) panics when
+# in2=0.  Patched locally to return 0 instead of erroring for padding rows.
+[patch.crates-io]
+sp1-recursion-executor = { path = "vendor/sp1-recursion-executor" }
+
