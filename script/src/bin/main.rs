@@ -380,7 +380,10 @@ fn prove_subprocess(elf_id: &str, stdin: &SP1Stdin) -> SP1ProofWithPublicValues 
     // program spans ≥2 shards and the recursion tree is non-degenerate.
     match elf_id {
         "vfy-g16"   => { cmd.env("SHARD_SIZE", "262144"); } // 1<<18; 636K/262144 ≈ 3 shards
-        "coinproof" => { cmd.env("SHARD_SIZE", "262144"); } // 1<<18; 3000×SHA256 padding ≈ 450K cycles → 2 shards
+        "coinproof" => {
+            cmd.env("SHARD_SIZE", "262144")  // 1<<18; coinproof ≈ 3.6M cycles → 14 shards
+               .env("RECURSION_DIAG", "1"); // dump write history on DivF failure
+        }
         _ => {}
     }
     let status = cmd.status().expect("spawn proving subprocess");
@@ -426,6 +429,8 @@ fn run_internal_prove(elf_id: &str, stdin_path: &std::path::Path, output_path: &
                          shards@262144={}",
                         cycles.div_ceil(262144)
                     );
+                    // Full opcode + syscall breakdown — shows which precompile chips fired.
+                    eprintln!("[COINPROOF-DIAG] full execution report:\n{report}");
                 }
                 Err(e) => eprintln!("[COINPROOF-DIAG] execute FAILED: {e}"),
             }

@@ -4456,8 +4456,6 @@ dependencies = [
 [[package]]
 name = "sp1-recursion-executor"
 version = "6.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "983d18b6e0e641c8173b250c234fe355c3a9ba5b7485d3af5a54ddb7ab51e814"
 dependencies = [
  "backtrace",
  "cfg-if",

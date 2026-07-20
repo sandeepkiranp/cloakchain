@@ -42,8 +42,8 @@ use sp1_hypercube::{
 use std::{
     array,
     borrow::Borrow,
-    cell::UnsafeCell,
-    collections::VecDeque,
+    cell::{RefCell, UnsafeCell},
+    collections::{HashMap as DiagHashMap, VecDeque},
     fmt::Debug,
     io::{stdout, Write},
     iter::zip,
@@ -77,6 +77,78 @@ impl<F: PrimeField64> Address<F> {
     pub fn as_usize(&self) -> usize {
         self.0.as_canonical_u64() as usize
     }
+}
+
+// ─── Write-tracker diagnostic ─────────────────────────────────────────────────
+// Set RECURSION_DIAG=1 to activate.  On a DivF out-of-domain panic, dumps the
+// write history for the watched addresses and the last 100 instructions so we
+// can identify which computation produced the zero denominator.
+
+struct ExecDiag {
+    active: bool,
+    step: usize,
+    last_write: DiagHashMap<usize, (usize, String)>,
+    trace: VecDeque<String>,
+}
+
+// Addresses to watch: the failing in2 (316465) ± 5 neighbourhood, plus in1/out.
+const DIAG_WATCHED: &[usize] = &[
+    316460, 316461, 316462, 316463, 316464, 316465, 316466, 316467, 316468, 316469, 316470,
+    2013019, 2013020,
+];
+const DIAG_TRACE_LEN: usize = 100;
+
+impl ExecDiag {
+    fn new() -> Self {
+        let active =
+            std::env::var("RECURSION_DIAG").map(|v| v == "1").unwrap_or(false);
+        Self {
+            active,
+            step: 0,
+            last_write: DiagHashMap::new(),
+            trace: VecDeque::with_capacity(DIAG_TRACE_LEN + 1),
+        }
+    }
+
+    fn record(&mut self, dest_addr: usize, summary: String) {
+        if !self.active {
+            return;
+        }
+        self.step += 1;
+        if self.trace.len() >= DIAG_TRACE_LEN {
+            self.trace.pop_front();
+        }
+        self.trace.push_back(format!("[{:>10}] {}", self.step, &summary));
+        if DIAG_WATCHED.contains(&dest_addr) {
+            self.last_write.insert(dest_addr, (self.step, summary));
+        }
+    }
+
+    fn dump(&self, label: &str) {
+        if !self.active {
+            return;
+        }
+        eprintln!("\n[RECURSION-DIAG] ════════════════════════════════════════════════════");
+        eprintln!("[RECURSION-DIAG] post-mortem: {label}  (at step {})", self.step);
+        for &addr in DIAG_WATCHED {
+            match self.last_write.get(&addr) {
+                Some((s, d)) => {
+                    eprintln!("[RECURSION-DIAG]   addr={addr:>8}  last_write_step={s:>10}  {d}")
+                }
+                None => eprintln!("[RECURSION-DIAG]   addr={addr:>8}  NEVER WRITTEN"),
+            }
+        }
+        let show = self.trace.len().min(50);
+        eprintln!("[RECURSION-DIAG] last {show} instructions (most-recent first):");
+        for line in self.trace.iter().rev().take(show) {
+            eprintln!("[RECURSION-DIAG]   {line}");
+        }
+        eprintln!("[RECURSION-DIAG] ════════════════════════════════════════════════════\n");
+    }
+}
+
+thread_local! {
+    static EXEC_DIAG: RefCell<ExecDiag> = RefCell::new(ExecDiag::new());
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -418,6 +490,8 @@ where
             Instruction::BaseAlu(ref instr @ BaseAluInstr { opcode, mult: _, addrs }) => {
                 let in1 = memory.mr_unchecked(addrs.in1).val[0];
                 let in2 = memory.mr_unchecked(addrs.in2).val[0];
+                let in1_u = in1.as_canonical_u32();
+                let in2_u = in2.as_canonical_u32();
                 // Do the computation.
                 let out = match opcode {
                     BaseAluOpcode::AddF => in1 + in2,
@@ -431,6 +505,13 @@ where
                             if in1.is_zero() {
                                 AbstractField::one()
                             } else {
+                                // ── Diagnostic dump ──
+                                EXEC_DIAG.with(|d| d.borrow().dump(&format!(
+                                    "DivF in1={in1_u:#010x}@{} in2={in2_u:#010x}@{} out@{}",
+                                    addrs.in1.as_usize(),
+                                    addrs.in2.as_usize(),
+                                    addrs.out.as_usize(),
+                                )));
                                 return Err(RuntimeError::DivFOutOfDomain {
                                     in1,
                                     in2,
@@ -441,6 +522,17 @@ where
                         }
                     },
                 };
+                let out_u = out.as_canonical_u32();
+                let out_addr = addrs.out.as_usize();
+                EXEC_DIAG.with(|d| d.borrow_mut().record(
+                    out_addr,
+                    format!(
+                        "BaseAlu::{opcode:?} out@{out_addr}={out_u:#010x} \
+                         in1@{}={in1_u:#010x} in2@{}={in2_u:#010x}",
+                        addrs.in1.as_usize(),
+                        addrs.in2.as_usize(),
+                    ),
+                ));
                 memory.mw_unchecked(addrs.out, Block::from(out));
                 // Write the event to the record.
                 UnsafeCell::raw_get(record.base_alu_events[offset].as_ptr()).write(BaseAluEvent {
@@ -500,7 +592,15 @@ where
                         "stored memory value should be the specified value"
                     );
                 }
-                MemAccessKind::Write => memory.mw_unchecked(addr, val),
+                MemAccessKind::Write => {
+                    let addr_u = addr.as_usize();
+                    let val_u = val.0[0].as_canonical_u32();
+                    EXEC_DIAG.with(|d| d.borrow_mut().record(
+                        addr_u,
+                        format!("Mem::Write @{addr_u}={val_u:#010x}"),
+                    ));
+                    memory.mw_unchecked(addr, val)
+                }
             },
             Instruction::ExtFelt(ExtFeltInstr { addrs, mults: _, ext2felt }) => {
                 if ext2felt {
@@ -531,6 +631,11 @@ where
                 let perm_output = perm.permute(in_vals);
 
                 perm_output.iter().zip(output).for_each(|(&val, addr)| {
+                    let addr_u = addr.as_usize();
+                    EXEC_DIAG.with(|d| d.borrow_mut().record(
+                        addr_u,
+                        format!("Poseidon2 @{addr_u}={:#010x}", val.as_canonical_u32()),
+                    ));
                     memory.mw_unchecked(*addr, Block::from(val));
                 });
 
@@ -601,6 +706,19 @@ where
                 let in2 = memory.mr_unchecked(in2).val[0];
                 let out1_val = bit * in2 + (F::one() - bit) * in1;
                 let out2_val = bit * in1 + (F::one() - bit) * in2;
+                let out1_addr = out1.as_usize();
+                let out2_addr = out2.as_usize();
+                EXEC_DIAG.with(|d| {
+                    let mut d = d.borrow_mut();
+                    d.record(
+                        out1_addr,
+                        format!("Select out1@{out1_addr}={:#010x}", out1_val.as_canonical_u32()),
+                    );
+                    d.record(
+                        out2_addr,
+                        format!("Select out2@{out2_addr}={:#010x}", out2_val.as_canonical_u32()),
+                    );
+                });
                 memory.mw_unchecked(out1, Block::from(out1_val));
                 memory.mw_unchecked(out2, Block::from(out2_val));
 
