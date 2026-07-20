@@ -80,24 +80,30 @@ impl<F: PrimeField64> Address<F> {
 }
 
 // ─── Write-tracker diagnostic ─────────────────────────────────────────────────
-// Set RECURSION_DIAG=1 to activate.  On a DivF out-of-domain panic, dumps the
-// write history for the watched addresses and the last 100 instructions.
+// Set RECURSION_DIAG=1 to activate.  On a DivF out-of-domain panic, dumps:
+//   1. The first INIT_DUMP_STEPS Mem::Write operations (proof input layout)
+//   2. Last-write info for watched addresses around the crash site
+//   3. Last 50 instructions before the crash
 //
-// Root cause of the crash (SP1 6.2.3, coinproof without sys_bigint):
-//   address 316465 holds the Uint256MulModUser chip's log-up evaluation loaded
-//   from the core proof at step 1.  When coinproof makes zero UINT256_MUL
-//   (sys_bigint) calls the evaluation polynomial is identically 0.  The compress
-//   circuit computes SubF(1, eval)/eval; with eval=0 this gives DivF(1, 0)→panic
-//   at step ~174554.  Fix: one dummy sys_bigint call in program-coinproof/main.rs.
+// Address 316465 is the SHARED DENOMINATOR for all DivF operations. It's written
+// once at step 1 (from proof input) with value 0 for coinproof → crash at 174554.
+// For VFY-G16 the same address has a non-zero value → no crash.
+// Previous hypotheses (BN254 chips, Uint256MulMod) both FAILED — 316465 is still
+// 0 after adding both. Need to identify the actual chip via the init dump below.
+
+// How many initial Mem::Write steps to capture for the proof-input layout dump.
+const INIT_DUMP_STEPS: usize = 300;
 
 struct ExecDiag {
     active: bool,
     step: usize,
     last_write: DiagHashMap<usize, (usize, String)>,
     trace: VecDeque<String>,
+    // All Mem::Write ops in the first INIT_DUMP_STEPS steps: (step, addr, val_u32)
+    init_mem_writes: Vec<(usize, usize, u32)>,
 }
 
-// Addresses to watch: the failing in2 (316465) ± 5 neighbourhood, plus in1/out.
+// Addresses to watch: the failing in2 (316465) ± 5 neighbourhood, plus crash in1/out.
 const DIAG_WATCHED: &[usize] = &[
     316460, 316461, 316462, 316463, 316464, 316465, 316466, 316467, 316468, 316469, 316470,
     2013019, 2013020,
@@ -113,6 +119,7 @@ impl ExecDiag {
             step: 0,
             last_write: DiagHashMap::new(),
             trace: VecDeque::with_capacity(DIAG_TRACE_LEN + 1),
+            init_mem_writes: Vec::new(),
         }
     }
 
@@ -130,12 +137,34 @@ impl ExecDiag {
         }
     }
 
+    // Called for every Mem::Write, before step is incremented.
+    fn record_mem_write(&mut self, addr: usize, val: u32) {
+        if !self.active {
+            return;
+        }
+        // step has already been incremented by record() just before this call
+        if self.step <= INIT_DUMP_STEPS {
+            self.init_mem_writes.push((self.step, addr, val));
+        }
+    }
+
     fn dump(&self, label: &str) {
         if !self.active {
             return;
         }
         eprintln!("\n[RECURSION-DIAG] ════════════════════════════════════════════════════");
         eprintln!("[RECURSION-DIAG] post-mortem: {label}  (at step {})", self.step);
+
+        // ── Init mem-write dump: proof input layout ───────────────────────────
+        eprintln!("[RECURSION-DIAG] ── First {} Mem::Writes (proof input layout) ──", INIT_DUMP_STEPS);
+        for &(s, addr, val) in &self.init_mem_writes {
+            let marker = if addr == 316465 { " ◄◄◄ TARGET" } else { "" };
+            eprintln!("[RECURSION-DIAG]   step={s:>6}  addr={addr:>8}  val={val:#010x}{marker}");
+        }
+        eprintln!("[RECURSION-DIAG]   ({} writes captured)", self.init_mem_writes.len());
+
+        // ── Watched address summary ───────────────────────────────────────────
+        eprintln!("[RECURSION-DIAG] ── Watched address last-write summary ──");
         for &addr in DIAG_WATCHED {
             match self.last_write.get(&addr) {
                 Some((s, d)) => {
@@ -144,8 +173,10 @@ impl ExecDiag {
                 None => eprintln!("[RECURSION-DIAG]   addr={addr:>8}  NEVER WRITTEN"),
             }
         }
+
+        // ── Final 50 instructions ─────────────────────────────────────────────
         let show = self.trace.len().min(50);
-        eprintln!("[RECURSION-DIAG] last {show} instructions (most-recent first):");
+        eprintln!("[RECURSION-DIAG] ── last {show} instructions (most-recent first) ──");
         for line in self.trace.iter().rev().take(show) {
             eprintln!("[RECURSION-DIAG]   {line}");
         }
@@ -601,10 +632,11 @@ where
                 MemAccessKind::Write => {
                     let addr_u = addr.as_usize();
                     let val_u = val.0[0].as_canonical_u32();
-                    EXEC_DIAG.with(|d| d.borrow_mut().record(
-                        addr_u,
-                        format!("Mem::Write @{addr_u}={val_u:#010x}"),
-                    ));
+                    EXEC_DIAG.with(|d| {
+                        let mut d = d.borrow_mut();
+                        d.record(addr_u, format!("Mem::Write @{addr_u}={val_u:#010x}"));
+                        d.record_mem_write(addr_u, val_u);
+                    });
                     memory.mw_unchecked(addr, val)
                 }
             },

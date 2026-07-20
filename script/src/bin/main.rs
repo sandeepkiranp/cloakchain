@@ -381,10 +381,13 @@ fn prove_subprocess(elf_id: &str, stdin: &SP1Stdin) -> SP1ProofWithPublicValues 
     // activates the write-tracker in vendor/sp1-recursion-executor to post-mortem
     // any remaining DivF failure.
     match elf_id {
-        "vfy-g16"   => { cmd.env("SHARD_SIZE", "262144"); } // 1<<18; 636K cycles ≈ 3 shards
+        "vfy-g16" => {
+            cmd.env("SHARD_SIZE", "262144")  // 1<<18; ~636K cycles ≈ 3 shards
+               .env("RECURSION_DIAG", "1"); // compare init dump with coinproof
+        }
         "coinproof" => {
             cmd.env("SHARD_SIZE", "262144")  // 1<<18; ~3M cycles ≈ 12 shards
-               .env("RECURSION_DIAG", "1"); // remove once fix confirmed working
+               .env("RECURSION_DIAG", "1"); // watch addr 316465 init dump
         }
         _ => {}
     }
