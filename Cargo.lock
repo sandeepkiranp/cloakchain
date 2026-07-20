@@ -4503,8 +4503,6 @@ dependencies = [
 [[package]]
 name = "sp1-recursion-machine"
 version = "6.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01ab820757fa3783a0230efd48a509fb64b8e7fbaf1d257211dae0c66df79002"
 dependencies = [
  "itertools 0.14.0",
  "rand 0.8.5",

@@ -1,0 +1,39 @@
+[package]
+name = "sp1-recursion-machine"
+description = "Machine definitions for SP1 recursion"
+readme = "../../../README.md"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+keywords = { workspace = true }
+categories = { workspace = true }
+rust-version = { workspace = true }
+
+[dependencies]
+slop-basefold = { workspace = true }
+sp1-derive = { workspace = true }
+sp1-primitives = { workspace = true }
+sp1-recursion-executor = { workspace = true, features = ["program_validation"] }
+sp1-hypercube = { workspace = true }
+
+
+slop-air = { workspace = true }
+slop-matrix = { workspace = true }
+slop-algebra = { workspace = true }
+slop-maybe-rayon = { workspace = true }
+slop-symmetric = { workspace = true }
+itertools = { workspace = true }
+strum = { workspace = true, features = ["derive"] }
+tracing = { workspace = true }
+rand = { workspace = true }
+
+
+[build-dependencies]
+rand = { workspace = true }
+sp1-hypercube = { workspace = true }
+sp1-primitives = { workspace = true }
+sp1-recursion-executor = { workspace = true, features = ["program_validation"] }
+
+[lints]
+workspace = true

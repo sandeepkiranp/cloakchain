@@ -9,4 +9,5 @@ alloy-sol-types = "*"
 # in2=0.  Patched locally to return 0 instead of erroring for padding rows.
 [patch.crates-io]
 sp1-recursion-executor = { path = "vendor/sp1-recursion-executor" }
+sp1-recursion-machine  = { path = "vendor/sp1-recursion-machine" }
 
