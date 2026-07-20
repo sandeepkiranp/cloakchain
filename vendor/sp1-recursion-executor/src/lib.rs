@@ -424,7 +424,7 @@ where
                 // for these rows (making is_real=0), which disables all constraints
                 // and memory reads/writes. Write an all-zero event and skip the memory
                 // write so this row becomes a true no-op.
-                if *opcode == BaseAluOpcode::DivF && mult.is_zero() && in2.is_zero() && !in1.is_zero() {
+                if opcode == BaseAluOpcode::DivF && mult.is_zero() && in2.is_zero() && !in1.is_zero() {
                     UnsafeCell::raw_get(record.base_alu_events[offset].as_ptr()).write(
                         BaseAluEvent { out: AbstractField::zero(), in1: AbstractField::zero(), in2: AbstractField::zero() },
                     );
