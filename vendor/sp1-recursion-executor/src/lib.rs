@@ -101,6 +101,9 @@ struct ExecDiag {
     trace: VecDeque<String>,
     // All Mem::Write ops in the first INIT_DUMP_STEPS steps: (step, addr, val_u32)
     init_mem_writes: Vec<(usize, usize, u32)>,
+    // Hint writes to watched addresses: (hint_seq, addr, [v0,v1,v2,v3])
+    hint_watched: Vec<(usize, usize, [u32; 4])>,
+    hint_seq: usize,
 }
 
 // Addresses to watch: the failing in2 (316465) ± 5 neighbourhood, plus crash in1/out.
@@ -120,6 +123,8 @@ impl ExecDiag {
             last_write: DiagHashMap::new(),
             trace: VecDeque::with_capacity(DIAG_TRACE_LEN + 1),
             init_mem_writes: Vec::new(),
+            hint_watched: Vec::new(),
+            hint_seq: 0,
         }
     }
 
@@ -148,6 +153,44 @@ impl ExecDiag {
         }
     }
 
+    // Called for every Hint write; tracks watched addresses so we know if a Hint
+    // overwrites a Mem::Write-initialized cell with the actual witness value.
+    fn record_hint_write(&mut self, addr: usize, block: [u32; 4]) {
+        if !self.active { return; }
+        self.hint_seq += 1;
+        if DIAG_WATCHED.contains(&addr) {
+            self.hint_watched.push((self.hint_seq, addr, block));
+        }
+    }
+
+    // Called at the END of a successful run to show the proof-input layout.
+    fn dump_init(&self) {
+        if !self.active {
+            return;
+        }
+        eprintln!("\n[RECURSION-DIAG-INIT] ── First {} Mem::Writes (proof input layout, SUCCESS) ──",
+            INIT_DUMP_STEPS);
+        for &(s, addr, val) in &self.init_mem_writes {
+            let marker = if addr == 316465 { " ◄◄◄ addr316465" } else { "" };
+            eprintln!("[RECURSION-DIAG-INIT]   step={s:>6}  addr={addr:>8}  val={val:#010x}{marker}");
+        }
+        eprintln!("[RECURSION-DIAG-INIT]   ({} writes captured, {} total steps)",
+            self.init_mem_writes.len(), self.step);
+        self.dump_hint_watched("[RECURSION-DIAG-INIT]");
+        eprintln!("[RECURSION-DIAG-INIT] ──────────────────────────────────────────────\n");
+    }
+
+    fn dump_hint_watched(&self, prefix: &str) {
+        eprintln!("{prefix} ── Hint writes to watched addrs ({} total hints) ──", self.hint_seq);
+        if self.hint_watched.is_empty() {
+            eprintln!("{prefix}   (none — watched addresses never written by Hint)");
+        }
+        for &(seq, addr, [v0, v1, v2, v3]) in &self.hint_watched {
+            eprintln!("{prefix}   hint#{seq:>8}  addr={addr:>8}  \
+                block=({v0:#010x},{v1:#010x},{v2:#010x},{v3:#010x})");
+        }
+    }
+
     fn dump(&self, label: &str) {
         if !self.active {
             return;
@@ -162,6 +205,7 @@ impl ExecDiag {
             eprintln!("[RECURSION-DIAG]   step={s:>6}  addr={addr:>8}  val={val:#010x}{marker}");
         }
         eprintln!("[RECURSION-DIAG]   ({} writes captured)", self.init_mem_writes.len());
+        self.dump_hint_watched("[RECURSION-DIAG]");
 
         // ── Watched address summary ───────────────────────────────────────────
         eprintln!("[RECURSION-DIAG] ── Watched address last-write summary ──");
@@ -525,8 +569,10 @@ where
 
         match *instruction {
             Instruction::BaseAlu(ref instr @ BaseAluInstr { opcode, mult: _, addrs }) => {
-                let in1 = memory.mr_unchecked(addrs.in1).val[0];
-                let in2 = memory.mr_unchecked(addrs.in2).val[0];
+                let in1_block = memory.mr_unchecked(addrs.in1).val;
+                let in2_block = memory.mr_unchecked(addrs.in2).val;
+                let in1 = in1_block.0[0];
+                let in2 = in2_block.0[0];
                 let in1_u = in1.as_canonical_u32();
                 let in2_u = in2.as_canonical_u32();
                 // Do the computation.
@@ -543,8 +589,10 @@ where
                                 AbstractField::one()
                             } else {
                                 // ── Diagnostic dump ──
+                                let [b0,b1,b2,b3] = in2_block.0.map(|x| x.as_canonical_u32());
                                 EXEC_DIAG.with(|d| d.borrow().dump(&format!(
-                                    "DivF in1={in1_u:#010x}@{} in2={in2_u:#010x}@{} out@{}",
+                                    "DivF in1={in1_u:#010x}@{} in2={in2_u:#010x}@{} out@{} \
+                                     full_in2_block=({b0:#010x},{b1:#010x},{b2:#010x},{b3:#010x})",
                                     addrs.in1.as_usize(),
                                     addrs.in2.as_usize(),
                                     addrs.out.as_usize(),
@@ -914,6 +962,18 @@ where
                     // Inline [`Self::mw`] to mutably borrow multiple fields of `self`.
                     memory.mw_unchecked(addr, val);
 
+                    // Track hint writes to watched addresses for diagnostics.
+                    EXEC_DIAG.with(|d| {
+                        let mut d = d.borrow_mut();
+                        let block = [
+                            val.0[0].as_canonical_u32(),
+                            val.0[1].as_canonical_u32(),
+                            val.0[2].as_canonical_u32(),
+                            val.0[3].as_canonical_u32(),
+                        ];
+                        d.record_hint_write(addr.as_usize(), block);
+                    });
+
                     // Write the event to the record.
                     UnsafeCell::raw_get(record.mem_var_events[offset + i].as_ptr())
                         .write(MemEvent { inner: val });
@@ -1002,6 +1062,9 @@ where
                 Some(&mut self.witness_stream),
             )
         }?;
+
+        // On success: dump init_mem_writes so we can compare with failing runs.
+        EXEC_DIAG.with(|d| d.borrow().dump_init());
 
         self.record = record;
 
