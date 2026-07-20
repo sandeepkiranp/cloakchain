@@ -7,16 +7,19 @@ use cloakkchain_lib::{
 };
 
 pub fn main() {
-    // SP1 6.2.3 single-shard DivF workaround: the recursion circuit generates a
-    // DivF instruction with in2=0, in1≠0 for single-shard programs, producing an
-    // unsatisfiable constraint.  Force ≥2 shards by burning enough RISC-V cycles
-    // to exceed SHARD_SIZE=262144.  3000 chained SHA256 calls ≈ 450K cycles.
+    // SP1 6.2.3 single-shard DivF workaround: the recursion circuit emits an
+    // unsatisfiable DivF(in2=0, in1≠0) for single-shard programs; multi-shard
+    // programs use a different recursion path that avoids the bug.
+    //
+    // Pure RISC-V arithmetic loop: ~6 instructions/iter (mul + add + black_box
+    // sw/lw + counter + branch).  100K iters ≈ 600K cycles → 3 shards at
+    // SHARD_SIZE=262144, guaranteed without relying on precompile call costs.
     {
-        let mut h = [0u8; 32];
-        for _ in 0u32..3_000 {
-            h = Sha256::digest(h).into();
+        let mut acc = 0u32;
+        for i in 0u32..100_000 {
+            acc = core::hint::black_box(acc).wrapping_mul(1_664_525).wrapping_add(i);
         }
-        let _ = core::hint::black_box(h[0]);
+        let _ = core::hint::black_box(acc);
     }
 
     let vkey: [u32; 8]             = sp1_zkvm::io::read();
