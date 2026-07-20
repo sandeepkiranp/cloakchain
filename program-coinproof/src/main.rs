@@ -19,6 +19,9 @@ pub fn main() {
         for i in 0u32..100_000 {
             acc = core::hint::black_box(acc).wrapping_mul(1_664_525).wrapping_add(i);
         }
+        // Diagnostic: emits to host stdout during SP1 execution (fd=1 → "stdout: …").
+        // Confirms (a) this ELF build contains the loop and (b) the loop ran.
+        println!("[COINPROOF-DIAG] cycle-pad acc={acc:#010x}");
         let _ = core::hint::black_box(acc);
     }
 

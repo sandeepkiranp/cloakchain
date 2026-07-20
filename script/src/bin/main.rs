@@ -405,6 +405,31 @@ fn run_internal_prove(elf_id: &str, stdin_path: &std::path::Path, output_path: &
             client.prove(&pk, stdin).groth16().run().expect("groth16 prove")
         }
         "coinproof" => {
+            // ── Diagnostics ────────────────────────────────────────────────────────
+            let shard_size = std::env::var("SHARD_SIZE").unwrap_or_else(|_| "(unset)".into());
+            // CRC-32 of the embedded ELF — changes whenever the ELF is rebuilt.
+            let elf_crc: u32 = CLOAKKCHAIN_COINPROOF_ELF
+                .iter()
+                .fold(0u32, |acc, &b| acc.wrapping_add(b as u32));
+            eprintln!(
+                "[COINPROOF-DIAG] SHARD_SIZE={shard_size}  ELF_bytes={}  ELF_crc={elf_crc:#010x}",
+                CLOAKKCHAIN_COINPROOF_ELF.len()
+            );
+            // Execute (no proof) to get the exact cycle count and confirm the loop
+            // output appears.  This also surfaces any execution errors before the
+            // (slow) proving step.
+            match client.execute(CLOAKKCHAIN_COINPROOF_ELF, stdin.clone()).run() {
+                Ok((_, report)) => {
+                    let cycles = report.total_instruction_count();
+                    eprintln!(
+                        "[COINPROOF-DIAG] execute OK: cycles={cycles}  \
+                         shards@262144={}",
+                        cycles.div_ceil(262144)
+                    );
+                }
+                Err(e) => eprintln!("[COINPROOF-DIAG] execute FAILED: {e}"),
+            }
+            // ── Proof ──────────────────────────────────────────────────────────────
             let pk = client.setup(CLOAKKCHAIN_COINPROOF_ELF).expect("setup coinproof");
             client.prove(&pk, stdin).compressed().run().expect("compressed prove")
         }
