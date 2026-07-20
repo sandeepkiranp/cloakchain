@@ -373,8 +373,15 @@ fn prove_subprocess(elf_id: &str, stdin: &SP1Stdin) -> SP1ProofWithPublicValues 
         "--internal-prove-stdin",  stdin_path.to_str().unwrap(),
         "--internal-prove-output", proof_path.to_str().unwrap(),
     ]).envs(std::env::vars());
-    if elf_id == "vfy-g16" {
-        cmd.env("SHARD_SIZE", "262144"); // 1 << 18; forces 3 shards from 636K cycles
+    // Both vfy-g16 (636K cycles, BN254 precompiles) and coinproof (reads a large
+    // compressed inner proof from stdin) end up as single-shard programs under
+    // the default 16M shard size.  A single-shard compressed STARK triggers a
+    // BaseAlu padding DivF bug in SP1 6.2.3.  Force smaller shard sizes so each
+    // program spans ≥2 shards and the recursion tree is non-degenerate.
+    match elf_id {
+        "vfy-g16"   => { cmd.env("SHARD_SIZE", "262144"); } // 1<<18; 636K/262144 ≈ 3 shards
+        "coinproof" => { cmd.env("SHARD_SIZE", "131072"); } // 1<<17; splits ≥150K-cycle programs
+        _ => {}
     }
     let status = cmd.status().expect("spawn proving subprocess");
     assert!(status.success(), "proving subprocess for {elf_id} exited with {status}");
