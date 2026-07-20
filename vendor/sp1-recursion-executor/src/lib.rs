@@ -415,48 +415,39 @@ where
         let offset = analyzed_instruction.offset;
 
         match *instruction {
-            Instruction::BaseAlu(ref instr @ BaseAluInstr { opcode, mult, addrs }) => {
+            Instruction::BaseAlu(ref instr @ BaseAluInstr { opcode, mult: _, addrs }) => {
                 let in1 = memory.mr_unchecked(addrs.in1).val[0];
                 let in2 = memory.mr_unchecked(addrs.in2).val[0];
-
-                // SP1 6.2.3 bug: DivF rows with mult=0 (disabled) can have in2=0
-                // and in1≠0 in memory. The sp1-recursion-machine patch clears is_div
-                // for these rows (making is_real=0), which disables all constraints
-                // and memory reads/writes. Write an all-zero event and skip the memory
-                // write so this row becomes a true no-op.
-                if opcode == BaseAluOpcode::DivF && mult.is_zero() && in2.is_zero() && !in1.is_zero() {
-                    UnsafeCell::raw_get(record.base_alu_events[offset].as_ptr()).write(
-                        BaseAluEvent { out: AbstractField::zero(), in1: AbstractField::zero(), in2: AbstractField::zero() },
-                    );
-                    // No memory.mw_unchecked — mult=0 means no output write intended.
-                } else {
-                    // Do the computation.
-                    let out = match opcode {
-                        BaseAluOpcode::AddF => in1 + in2,
-                        BaseAluOpcode::SubF => in1 - in2,
-                        BaseAluOpcode::MulF => in1 * in2,
-                        BaseAluOpcode::DivF => match in1.try_div(in2) {
-                            Some(x) => x,
-                            None => {
-                                // 0/0 is defined as 1 by convention.
-                                if in1.is_zero() {
-                                    AbstractField::one()
-                                } else {
-                                    return Err(RuntimeError::DivFOutOfDomain {
-                                        in1,
-                                        in2,
-                                        instr: *instr,
-                                        trace: state.resolve_trace().cloned(),
-                                    });
-                                }
+                // Do the computation.
+                let out = match opcode {
+                    BaseAluOpcode::AddF => in1 + in2,
+                    BaseAluOpcode::SubF => in1 - in2,
+                    BaseAluOpcode::MulF => in1 * in2,
+                    BaseAluOpcode::DivF => match in1.try_div(in2) {
+                        Some(x) => x,
+                        None => {
+                            // Check for division exceptions and error. Note that 0/0 is defined
+                            // to be 1.
+                            if in1.is_zero() {
+                                AbstractField::one()
+                            } else {
+                                return Err(RuntimeError::DivFOutOfDomain {
+                                    in1,
+                                    in2,
+                                    instr: *instr,
+                                    trace: state.resolve_trace().cloned(),
+                                });
                             }
-                        },
-                    };
-                    memory.mw_unchecked(addrs.out, Block::from(out));
-                    UnsafeCell::raw_get(record.base_alu_events[offset].as_ptr()).write(
-                        BaseAluEvent { out, in1, in2 },
-                    );
-                }
+                        }
+                    },
+                };
+                memory.mw_unchecked(addrs.out, Block::from(out));
+                // Write the event to the record.
+                UnsafeCell::raw_get(record.base_alu_events[offset].as_ptr()).write(BaseAluEvent {
+                    out,
+                    in1,
+                    in2,
+                });
             }
             Instruction::ExtAlu(ref instr @ ExtAluInstr { opcode, mult: _, addrs }) => {
                 let in1 = memory.mr_unchecked(addrs.in1).val;

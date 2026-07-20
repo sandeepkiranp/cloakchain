@@ -380,7 +380,7 @@ fn prove_subprocess(elf_id: &str, stdin: &SP1Stdin) -> SP1ProofWithPublicValues 
     // program spans ≥2 shards and the recursion tree is non-degenerate.
     match elf_id {
         "vfy-g16"   => { cmd.env("SHARD_SIZE", "262144"); } // 1<<18; 636K/262144 ≈ 3 shards
-        "coinproof" => { cmd.env("SHARD_SIZE", "131072"); } // 1<<17; splits ≥150K-cycle programs
+        "coinproof" => { cmd.env("SHARD_SIZE", "262144"); } // 1<<18; 3000×SHA256 padding ≈ 450K cycles → 2 shards
         _ => {}
     }
     let status = cmd.status().expect("spawn proving subprocess");
