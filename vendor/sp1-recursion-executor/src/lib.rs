@@ -195,36 +195,56 @@ impl ExecDiag {
         if !self.active {
             return;
         }
-        eprintln!("\n[RECURSION-DIAG] ════════════════════════════════════════════════════");
-        eprintln!("[RECURSION-DIAG] post-mortem: {label}  (at step {})", self.step);
+        let mut lines: Vec<String> = Vec::new();
+        let push = |lines: &mut Vec<String>, s: String| { lines.push(s); };
+
+        push(&mut lines, format!("\n[RECURSION-DIAG] ════════════════════════════════════════════════════"));
+        push(&mut lines, format!("[RECURSION-DIAG] post-mortem: {label}  (at step {})", self.step));
 
         // ── Init mem-write dump: proof input layout ───────────────────────────
-        eprintln!("[RECURSION-DIAG] ── First {} Mem::Writes (proof input layout) ──", INIT_DUMP_STEPS);
+        push(&mut lines, format!("[RECURSION-DIAG] ── First {} Mem::Writes (proof input layout) ──", INIT_DUMP_STEPS));
         for &(s, addr, val) in &self.init_mem_writes {
             let marker = if addr == 316465 { " ◄◄◄ TARGET" } else { "" };
-            eprintln!("[RECURSION-DIAG]   step={s:>6}  addr={addr:>8}  val={val:#010x}{marker}");
+            push(&mut lines, format!("[RECURSION-DIAG]   step={s:>6}  addr={addr:>8}  val={val:#010x}{marker}"));
         }
-        eprintln!("[RECURSION-DIAG]   ({} writes captured)", self.init_mem_writes.len());
-        self.dump_hint_watched("[RECURSION-DIAG]");
+        push(&mut lines, format!("[RECURSION-DIAG]   ({} writes captured)", self.init_mem_writes.len()));
+
+        // ── Hint writes to watched addresses ──────────────────────────────────
+        push(&mut lines, format!("[RECURSION-DIAG] ── Hint writes to watched addrs ({} total hints) ──", self.hint_seq));
+        if self.hint_watched.is_empty() {
+            push(&mut lines, format!("[RECURSION-DIAG]   (none — watched addresses never written by Hint)"));
+        }
+        for &(seq, addr, [v0, v1, v2, v3]) in &self.hint_watched {
+            push(&mut lines, format!("[RECURSION-DIAG]   hint#{seq:>8}  addr={addr:>8}  block=({v0:#010x},{v1:#010x},{v2:#010x},{v3:#010x})"));
+        }
 
         // ── Watched address summary ───────────────────────────────────────────
-        eprintln!("[RECURSION-DIAG] ── Watched address last-write summary ──");
+        push(&mut lines, format!("[RECURSION-DIAG] ── Watched address last-write summary ──"));
         for &addr in DIAG_WATCHED {
             match self.last_write.get(&addr) {
                 Some((s, d)) => {
-                    eprintln!("[RECURSION-DIAG]   addr={addr:>8}  last_write_step={s:>10}  {d}")
+                    push(&mut lines, format!("[RECURSION-DIAG]   addr={addr:>8}  last_write_step={s:>10}  {d}"))
                 }
-                None => eprintln!("[RECURSION-DIAG]   addr={addr:>8}  NEVER WRITTEN"),
+                None => push(&mut lines, format!("[RECURSION-DIAG]   addr={addr:>8}  NEVER WRITTEN")),
             }
         }
 
-        // ── Final 50 instructions ─────────────────────────────────────────────
-        let show = self.trace.len().min(50);
-        eprintln!("[RECURSION-DIAG] ── last {show} instructions (most-recent first) ──");
-        for line in self.trace.iter().rev().take(show) {
-            eprintln!("[RECURSION-DIAG]   {line}");
+        // ── Final 100 instructions ────────────────────────────────────────────
+        let show = self.trace.len();
+        push(&mut lines, format!("[RECURSION-DIAG] ── last {show} instructions (most-recent last) ──"));
+        for line in self.trace.iter() {
+            push(&mut lines, format!("[RECURSION-DIAG]   {line}"));
         }
-        eprintln!("[RECURSION-DIAG] ════════════════════════════════════════════════════\n");
+        push(&mut lines, format!("[RECURSION-DIAG] ════════════════════════════════════════════════════\n"));
+
+        // ── Write to stderr AND to /tmp/recursion-diag.txt ───────────────────
+        let full = lines.join("\n");
+        eprintln!("{full}");
+        if let Ok(mut f) = std::fs::File::create("/tmp/recursion-diag.txt") {
+            let _ = f.write_all(full.as_bytes());
+            let _ = f.write_all(b"\n");
+            eprintln!("[RECURSION-DIAG] Full dump also written to /tmp/recursion-diag.txt");
+        }
     }
 }
 
@@ -590,13 +610,24 @@ where
                             } else {
                                 // ── Diagnostic dump ──
                                 let [b0,b1,b2,b3] = in2_block.0.map(|x| x.as_canonical_u32());
-                                EXEC_DIAG.with(|d| d.borrow().dump(&format!(
-                                    "DivF in1={in1_u:#010x}@{} in2={in2_u:#010x}@{} out@{} \
-                                     full_in2_block=({b0:#010x},{b1:#010x},{b2:#010x},{b3:#010x})",
-                                    addrs.in1.as_usize(),
-                                    addrs.in2.as_usize(),
-                                    addrs.out.as_usize(),
-                                )));
+                                let in1_addr = addrs.in1.as_usize();
+                                let in2_addr = addrs.in2.as_usize();
+                                EXEC_DIAG.with(|d| {
+                                    let diag = d.borrow();
+                                    let in1_writer = diag.last_write.get(&in1_addr)
+                                        .map(|(s, desc)| format!("step={s} [{desc}]"))
+                                        .unwrap_or_else(|| "NEVER-WRITTEN(constant/init)".into());
+                                    let in2_writer = diag.last_write.get(&in2_addr)
+                                        .map(|(s, desc)| format!("step={s} [{desc}]"))
+                                        .unwrap_or_else(|| "NEVER-WRITTEN(constant/init)".into());
+                                    diag.dump(&format!(
+                                        "DivF in1={in1_u:#010x}@{in1_addr} in2={in2_u:#010x}@{in2_addr} out@{}\n\
+                                         full_in2_block=({b0:#010x},{b1:#010x},{b2:#010x},{b3:#010x})\n\
+                                         in1_last_writer: {in1_writer}\n\
+                                         in2_last_writer: {in2_writer}",
+                                        addrs.out.as_usize(),
+                                    ));
+                                });
                                 return Err(RuntimeError::DivFOutOfDomain {
                                     in1,
                                     in2,

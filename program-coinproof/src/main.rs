@@ -7,35 +7,6 @@ use cloakkchain_lib::{
 };
 
 pub fn main() {
-    // SP1 6.2.3 recursion workaround: the compress circuit evaluates every chip's
-    // log-up polynomial at a random challenge point.  For a chip with zero events
-    // the polynomial is identically 0, so that evaluation = 0.  For one specific
-    // chip (Uint256MulModUser, activated by the UINT256_MUL / sys_bigint ecall)
-    // the circuit computes SubF(1, eval) / eval; when eval = 0 this gives DivF(1, 0)
-    // → panic at step ~174554.
-    //
-    // VFY-G16 avoids the crash because substrate-bn calls sys_bigint hundreds of
-    // times during Groth16 verification (U256 modular multiply in arith.rs:333),
-    // making the Uint256MulModUser evaluation non-zero.
-    //
-    // Fix: one dummy sys_bigint call gives coinproof ≥1 UINT256_MUL event so the
-    // chip evaluation polynomial is non-zero → DivF succeeds.
-    unsafe {
-        // 2 × 3 mod 7 = 6  — any valid modular multiplication activates the chip.
-        let x          = core::hint::black_box([2u64, 0, 0, 0]);
-        let y          = core::hint::black_box([3u64, 0, 0, 0]);
-        let modulus    = core::hint::black_box([7u64, 0, 0, 0]);
-        let mut result = core::mem::MaybeUninit::<[u64; 4]>::uninit();
-        sp1_zkvm::syscalls::sys_bigint(
-            result.as_mut_ptr() as *mut [u64; 4],
-            0,
-            &x       as *const [u64; 4],
-            &y       as *const [u64; 4],
-            &modulus as *const [u64; 4],
-        );
-        let _ = core::hint::black_box(result.assume_init());
-    }
-
     let vkey: [u32; 8]             = sp1_zkvm::io::read();
     let vfy_g16_vkey: [u32; 8]     = sp1_zkvm::io::read();
     let owner_sk: [u8; 32]         = sp1_zkvm::io::read();
