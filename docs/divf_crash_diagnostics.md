@@ -1,5 +1,68 @@
 # SP1 6.2.3 DivF Crash — Diagnostic Summary
 
+## Update 3: `contains_first_shard` was also wrong — real cause is `exit_code=1` in the deferred (VFY-G16) proof
+
+A second nsac run with the `contains_first_shard` print (marker `75xxxxxxx`) showed all 4
+compress-batch entries with clean boolean values (0, 0, 1, 0) — that check also passes. So
+**neither** `vk_root` **nor** `contains_first_shard` is the bug.
+
+Re-reading the crash trace against `deferred.rs` (not `compress.rs`) instead: the `800000000`
+marker (the deferred-proof `vk_root` check, for the externally-supplied proof passed via
+`write_proof`) appears with no success dump before the crash, meaning **the crashing program
+is the deferred verifier**, not a compress fold. Right after `deferred.rs`'s (passing) 8-word
+`vk_root` loop, the code calls `assert_recursion_public_values_valid` (an 8-word Poseidon2
+digest check — matches the Poseidon2 ops + 8-word SubF/DivF loop seen at steps
+174490–174552), then:
+```rust
+builder.assert_felt_eq(current_public_values.is_complete, SP1Field::one());  // passes
+builder.assert_felt_eq(current_public_values.exit_code, SP1Field::zero());   // CRASHES
+```
+This matches exactly: step 174553/174554 (`is_complete==1`, dynamic-vs-dynamic, passes),
+step 174555 (`exit_code==0`, rhs is the literal zero constant at 316465, **fails**).
+
+**Root cause:** the externally-supplied deferred proof — VFY-G16's compressed proof, fed into
+coinproof via `write_proof` — has `exit_code=1`. In `program-vfy-g16/src/main.rs`:
+```rust
+verify_sp1_spend_proof(&spend_proof_bytes, &pv_encode, &spend_vkey_hash)
+    .expect("Groth16 spend proof verification failed");
+```
+A panic in an SP1 guest converts to a clean `halt(1)` — proving still succeeds (no crash, no
+visible error), just with `exit_code=1` instead of 0. SP1's deferred verifier then correctly
+rejects it, three layers removed from where the real problem is.
+
+Note this is **not** the same check that already passed: `client.verify(&genesis_proof, ...)`
+in `script/src/bin/main.rs` (right after generating the genesis Groth16 proof) uses SP1's own
+official verifier and succeeds. `verify_sp1_spend_proof` is this project's own hand-rolled
+verifier (`groth16-verifier/src/lib.rs`, built on the vendored `snark-bn254-verifier` crate
+instead of the official `ark-bn254`-based `sp1-verifier`), so the proof being valid per SP1
+doesn't mean it's valid per this custom implementation — the bug is in the custom one.
+
+**Ruled out so far:**
+- VK staleness — `groth16-verifier/vk-artifacts/groth16_vk.bin` is byte-identical
+  (sha256 `4388a21c...`) to nsac's actual cached `~/.sp1/circuits/groth16/v6.1.0/groth16_vk.bin`.
+- Byte layout / hash scheme in `groth16-verifier/src/lib.rs` — matches the official
+  `sp1-verifier-6.2.3` reference implementation exactly (same offsets, same
+  SHA256-with-top-3-bits-masked digest, same public input ordering).
+- An off-by-4-byte issue found in `vendor/snark-bn254-verifier/src/groth16/converter.rs`'s
+  `commitment_key_g`/`commitment_key_g_root_sigma_neg` parsing (relative to
+  `groth16-verifier`'s `build_padded_vk()` padding boundary) — confirmed harmless, since
+  `verify_groth16` in `vendor/snark-bn254-verifier/src/groth16/verify.rs` never reads
+  `vk.commitment_key` at all.
+
+**Added diagnostic** (`script/src/bin/main.rs`, `run_internal_prove`'s `"vfy-g16"` branch):
+a `client.execute(...)` pre-check mirroring the existing `coinproof` diagnostic, since a
+guest panic converting to `halt(1)` produces no visible error during `.prove()` — this
+should surface the actual panic message/exit behavior directly on the next run.
+
+**Next step:** run on nsac and grep for `[VFY-G16-DIAG]` to see whether execute() surfaces
+the panic directly. If it does, the fix is in `groth16-verifier`'s custom Groth16
+verification logic (likely in `vendor/snark-bn254-verifier`'s pairing/point-encoding
+assumptions, or a mismatch between what `snark_bn254_verifier::Groth16Verifier` expects for
+proof/VK point encoding and what SP1's gnark backend actually produces) — not in the SP1
+recursion internals this whole investigation started with.
+
+---
+
 ## Update 2: the `vk_root` theory was wrong — real suspect is `contains_first_shard`
 
 With the `vk not allowed` blocker fixed (see below) and the print diagnostics from

@@ -450,6 +450,22 @@ fn run_internal_prove(elf_id: &str, stdin_path: &std::path::Path, output_path: &
             client.prove(&pk, stdin).compressed().run().expect("compressed prove")
         }
         "vfy-g16" => {
+            // ── Diagnostics ────────────────────────────────────────────────────────
+            // A panic inside the guest (e.g. verify_sp1_spend_proof(...).expect(...))
+            // converts to a clean halt(1) rather than a host-visible error, so proving
+            // succeeds silently with exit_code=1 - only surfacing much later when
+            // coinproof's deferred verifier asserts exit_code==0. Run execute() first
+            // (mirroring the coinproof branch above) so any guest panic is visible here.
+            match client.execute(VFY_G16_ELF, stdin.clone()).run() {
+                Ok((_, report)) => {
+                    eprintln!(
+                        "[VFY-G16-DIAG] execute OK: cycles={}",
+                        report.total_instruction_count()
+                    );
+                }
+                Err(e) => eprintln!("[VFY-G16-DIAG] execute FAILED: {e}"),
+            }
+            // ── Proof ──────────────────────────────────────────────────────────────
             let pk = client.setup(VFY_G16_ELF).expect("setup vfy-g16");
             client.prove(&pk, stdin).compressed().run().expect("compressed prove")
         }
