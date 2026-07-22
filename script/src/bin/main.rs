@@ -621,14 +621,6 @@ fn main() {
     sp1_sdk::utils::setup_logger();
     dotenv::dotenv().ok();
 
-    // prove_subprocess() already sets this for the vfy-g16/coinproof proving subprocesses,
-    // but client.verify(...) calls in *this* (parent) process construct their own
-    // ProverClient::from_env() too - without this also set here, the parent verifies
-    // against the official vk_verification=true root while the child proved against the
-    // dummy vk_verification=false root, causing a spurious "vk_root mismatch" on every
-    // compressed-proof verify. Needs sp1-sdk's "experimental" feature (see Cargo.toml).
-    std::env::set_var("WITHOUT_VK_VERIFICATION", "1");
-
     let args = Args::parse();
 
     // Subprocess mode: prove one program and exit.  Memory is fully freed when
@@ -767,6 +759,20 @@ fn main() {
     let spend_pk     = client.setup(CLOAKKCHAIN_SPEND_ELF).expect("setup spend elf");
     let coinproof_pk = client.setup(CLOAKKCHAIN_COINPROOF_ELF).expect("setup coinproof elf");
     let vfy_g16_pk   = client.setup(VFY_G16_ELF).expect("setup vfy_g16 elf");
+
+    // coinproof/vfy-g16 are proved with WITHOUT_VK_VERIFICATION=1 (see prove_subprocess) since
+    // their recursion-circuit shapes aren't in SP1's official vk_map.bin - but `client` above
+    // must NOT have that set, because spend's Groth16 wrap circuit requires the official
+    // vk_root (confirmed: setting this globally broke genesis spend proving with a gnark R1CS
+    // constraint failure). So build a second, separate client - with the env var only set for
+    // the duration of its own construction - used exclusively to verify compressed coinproof
+    // proofs against the matching dummy vk_root.
+    let coinproof_verify_client = {
+        std::env::set_var("WITHOUT_VK_VERIFICATION", "1");
+        let c = ProverClient::from_env();
+        std::env::remove_var("WITHOUT_VK_VERIFICATION");
+        c
+    };
     let spend_vkey     = spend_pk.verifying_key().hash_u32();
     let coinproof_vkey = coinproof_pk.verifying_key().hash_u32();
     let vfy_g16_vkey   = vfy_g16_pk.verifying_key().hash_u32();
@@ -804,9 +810,9 @@ fn main() {
     println!("  Proved & verified ({prove_secs:.1} s) — proof {} — entry {}", fmt_bytes(genesis_proof_size), fmt_bytes(e0_bytes));
 
     println!("--- Wallets scanning slot 0 ---");
-    alice_wallet.process_slot(0, &entries, &spend_pk, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats);
-    bob_wallet  .process_slot(0, &entries, &spend_pk, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats);
-    carol_wallet.process_slot(0, &entries, &spend_pk, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats);
+    alice_wallet.process_slot(0, &entries, &spend_pk, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &coinproof_verify_client, &mut stats);
+    bob_wallet  .process_slot(0, &entries, &spend_pk, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &coinproof_verify_client, &mut stats);
+    carol_wallet.process_slot(0, &entries, &spend_pk, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &coinproof_verify_client, &mut stats);
 
     // =========================================================================
     // Slot 1: Alice sends 40 to Bob + 60 change
@@ -840,9 +846,9 @@ fn main() {
     println!("  Proved & verified ({prove_secs:.1} s) — proof {} — entry {}", fmt_bytes(alice_proof_size), fmt_bytes(e1_bytes));
 
     println!("--- Wallets scanning slot 1 ---");
-    alice_wallet.process_slot(1, &entries, &spend_pk, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats);
-    bob_wallet  .process_slot(1, &entries, &spend_pk, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats);
-    carol_wallet.process_slot(1, &entries, &spend_pk, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats);
+    alice_wallet.process_slot(1, &entries, &spend_pk, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &coinproof_verify_client, &mut stats);
+    bob_wallet  .process_slot(1, &entries, &spend_pk, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &coinproof_verify_client, &mut stats);
+    carol_wallet.process_slot(1, &entries, &spend_pk, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &coinproof_verify_client, &mut stats);
 
     // =========================================================================
     // Slot 2: Bob sends 40 to Carol
@@ -874,9 +880,9 @@ fn main() {
     println!("  Proved & verified ({prove_secs:.1} s) — proof {} — entry {}", fmt_bytes(bob_proof_size), fmt_bytes(e2_bytes));
 
     println!("--- Wallets scanning slot 2 ---");
-    alice_wallet.process_slot(2, &entries, &spend_pk, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats);
-    bob_wallet  .process_slot(2, &entries, &spend_pk, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats);
-    carol_wallet.process_slot(2, &entries, &spend_pk, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats);
+    alice_wallet.process_slot(2, &entries, &spend_pk, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &coinproof_verify_client, &mut stats);
+    bob_wallet  .process_slot(2, &entries, &spend_pk, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &coinproof_verify_client, &mut stats);
+    carol_wallet.process_slot(2, &entries, &spend_pk, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &coinproof_verify_client, &mut stats);
 
     println!("\n=== Wallet States ===");
     alice_wallet.print_state();

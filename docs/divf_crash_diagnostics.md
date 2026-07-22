@@ -1,5 +1,46 @@
 # SP1 6.2.3 DivF Crash — Diagnostic Summary
 
+## Update 13: Update 12's global fix broke genesis spend proving — scoped it to a second client
+
+Update 12's `std::env::set_var("WITHOUT_VK_VERIFICATION", "1")` at the top of `main()` was too
+broad. Next nsac run: genesis spend Groth16 proving (which had *never* failed in any prior
+run — confirmed by checking `coinproof_run8.log`, which shows it completing successfully
+*before* Update 12's change) now crashed with a gnark R1CS constraint failure:
+
+```
+Error: constraint #1317536 is not satisfied: [assertIsEqual] ... == ...
+sp1.(*Circuit).Define  /sp1/crates/recursion/gnark-ffi/go/sp1/sp1.go:182
+panic: constraint #1317536 is not satisfied
+```
+
+That's SP1's own fixed Go gnark circuit (`sp1-recursion-gnark-ffi`, shipped by Succinct,
+not something this project can patch) — it apparently *requires* the official
+`vk_verification=true` root to build a satisfiable witness for the final Groth16 wrap.
+Setting `WITHOUT_VK_VERIFICATION` globally made the parent process's *single* shared
+`client` use the dummy root for spend's shrink+wrap+Groth16 pipeline too, which broke it.
+
+**The real constraint:** spend needs `vk_verification=true` (default); coinproof/vfy-g16 need
+`vk_verification=false` (their shapes aren't in SP1's official `vk_map.bin` — that's the
+original `"vk not allowed"` blocker from many updates ago). These can't coexist in one
+`ProverClient`, since `vk_verification` is baked in once at client-construction time.
+
+**Fix** (`script/src/bin/main.rs`):
+- Reverted the global `set_var` at the top of `main()` — the original `client` (used for
+  spend setup/prove/verify, and for `coinproof_pk`/`vfy_g16_pk` setup — setup itself doesn't
+  depend on `vk_verification`) is back to unmodified, working, default behavior.
+- Added a **second**, separate client, `coinproof_verify_client`, built with the env var
+  toggled on only for the duration of its own construction. Traced `client: &C`'s actual
+  usage through `process_slot`/`bootstrap`/`run_coinproof_step` and confirmed it's used for
+  exactly one thing: the `client.verify(&proof, coinproof_pk.verifying_key(), None)` call for
+  compressed coinproof proofs (`run_coinproof_step`, line 246) — nothing else needs it. Swapped
+  in `coinproof_verify_client` at all 9 `process_slot(...)` call sites (verified the
+  `&vfy_g16_vkey, &client, &mut stats` pattern appeared exactly 9 times before bulk-replacing).
+
+**Next step:** run `--prove` on nsac again. This should let spend proving succeed as it always
+did, while still giving coinproof's verify the matching dummy-vk client it needs.
+
+---
+
 ## Update 12: the original `DivFOutOfDomain` crash is GONE — new, unrelated `vk_root mismatch` on verify
 
 Ran the full `--prove` pipeline on nsac with all three Groth16-verifier fixes in place. Result:
