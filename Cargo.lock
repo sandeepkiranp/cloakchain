@@ -4298,8 +4298,6 @@ dependencies = [
 [[package]]
 name = "sp1-prover"
 version = "6.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72c3cb0201a41e9da5372b2b437af07ee3ccd6dca99a69ece4213af40d9436b7"
 dependencies = [
  "anyhow",
  "bincode",

@@ -635,8 +635,17 @@ fn main() {
     // makes the pipeline run correctly end-to-end, but the resulting proofs are not
     // production/mainnet-grade until that's addressed separately (e.g. registering these
     // programs' shapes in a real vk_map).
-    std::env::set_var("WITHOUT_VK_VERIFICATION", "1");
-    std::env::set_var("SP1_CIRCUIT_MODE", "dev");
+    // FORCE_VK_VERIFICATION=1 skips both of the above (falls back to SP1's default
+    // vk_verification=true + release circuit mode) - a temporary diagnostic toggle to
+    // reproduce and inspect the original "vk not allowed" error with the new [VK-DIAG]
+    // print in vendor/sp1-prover (set RECURSION_DIAG=1 too, to actually see it), without
+    // needing to hand-edit/revert this block for a one-off investigative run.
+    if std::env::var("FORCE_VK_VERIFICATION").map(|v| v == "1").unwrap_or(false) {
+        eprintln!("[main] FORCE_VK_VERIFICATION=1: using default vk_verification=true, release circuit mode");
+    } else {
+        std::env::set_var("WITHOUT_VK_VERIFICATION", "1");
+        std::env::set_var("SP1_CIRCUIT_MODE", "dev");
+    }
 
     let args = Args::parse();
 

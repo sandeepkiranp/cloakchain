@@ -1,5 +1,57 @@
 # SP1 6.2.3 DivF Crash — Diagnostic Summary
 
+## Update 15: `SP1_CIRCUIT_MODE=dev` is a dead end — investigating whether coinproof/vfy-g16's shapes are genuinely unregistered
+
+Update 14's fix ran on nsac far enough to build a local dev Groth16 circuit (~15 min,
+`nbConstraints=15972262`) for genesis's spend proof — but `client.verify(&genesis_proof,
+...)` then failed: `Groth16("/home/sandeep/.sp1/circuits/fce924068aa5a610-groth16-dev"
+development groth16 build dir does not exist)`. The hash the verify step looked for
+(`fce924068aa5a610`) didn't match the one the prove step actually built
+(`0ada77e98b7892a1`).
+
+Traced this to `sp1-prover-6.2.3/src/verify.rs`: `self.wrap_vk` is loaded from
+`include_bytes!("../wrap_vk.bin")` — **a compile-time constant, identical in every process,
+completely independent of `vk_verification`/`SP1_CIRCUIT_MODE`**. It's Succinct's one
+official wrap circuit's VK, always. Separately, `build.rs`'s `build_outer_circuit` compiles
+the wrap circuit with an explicit constraint tying it to whatever shrink-proof VK is passed
+in as `template_vk` — so a `SP1_CIRCUIT_MODE=dev` build (using our dummy-rooted shrink VK)
+produces a **structurally different circuit** with a different resulting VK, which
+`client.verify()`'s hardcoded `self.wrap_vk` can never match.
+
+**Conclusion: no combination of env vars makes a `SP1_CIRCUIT_MODE=dev`-built Groth16 proof
+acceptable to standard `client.verify()`.** This isn't an ordering/consistency bug like the
+last several updates — it's structural. Abandoned this path entirely; reverted to
+investigating proper vk registration (option 2 from the "what does removing
+`WITHOUT_VK_VERIFICATION` actually break" conversation).
+
+**Free, local check (no nsac compute):** deserialized Succinct's shipped `vk_map.bin`
+directly (bypassing `RecursionVks::from_map`'s padding, which pads *both* the real map and
+the empty dummy map up to the same theoretical `create_all_input_shapes` total — so
+`num_keys()` alone is uninformative, both report the same number regardless of real
+content). Raw content: **185,862 real, pre-registered entries** (indices 0..185,861,
+contiguous) — which exactly equals the theoretical maximum for `max_compose_arity=4`. So
+Succinct's official map is a complete, exhaustive combinatorial catalog, not a small curated
+subset. This means "vk not allowed" for our programs is more likely a specific edge case
+(an actual shape/hash our execution produces that isn't among the 185,862) rather than an
+obvious, large coverage gap.
+
+**Added diagnostic** to confirm which: vendored `sp1-prover` (`vendor/sp1-prover`, new
+`[patch.crates-io]` entry) and patched the exact `"vk not allowed"` site
+(`src/recursion.rs`'s `open()`) to print the failing vk's digest (as u32s, comparable
+against the raw dump above) and the registered count, gated behind the existing
+`RECURSION_DIAG=1` convention. Added a `FORCE_VK_VERIFICATION=1` toggle in
+`script/src/bin/main.rs` so this can be tested without hand-editing/reverting the real fix -
+setting it falls back to default `vk_verification=true` + release circuit mode (reusing the
+already-cached official Groth16 artifacts, so genesis's spend proof should be fast, not
+another 15-minute rebuild).
+
+**Next step:** on nsac, run with `FORCE_VK_VERIFICATION=1 RECURSION_DIAG=1
+RUST_LOG=info cargo run --release -- --prove`, expect a fast failure at VFY-G16's first
+compress attempt (matching the very first crash of this whole investigation), and grep for
+`[VK-DIAG]` to get the actual failing digest.
+
+---
+
 ## Update 14: back to one consistent client, plus `SP1_CIRCUIT_MODE=dev` for spend's wrap step
 
 Update 13's two-client split (`client` for spend, `coinproof_verify_client` for coinproof
