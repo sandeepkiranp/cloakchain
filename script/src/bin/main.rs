@@ -621,6 +621,14 @@ fn main() {
     sp1_sdk::utils::setup_logger();
     dotenv::dotenv().ok();
 
+    // prove_subprocess() already sets this for the vfy-g16/coinproof proving subprocesses,
+    // but client.verify(...) calls in *this* (parent) process construct their own
+    // ProverClient::from_env() too - without this also set here, the parent verifies
+    // against the official vk_verification=true root while the child proved against the
+    // dummy vk_verification=false root, causing a spurious "vk_root mismatch" on every
+    // compressed-proof verify. Needs sp1-sdk's "experimental" feature (see Cargo.toml).
+    std::env::set_var("WITHOUT_VK_VERIFICATION", "1");
+
     let args = Args::parse();
 
     // Subprocess mode: prove one program and exit.  Memory is fully freed when

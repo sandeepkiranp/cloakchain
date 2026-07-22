@@ -1,5 +1,41 @@
 # SP1 6.2.3 DivF Crash — Diagnostic Summary
 
+## Update 12: the original `DivFOutOfDomain` crash is GONE — new, unrelated `vk_root mismatch` on verify
+
+Ran the full `--prove` pipeline on nsac with all three Groth16-verifier fixes in place. Result:
+
+- VFY-G16 took 472.7s (vs ~144s before) — consistent with it now running the *actual* full
+  pairing computation successfully instead of panicking partway through.
+- Coinproof's compress/deferred proving **completed with no crash at all** — no
+  `[RECURSION-DIAG]` post-mortem, no `DivFOutOfDomain`. The bug this entire investigation
+  started from is fixed.
+- But `client.verify(&proof, coinproof_pk.verifying_key(), None)` — called right after, in
+  `script/src/bin/main.rs`'s `run_coinproof_step` — now fails: `coin-proof verify failed:
+  Recursion(invalid public values: vk_root mismatch)`.
+
+**Root cause:** `WITHOUT_VK_VERIFICATION=1` was only ever set inside `prove_subprocess`'s
+child-process env (`cmd.env(...)`, added in Update 1/`ff2d51b`) — scoped to the subprocess
+that does the actual proving. But `client.verify(...)` runs in the **parent** process, using
+the parent's own `ProverClient::from_env()` (constructed without that env var). So the
+compressed proof was produced with the dummy (`vk_verification=false`) root, then verified
+against the official (`vk_verification=true`) root — a self-inflicted mismatch, not a real
+correctness bug. Traced the exact check: `sp1-prover-6.2.3/src/verify.rs:557-558`,
+`if public_values.vk_root != self.recursion_vks.root() { ... "vk_root mismatch" }`, reached
+via `sp1-sdk`'s `Prover::verify()` → `verify_proof()` → `node.verify(...)`
+(`sp1-sdk-6.2.3/src/prover.rs:257-262`, wrapping the error as `SP1VerificationError::Recursion`
+for compressed proofs — matching the exact error text seen).
+
+**Fix** (`script/src/bin/main.rs`): set `WITHOUT_VK_VERIFICATION=1` via `std::env::set_var`
+at the very start of `main()`, before any `ProverClient::from_env()` call in the parent
+process — so both proving (subprocess) and verifying (parent) consistently agree on
+`vk_verification=false`. Confirmed `std::env::set_var` compiles without `unsafe` under this
+project's edition/rustc combination (tested standalone).
+
+**Next step:** run `--prove` again on nsac. This should be the last thing standing between
+here and a clean end-to-end run.
+
+---
+
 ## Update 11: third and (hopefully) final bug found — sign errors in `verify_groth16`'s pairing equation
 
 Pulled the three dumped fixture files (`vfy_g16_fail_{proof_bytes.bin,pv_encode.bin,vkey_hash.txt}`)
