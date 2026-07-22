@@ -7,4 +7,5 @@ alloy-sol-types = "*"
 
 [patch.crates-io]
 sp1-recursion-executor = { path = "vendor/sp1-recursion-executor" }
+sp1-recursion-circuit = { path = "vendor/sp1-recursion-circuit" }
 

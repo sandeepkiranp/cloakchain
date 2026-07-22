@@ -4386,8 +4386,6 @@ dependencies = [
 [[package]]
 name = "sp1-recursion-circuit"
 version = "6.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19d9ce031605bc111474c11e7841536f3469311253791ef326ee16427e10178e"
 dependencies = [
  "bincode",
  "itertools 0.14.0",
