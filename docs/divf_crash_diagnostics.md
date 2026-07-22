@@ -1,5 +1,23 @@
 # SP1 6.2.3 DivF Crash — Diagnostic Summary
 
+## Update 4: the VFY-G16-DIAG print was incomplete — didn't check `report.exit_code`
+
+The `[VFY-G16-DIAG] execute OK: cycles=636698` line from the next run does **not** rule out
+`exit_code=1` after all. Confirmed directly from SP1 SDK's own test suite
+(`sp1-sdk-6.2.3/src/lib.rs:102-111`, `test_execute_panic`): `client.execute(PANIC_ELF,
+stdin).await.unwrap()` returns **`Ok`** even when the guest panics, with
+`report.exit_code == 1`. `execute()` only returns `Err` for actual executor-level faults
+(illegal instruction, OOM, etc.) — a clean `halt(1)` from a converted panic is a totally
+normal `Ok` result. So the diagnostic as first written (printing only cycle count) couldn't
+have distinguished "guest ran fine" from "guest panicked but converted to halt(1)" — it
+needed to print `report.exit_code` directly.
+
+**Fixed:** `script/src/bin/main.rs`'s `"vfy-g16"` branch now prints `report.exit_code`
+alongside cycle count. Re-run and check whether it's `0` or `1` — this is the actual
+confirmation needed for the `exit_code=1` hypothesis in Update 3 below.
+
+---
+
 ## Update 3: `contains_first_shard` was also wrong — real cause is `exit_code=1` in the deferred (VFY-G16) proof
 
 A second nsac run with the `contains_first_shard` print (marker `75xxxxxxx`) showed all 4

@@ -458,9 +458,13 @@ fn run_internal_prove(elf_id: &str, stdin_path: &std::path::Path, output_path: &
             // (mirroring the coinproof branch above) so any guest panic is visible here.
             match client.execute(VFY_G16_ELF, stdin.clone()).run() {
                 Ok((_, report)) => {
+                    // execute() returns Ok even when the guest panics (SP1 converts a
+                    // panic to a clean halt(1)) - report.exit_code is the only way to
+                    // actually see this; cycle count alone doesn't reveal it.
                     eprintln!(
-                        "[VFY-G16-DIAG] execute OK: cycles={}",
-                        report.total_instruction_count()
+                        "[VFY-G16-DIAG] execute OK: cycles={} exit_code={}",
+                        report.total_instruction_count(),
+                        report.exit_code
                     );
                 }
                 Err(e) => eprintln!("[VFY-G16-DIAG] execute FAILED: {e}"),
