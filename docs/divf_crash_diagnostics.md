@@ -1,5 +1,58 @@
 # SP1 6.2.3 DivF Crash — Diagnostic Summary
 
+## Update 2: the `vk_root` theory was wrong — real suspect is `contains_first_shard`
+
+With the `vk not allowed` blocker fixed (see below) and the print diagnostics from
+`compress.rs`/`deferred.rs` in place, coinproof reached the exact same
+`DivFOutOfDomain` crash (step 174554/174555, addr 316465) as originally reported. The
+`PRINTF=` output from the run (`~/coinproof_run.log`) shows:
+
+- Compress-batch `vk_root` check (marker `7000000xx`): **4 proofs (i=0..3), all matching**
+  — expected and actual `vk_root` are identical (8/8 words) for every entry.
+- Deferred-verifier `vk_root` check (marker `8000000xx`): **1 proof (idx 0), also matching.**
+
+So the multi-week `vk_root` mismatch hypothesis is **not the actual bug** — every vk_root
+comparison in the batch passes. The crash trace itself confirms this a different way: its
+post-mortem shows `in2_last_writer: step=1 [Mem::Write @316465=0x00000000]` — address
+316465 is the recursion program's single shared **compile-time zero constant**
+(`Imm::F(SP1Field::zero())`, cached by the compiler and reused as the divisor for every
+`assert_felt_eq(x, y)` → `SubF(diff,x,y); DivF(out,diff,ZERO)` in the whole program), not a
+witnessed `vk_root[1]` value. It was never going to change no matter what chip-activation
+fix was tried, because it was never derived from proof data in the first place.
+
+The crash trace shows exactly two more `SubF`/`DivF` pairs immediately after the (passing)
+8-word `vk_root` loop for batch index `i=3`:
+- step 174553/174554: `in1@194` vs `in2@317646` — **passes** (both dynamic values, equal).
+  This lines up with `C::range_check_felt(..., current_public_values.num_included_shard, ...)`
+  in `compress.rs`, which decomposes into bits then asserts the reconstruction matches.
+- step 174555 (crashes on the following `DivF`): `in1@196` vs `in2@316465` (the zero
+  constant) — this matches `compress.rs`'s very next check:
+  ```rust
+  // Verify that `contains_first_shard` is boolean.
+  builder.assert_felt_eq(
+      current_public_values.contains_first_shard
+          * (current_public_values.contains_first_shard - SP1Field::one()),
+      SP1Field::zero(),
+  );
+  ```
+  A literal `SP1Field::zero()` rhs is the signature of this exact check (not a
+  proof-to-proof comparison). `X * (X - 1) = 1` (the crashing value) implies
+  `current_public_values.contains_first_shard` for batch entry `i=3` is some field element
+  that is **neither 0 nor 1** — i.e. not boolean, for whichever proof (normalize or the
+  deferred-lifted one) sits at position 3 in this compress fold.
+
+**Added diagnostic** (`vendor/sp1-recursion-circuit/src/machine/compress.rs`): a
+`RECURSION_DIAG`-gated print of `(750_000_000 + i, contains_first_shard)` right before this
+assertion, to confirm the exact non-boolean value and which batch index it comes from on
+the next run. Grep the next log for `PRINTF=75` to find it (should be the very last
+`PRINTF=` line before the crash).
+
+If confirmed, the fix is in whichever code path produces `current_public_values` for batch
+index 3 (either a `get_normalize_witness`-derived proof or the deferred-lifted proof) —
+that path is failing to correctly set `contains_first_shard` to a clean 0/1 value.
+
+---
+
 ## Update: earlier, unrelated blocker — `vk not allowed`
 
 Before the `DivFOutOfDomain` crash below can even be reproduced, a first nsac run hit a

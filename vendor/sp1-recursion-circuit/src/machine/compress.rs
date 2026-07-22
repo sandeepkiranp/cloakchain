@@ -221,6 +221,16 @@ where
             );
 
             // Verify that `contains_first_shard` is boolean.
+            // RECURSION_DIAG: print (i, contains_first_shard) — the vk_root loop above
+            // already confirmed via print diagnostics that it isn't the source of the
+            // DivFOutOfDomain crash (all entries matched); this is the next assert_felt_eq
+            // in program order and its rhs is the literal `SP1Field::zero()` constant
+            // (matching the crash trace's `in2@316465`, the shared zero-constant address),
+            // so it's the prime suspect for the actual failing check.
+            if std::env::var("RECURSION_DIAG").map(|v| v == "1").unwrap_or(false) {
+                builder.print_debug(750_000_000 + i);
+                builder.print_f(current_public_values.contains_first_shard);
+            }
             builder.assert_felt_eq(
                 current_public_values.contains_first_shard
                     * (current_public_values.contains_first_shard - SP1Field::one()),
