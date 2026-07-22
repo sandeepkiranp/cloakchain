@@ -466,13 +466,38 @@ fn run_internal_prove(elf_id: &str, stdin_path: &std::path::Path, output_path: &
                         report.total_instruction_count(),
                         report.exit_code
                     );
-                    // On exit_code!=0 the guest commits a debug string (via commit_slice)
-                    // instead of the normal pv_encode - guest println!/stdout isn't reliably
-                    // visible through execute() in this build (confirmed empirically).
+                    // On exit_code!=0 the guest commits, in order: a length-prefixed dump
+                    // of (proof_bytes, pv_encode, spend_vkey_hash) - the exact inputs that
+                    // failed verification - followed by the panic hook's own debug message.
+                    // Save the dumped fields to disk so they can be pulled off-machine and
+                    // replayed against both verifiers locally.
                     if report.exit_code != 0 {
+                        let bytes = output.as_slice();
+                        let mut offset = 0usize;
+                        let mut fields = Vec::new();
+                        while offset + 4 <= bytes.len() {
+                            let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+                            offset += 4;
+                            if offset + len > bytes.len() {
+                                offset -= 4; // roll back so the tail print below starts at the right spot
+                                break;
+                            }
+                            fields.push(&bytes[offset..offset + len]);
+                            offset += len;
+                        }
+                        if fields.len() == 3 {
+                            let tmp = std::env::temp_dir();
+                            std::fs::write(tmp.join("vfy_g16_fail_proof_bytes.bin"), fields[0]).ok();
+                            std::fs::write(tmp.join("vfy_g16_fail_pv_encode.bin"), fields[1]).ok();
+                            std::fs::write(tmp.join("vfy_g16_fail_vkey_hash.txt"), fields[2]).ok();
+                            eprintln!(
+                                "[VFY-G16-DIAG] dumped failing inputs to {}/vfy_g16_fail_*",
+                                tmp.display()
+                            );
+                        }
                         eprintln!(
                             "[VFY-G16-DIAG] committed output (exit_code!=0): {}",
-                            String::from_utf8_lossy(output.as_slice())
+                            String::from_utf8_lossy(&bytes[offset..])
                         );
                     }
                 }

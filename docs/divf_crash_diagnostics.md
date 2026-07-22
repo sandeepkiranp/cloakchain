@@ -1,5 +1,47 @@
 # SP1 6.2.3 DivF Crash — Diagnostic Summary
 
+## Update 10: both crashes fixed — now a clean "verification returned false"
+
+The Update 9 fix worked too — no more panics in the vendored crypto crates, and cycle count
+nearly doubled again (1,799,347 → 3,499,757), confirming the *entire* pairing computation
+now runs to completion. This time the guest gets a clean `Result::Err`, not a crash:
+
+```
+[VFY-G16-PANIC] Groth16 spend proof verification failed: Groth16 verification returned false
+  proof_bytes.len()=356  pv_encode.len()=104
+  spend_vkey_hash=0x00688dfe95bcefba92a212105169d1dc89c198f997c41024d2bcede417bc947e
+  at program-vfy-g16/src/main.rs:37
+```
+
+So `Groth16Verifier::verify` (`vendor/snark-bn254-verifier`) ran the full pairing check and
+got `Ok(false)` — the proof genuinely doesn't verify against these inputs/VK, by this
+verifier's math. But SP1's own official verifier already accepted this exact proof earlier
+in the pipeline (`client.verify(&genesis_proof, ...)` in `script/src/bin/main.rs`), so this
+is a real discrepancy between `snark-bn254-verifier`'s conventions and what SP1's gnark
+backend actually produces — likely a point-encoding, endianness, or sign-convention mismatch
+somewhere in `vendor/snark-bn254-verifier`'s proof/VK parsing or pairing equation, rather
+than another isolated panic-fixable bug like the last two.
+
+Everything checked so far by direct comparison against the official `sp1-verifier` reference
+(byte layout, hash scheme, public input order, VK bytes) has matched — so pinning this down
+needs real test vectors compared side-by-side against the official verifier, not more
+static reading.
+
+**Added diagnostic** (`program-vfy-g16/src/main.rs`, `script/src/bin/main.rs`): on
+verification failure, the guest now `commit_slice`s a length-prefixed dump of the exact
+`(spend_proof_bytes, pv_encode, spend_vkey_hash)` that failed, immediately before the panic
+hook's own message (both accumulate in the same public-values stream). The host parses this
+back apart and writes the three fields to
+`$TMPDIR/vfy_g16_fail_{proof_bytes.bin,pv_encode.bin,vkey_hash.txt}` — pull these off nsac
+and they can be replayed locally (no zkVM needed, this is pure host-side crypto) against both
+`groth16-verifier::verify_sp1_spend_proof` and the official `sp1-verifier` crate's
+`Groth16Verifier::verify` to see exactly where they diverge.
+
+**Next step:** run on nsac, then pull `/tmp/vfy_g16_fail_*` (or wherever `$TMPDIR` resolves)
+back for local comparison against the reference verifier.
+
+---
+
 ## Update 9: second, independent bug — `AffineG1 * Fr::zero()` panics in `substrate-bn`
 
 Update 8's fix worked — the `constants.rs:24` panic is gone, and cycle count nearly tripled

@@ -34,6 +34,17 @@ pub fn main() {
 
     if !spend_proof_bytes.is_empty() {
         if let Err(reason) = verify_sp1_spend_proof(&spend_proof_bytes, &pv_encode, &spend_vkey_hash) {
+            // Dump the exact inputs that failed so they can be pulled off-machine and
+            // replayed against both the official sp1-verifier and this custom verifier
+            // locally - "verification returned false" (as opposed to a panic) means the
+            // crypto math ran to completion but didn't match, which needs real test
+            // vectors to debug further, not more panic-location diagnostics.
+            let mut dump = Vec::new();
+            for field in [spend_proof_bytes.as_slice(), pv_encode.as_slice(), spend_vkey_hash.as_bytes()] {
+                dump.extend_from_slice(&(field.len() as u32).to_le_bytes());
+                dump.extend_from_slice(field);
+            }
+            sp1_zkvm::io::commit_slice(&dump);
             panic!(
                 "Groth16 spend proof verification failed: {reason}  \
                  proof_bytes.len()={}  pv_encode.len()={}  spend_vkey_hash={spend_vkey_hash}",
