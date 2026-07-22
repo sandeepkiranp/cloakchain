@@ -163,34 +163,6 @@ impl ExecDiag {
         }
     }
 
-    // Called at the END of a successful run to show the proof-input layout.
-    fn dump_init(&self) {
-        if !self.active {
-            return;
-        }
-        eprintln!("\n[RECURSION-DIAG-INIT] ── First {} Mem::Writes (proof input layout, SUCCESS) ──",
-            INIT_DUMP_STEPS);
-        for &(s, addr, val) in &self.init_mem_writes {
-            let marker = if addr == 316465 { " ◄◄◄ addr316465" } else { "" };
-            eprintln!("[RECURSION-DIAG-INIT]   step={s:>6}  addr={addr:>8}  val={val:#010x}{marker}");
-        }
-        eprintln!("[RECURSION-DIAG-INIT]   ({} writes captured, {} total steps)",
-            self.init_mem_writes.len(), self.step);
-        self.dump_hint_watched("[RECURSION-DIAG-INIT]");
-        eprintln!("[RECURSION-DIAG-INIT] ──────────────────────────────────────────────\n");
-    }
-
-    fn dump_hint_watched(&self, prefix: &str) {
-        eprintln!("{prefix} ── Hint writes to watched addrs ({} total hints) ──", self.hint_seq);
-        if self.hint_watched.is_empty() {
-            eprintln!("{prefix}   (none — watched addresses never written by Hint)");
-        }
-        for &(seq, addr, [v0, v1, v2, v3]) in &self.hint_watched {
-            eprintln!("{prefix}   hint#{seq:>8}  addr={addr:>8}  \
-                block=({v0:#010x},{v1:#010x},{v2:#010x},{v3:#010x})");
-        }
-    }
-
     fn dump(&self, label: &str) {
         if !self.active {
             return;
@@ -1093,9 +1065,6 @@ where
                 Some(&mut self.witness_stream),
             )
         }?;
-
-        // On success: dump init_mem_writes so we can compare with failing runs.
-        EXEC_DIAG.with(|d| d.borrow().dump_init());
 
         self.record = record;
 
