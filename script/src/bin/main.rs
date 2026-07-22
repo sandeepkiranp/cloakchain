@@ -457,7 +457,7 @@ fn run_internal_prove(elf_id: &str, stdin_path: &std::path::Path, output_path: &
             // coinproof's deferred verifier asserts exit_code==0. Run execute() first
             // (mirroring the coinproof branch above) so any guest panic is visible here.
             match client.execute(VFY_G16_ELF, stdin.clone()).run() {
-                Ok((_, report)) => {
+                Ok((output, report)) => {
                     // execute() returns Ok even when the guest panics (SP1 converts a
                     // panic to a clean halt(1)) - report.exit_code is the only way to
                     // actually see this; cycle count alone doesn't reveal it.
@@ -466,6 +466,15 @@ fn run_internal_prove(elf_id: &str, stdin_path: &std::path::Path, output_path: &
                         report.total_instruction_count(),
                         report.exit_code
                     );
+                    // On exit_code!=0 the guest commits a debug string (via commit_slice)
+                    // instead of the normal pv_encode - guest println!/stdout isn't reliably
+                    // visible through execute() in this build (confirmed empirically).
+                    if report.exit_code != 0 {
+                        eprintln!(
+                            "[VFY-G16-DIAG] committed output (exit_code!=0): {}",
+                            String::from_utf8_lossy(output.as_slice())
+                        );
+                    }
                 }
                 Err(e) => eprintln!("[VFY-G16-DIAG] execute FAILED: {e}"),
             }

@@ -1,5 +1,37 @@
 # SP1 6.2.3 DivF Crash — Diagnostic Summary
 
+## Update 6: guest `println!` isn't visible through `execute()` — switched to `commit_slice`
+
+The Update 5 run confirmed `exit_code=1` again but the `[VFY-G16-GUEST]` println! text never
+appeared anywhere in the log — grepping the full log for `stdout:` (the prefix
+`sp1-core-executor-6.2.3/src/minimal/write.rs`'s `handle_output` uses when forwarding guest
+fd 1/2 writes via `eprintln!`) turned up **zero** matches, for any guest program, not just
+VFY-G16. So guest stdout capture isn't reliably wired up in this `execute()` path in this
+build — not something worth chasing further.
+
+Also worth noting along the way: `[COINPROOF-DIAG] execute FAILED: deferred proof 0 failed
+verification: invalid public values: vk_root mismatch` (from coinproof's own execute() call)
+looked alarming but is a **red herring** — traced to
+`sp1-prover-6.2.3/src/worker/prover/execute.rs:124-126`, a diagnostic-only deferred-proof
+sanity check that's hardcoded to `VerifierRecursionVks::default()` (the official
+vk_verification=true root) whenever the `mprotect` feature isn't enabled — completely
+ignoring our `WITHOUT_VK_VERIFICATION=1` setting. Since we're proving in dummy-vk mode, this
+check will *always* report a mismatch regardless of whether anything is actually wrong; it's
+non-fatal (just logged) and proving proceeds to the same crash as before either way.
+
+**Fixed** (`program-vfy-g16/src/main.rs`): instead of `println!`, the guest now
+`sp1_zkvm::io::commit_slice`s a debug string (built with `format!`, since this guest isn't
+`#![no_std]`) before panicking on `Err`. `commit_slice` is a direct syscall write to the
+public-values stream, which takes effect before the panic halts execution — so it survives
+even though the guest never returns normally. `script/src/bin/main.rs`'s `"vfy-g16"` branch
+now reads `output.as_slice()` (previously discarded via `Ok((_, report))`) and prints it as
+UTF-8 whenever `report.exit_code != 0`.
+
+**Next step:** run on nsac again and grep for `VFY-G16-DIAG` — the "committed output"
+line should finally contain the real `verify_sp1_spend_proof` failure reason.
+
+---
+
 ## Update 5: `exit_code=1` confirmed — need the actual failure reason from inside the guest
 
 nsac's next run confirmed it directly: `[VFY-G16-DIAG] execute OK: cycles=636698
