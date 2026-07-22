@@ -1,5 +1,55 @@
 # SP1 6.2.3 DivF Crash — Diagnostic Summary
 
+## Update 14: back to one consistent client, plus `SP1_CIRCUIT_MODE=dev` for spend's wrap step
+
+Update 13's two-client split (`client` for spend, `coinproof_verify_client` for coinproof
+verification) fixed the immediate `vk_root mismatch` on `client.verify(...)`, but hit a new
+wall one step later: Alice's **slot 1** spend proof — the first spend proof in the whole
+pipeline to fold in a prior coinproof proof as a deferred proof (`stdin.write_proof(*ac,
+coinproof_pk.verifying_key().vk.clone())`) — crashed with the same `DivFOutOfDomain`
+signature (addr 316463/316464/316465) *inside spend's own recursion tree*, while trying to
+fold that deferred coinproof proof in. Root cause: spend's process used the official
+`vk_verification=true` root (needed for its Groth16 wrap step, per Update 13), but the
+coinproof proof it was folding carried the dummy `vk_verification=false` root — an
+unavoidable mismatch as long as the two settings differ between the two proofs meeting at
+that fold point.
+
+**The fix, once fully worked out:** SP1's dummy root is deterministic — it depends only on
+the shape catalog (`max_compose_arity`), not on which ELF is running — so if *every* program
+(spend included) consistently uses `WITHOUT_VK_VERIFICATION=1`, all the recursion-level
+`vk_root` checks agree everywhere, including at this fold point. That leaves only the
+Groth16 wrap circuit itself, which (per Update 13) hardcodes an expectation tied to
+Succinct's official root — but SP1 ships exactly the escape hatch needed for that:
+`SP1_CIRCUIT_MODE=dev` (`sp1-prover-6.2.3/src/build.rs`), which rebuilds the wrap circuit
+**locally** to match whatever root the current process actually has, instead of downloading
+Succinct's fixed official artifact.
+
+**Fix** (`script/src/bin/main.rs`, config/env-var only — no proof-verification or circuit
+logic touched, per explicit instruction):
+- Reverted Update 13's two-client split back to a single `client`, used everywhere as before
+  Update 12 ever started.
+- Set both `WITHOUT_VK_VERIFICATION=1` and `SP1_CIRCUIT_MODE=dev` once, process-wide, at the
+  top of `main()` — inherited by every subprocess (`prove_subprocess`'s
+  `.envs(std::env::vars())`), spend included, so every proof in the pipeline consistently
+  agrees on the same dummy root and the wrap circuit is rebuilt to match it.
+- Removed the now-redundant per-elf-type `.env("WITHOUT_VK_VERIFICATION", "1")` overrides in
+  `prove_subprocess` (still inherited from the parent; `SHARD_SIZE`/`RECURSION_DIAG` stay,
+  since those genuinely are per-elf-type specific).
+
+**Important caveat, called out explicitly in the code and here:** both of these are
+documented dev/test-only mechanisms in SP1 — the dummy root isn't a registered/audited vk
+set, and `SP1_CIRCUIT_MODE=dev`'s locally-built Groth16 circuit uses a local, non-ceremony
+trusted setup rather than Succinct's official one. This is the right call for getting the
+pipeline itself working correctly end-to-end (which is what's been under test this whole
+investigation), but the resulting proofs should not be treated as production/mainnet-grade
+without separately addressing vk registration.
+
+**Next step:** run `--prove` on nsac. First run will pay a one-time cost for SP1 to locally
+build the dev Groth16 circuit (cached afterward under `~/.sp1/circuits/`); expect this to
+take noticeably longer than previous runs on the first spend-with-deferred-proof step.
+
+---
+
 ## Update 13: Update 12's global fix broke genesis spend proving — scoped it to a second client
 
 Update 12's `std::env::set_var("WITHOUT_VK_VERIFICATION", "1")` at the top of `main()` was too
