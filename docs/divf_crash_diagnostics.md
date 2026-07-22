@@ -1,5 +1,27 @@
 # SP1 6.2.3 DivF Crash — Diagnostic Summary
 
+## Update 5: `exit_code=1` confirmed — need the actual failure reason from inside the guest
+
+nsac's next run confirmed it directly: `[VFY-G16-DIAG] execute OK: cycles=636698
+exit_code=1`. So VFY-G16's guest does halt with exit_code=1 — the hypothesis in Update 3 is
+correct. However, no panic message text appeared anywhere in the log — SP1 doesn't surface a
+guest's internal panic string during `execute()`/`prove()` by default, so we don't yet know
+*which* branch of `verify_sp1_spend_proof` failed (`Err("proof bytes too short")` /
+`Err("Fr conversion failed")` / `Ok(false)` → `"Groth16 verification returned false"` /
+`Err(_)` → `"Groth16 pairing check failed"` — each points to a very different bug).
+
+**Fixed** (`program-vfy-g16/src/main.rs`): replaced the blind `.expect(...)` with an explicit
+match that `println!`s the exact error string plus `proof_bytes.len()`/`pv_encode.len()`/
+`spend_vkey_hash` before panicking. Guest `println!` output is visible on stdout during
+`client.execute(...)` (confirmed compiling on the host target — `sp1-zkvm`'s guest runtime
+provides a working `println!`/`panic!`, no `#![no_std]` here).
+
+**Next step:** run on nsac again and grep for `VFY-G16-GUEST` — this will finally show the
+exact error string, which narrows the fix to a specific branch in `groth16-verifier/src/lib.rs`
+/ `vendor/snark-bn254-verifier`.
+
+---
+
 ## Update 4: the VFY-G16-DIAG print was incomplete — didn't check `report.exit_code`
 
 The `[VFY-G16-DIAG] execute OK: cycles=636698` line from the next run does **not** rule out
