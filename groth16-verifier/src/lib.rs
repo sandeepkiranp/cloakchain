@@ -110,3 +110,25 @@ fn nibble(b: u8) -> Result<u8, &'static str> {
         _ => return Err("invalid hex char in vkey hash"),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::verify_sp1_spend_proof;
+
+    // Real genesis-mint spend proof captured from a failing nsac run (see
+    // docs/divf_crash_diagnostics.md, Update 10) - independently confirmed valid by SP1's
+    // own official verifier (sp1-verifier, ark-bn254 based) at the time it was captured.
+    // Regression test for the vendored snark-bn254-verifier sign-convention bug: verify_groth16
+    // negated g2.beta during VK parsing and used +gamma in the pairing equation, when the
+    // correct standard Groth16 relation e(A,B) == e(alpha,beta)*e(vk_x,gamma)*e(C,delta)
+    // needs beta un-negated and gamma negated in the batched-pairing-vs-identity formulation.
+    #[test]
+    fn verifies_real_genesis_spend_proof() {
+        let proof_bytes = include_bytes!("../test-fixtures/valid_spend_proof_bytes.bin");
+        let pv_encode = include_bytes!("../test-fixtures/valid_spend_pv_encode.bin");
+        let vkey_hash = include_str!("../test-fixtures/valid_spend_vkey_hash.txt").trim();
+
+        verify_sp1_spend_proof(proof_bytes, pv_encode, vkey_hash)
+            .expect("known-valid SP1 Groth16 spend proof must verify");
+    }
+}

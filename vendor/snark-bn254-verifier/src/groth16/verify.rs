@@ -72,7 +72,7 @@ pub fn verify_groth16(
 
     Ok(pairing_batch(&[
         (proof.ar.into(), proof.bs.into()),
-        (prepared_inputs, vk.g2.gamma.into()),
+        (prepared_inputs, -Into::<G2>::into(vk.g2.gamma)),
         (proof.krs.into(), -Into::<G2>::into(vk.g2.delta)),
     ]) == alpha_g1_beta_g2)
 }

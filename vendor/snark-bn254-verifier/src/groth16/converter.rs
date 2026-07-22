@@ -76,7 +76,7 @@ pub(crate) fn load_groth16_verifying_key_from_bytes(
             k,
         },
         g2: Groth16G2 {
-            beta: -g2_beta,
+            beta: g2_beta,
             gamma: g2_gamma,
             delta: g2_delta,
         },

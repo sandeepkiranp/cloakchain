@@ -1,5 +1,59 @@
 # SP1 6.2.3 DivF Crash — Diagnostic Summary
 
+## Update 11: third and (hopefully) final bug found — sign errors in `verify_groth16`'s pairing equation
+
+Pulled the three dumped fixture files (`vfy_g16_fail_{proof_bytes.bin,pv_encode.bin,vkey_hash.txt}`)
+off nsac and compared our custom verifier against the official `sp1-verifier` crate
+side-by-side, in a standalone scratch project (no zkVM needed — this is pure host-side crypto).
+
+**Ruled out via direct experiments**, in order:
+- VK staleness — not it (already confirmed byte-identical to nsac's cache in Update 8).
+- Byte layout / hash scheme — official crate's `verify()` succeeds on this proof, so the data
+  is valid; separately confirmed our hash is SHA256 (not Blake3 — official crate tries both,
+  SHA256-only manual reconstruction succeeded, Blake3-only manual reconstruction failed).
+- Fundamental `substrate-bn` pairing math — bilinearity (`e(aP,Q)==e(P,aQ)`) holds, and
+  `pairing_batch` matches the manual product of individual pairings. Core crypto stack sound.
+- **Point parsing** — directly compared parsed coordinates between our `substrate-bn` parsing
+  and the official `ark-bn254` parsing, for all four point-encoding paths used anywhere in
+  this verifier (compressed G1, uncompressed G1, uncompressed G2, compressed G2). All four
+  matched byte-for-byte. Parsing is not the bug.
+- Two isolated sign-flip attempts (removing the `beta` negation alone; negating `gamma`
+  alone) — neither changed the result. This was the confusing part until doing the math by
+  hand: **two independent sign errors compensate for each other's absence**, so testing them
+  one at a time never shows any effect.
+
+**Root cause, confirmed via direct derivation:** built a standalone manual implementation of
+the *unmodified* standard Groth16 relation — `e(A,B) == e(alpha,beta)·e(vk_x,gamma)·e(C,delta)`,
+no negations anywhere — using the same confirmed-correct point parsing, and it matched
+(`MATCH: true`) on the real (previously-failing) proof data. `vendor/snark-bn254-verifier`'s
+actual `verify_groth16()` (`groth16/verify.rs`) instead computes a *differently signed*
+formulation: it pre-negates `g2.beta` during VK parsing (`groth16/converter.rs`) and uses
+`+gamma` (not negated) in the batched-pairing-vs-`alpha_g1_beta_g2` comparison. Working the
+algebra through by hand, that formulation is only equivalent to the standard relation if
+`gamma` is negated *and* `beta` is *not* pre-negated — i.e. exactly two sign flips relative
+to what the code had, which is why toggling either one alone left verification unchanged.
+
+**Fix:**
+- `vendor/snark-bn254-verifier/src/groth16/converter.rs` — `g2.beta` no longer pre-negated
+  during parsing (`beta: g2_beta` instead of `beta: -g2_beta`). (`g1.beta` is parsed but never
+  read anywhere in `verify_groth16`, confirmed via grep — left as-is, dead code either way.)
+- `vendor/snark-bn254-verifier/src/groth16/verify.rs` — `gamma` now negated in the
+  `pairing_batch` call (`-Into::<G2>::into(vk.g2.gamma)` instead of `vk.g2.gamma.into()`).
+
+**Verified**: the scratch comparison now shows `CUSTOM: Ok(())` matching `OFFICIAL: Ok(())`
+on the real proof data. Turned this into a **permanent regression test**
+(`groth16-verifier/src/lib.rs`'s `tests::verifies_real_genesis_spend_proof`, using the
+captured proof/pv/vkey fixture files now committed under `groth16-verifier/test-fixtures/`)
+— passes (`cargo test -p cloakkchain-groth16-verifier`).
+
+**Next step:** run the full `--prove` pipeline on nsac. This is the third bug found in the
+`groth16-verifier`/`snark-bn254-verifier`/`substrate-bn` stack (after the padding-offset panic
+in Update 8 and the zero-scalar-multiplication panic in Update 9) — if there isn't a fourth,
+VFY-G16 should finally produce `exit_code=0`, and the original `DivFOutOfDomain` crash this
+whole investigation started from should be gone.
+
+---
+
 ## Update 10: both crashes fixed — now a clean "verification returned false"
 
 The Update 9 fix worked too — no more panics in the vendored crypto crates, and cycle count
