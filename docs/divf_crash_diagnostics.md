@@ -1,5 +1,48 @@
 # SP1 6.2.3 DivF Crash — Diagnostic Summary
 
+## Update 9: second, independent bug — `AffineG1 * Fr::zero()` panics in `substrate-bn`
+
+Update 8's fix worked — the `constants.rs:24` panic is gone, and cycle count nearly tripled
+(636,726 → 1,799,347), confirming execution got much further into real curve arithmetic
+before hitting a **second, different** panic:
+
+```
+[VFY-G16-PANIC] called `Option::unwrap()` on a `None` value at vendor/substrate-bn/src/groups/mod.rs:320
+```
+
+`impl Mul<Fr> for AffineG1` (`vendor/substrate-bn/src/groups/mod.rs:301-322`) computes
+scalar multiplication via double-and-add over the scalar's bits, starting `res: Option<AffineG1>
+= None` and only ever setting it `Some` when a bit is `1`. If the scalar (`Fr`) is **zero**,
+no bit is ever `1`, so `res` stays `None` for the whole loop, and the final `res.unwrap()`
+panics — instead of returning the point at infinity (the mathematically correct result of
+`P * 0` for any point `P`).
+
+This matters here specifically because `snark-bn254-verifier`'s `prepare_inputs` (Groth16's
+standard `vk.g1.k[0] + Σ input_i * vk.g1.k[i+1]` linear combination) calls exactly this
+multiplication for every public input, and one of our 5 public inputs is `exit_code` — which
+is **zero in the normal, successful case** (confirmed: the genesis proof's own `exit_code`
+must be `0`, since SP1's own official verifier already accepted it via `client.verify(...)`
+earlier in `script/src/bin/main.rs`). So this isn't an edge case that can be assumed away —
+it's the *expected* value for any correctly-behaving spend proof.
+
+**Fix** (`vendor/substrate-bn/src/groups/mod.rs`): `res.unwrap_or_else(Self::zero)` instead
+of `res.unwrap()`. `AffineG<P>::zero()` is already the crate's own point-at-infinity
+convention (`(x: 0, y: 1)`), and `Add<AffineG1>` already special-cases `Self::zero()` as the
+identity (`if other == Self::zero() { return self; }`), so this composes correctly with the
+rest of `prepare_inputs`'s fold — adding `k_i * 0` becomes a no-op, exactly as required.
+
+**Verified locally**: added a temporary scratch test in
+`vendor/substrate-bn/src/groups/tests.rs` asserting `AffineG1::one() * Fr::zero() ==
+AffineG1::zero()` and that adding it to an accumulator is a no-op — passed
+(`cargo test -p substrate-bn scratch_affine_g1_mul_by_zero_scalar`), then removed (`git diff`
+on that file is empty).
+
+**Next step:** run the full `--prove` pipeline on nsac again. Two independent bugs down;
+this may well be the last one standing between here and the deferred proof finally carrying
+`exit_code=0`.
+
+---
+
 ## Update 8: root cause found and fixed — `build_padded_vk()`'s 4-byte misalignment
 
 The panic hook worked immediately:

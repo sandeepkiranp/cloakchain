@@ -317,7 +317,13 @@ impl Mul<Fr> for AffineG1 {
             }
         }
 
-        res.unwrap()
+        // `other == Fr::zero()` means every bit is 0, so the loop above never sets `res` -
+        // the mathematically correct result of `P * 0` is the point at infinity (the group
+        // identity), not a panic. This matters here because SP1's Groth16 public inputs
+        // legitimately include values that are zero in the common/successful case (e.g.
+        // exit_code=0), so scalar-zero point multiplication isn't an edge case that can be
+        // assumed away in a Groth16 linear combination over these inputs.
+        res.unwrap_or_else(Self::zero)
     }
 }
 
