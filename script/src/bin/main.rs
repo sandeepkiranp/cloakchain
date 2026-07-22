@@ -383,11 +383,17 @@ fn prove_subprocess(elf_id: &str, stdin: &SP1Stdin) -> SP1ProofWithPublicValues 
     match elf_id {
         "vfy-g16" => {
             cmd.env("SHARD_SIZE", "262144")  // 1<<18; ~636K cycles ≈ 3 shards
-               .env("RECURSION_DIAG", "1"); // compare init dump with coinproof
+               .env("RECURSION_DIAG", "1")   // compare init dump with coinproof
+               // These are custom guest programs, so their recursion-circuit shapes
+               // aren't in SP1's shipped vk_map.bin; vk_verification=true (the
+               // default) rejects them with a "vk not allowed" Fatal error before
+               // any proving happens. Requires sp1-sdk's "experimental" feature.
+               .env("WITHOUT_VK_VERIFICATION", "1");
         }
         "coinproof" => {
             cmd.env("SHARD_SIZE", "262144")  // 1<<18; ~3M cycles ≈ 12 shards
-               .env("RECURSION_DIAG", "1"); // watch addr 316465 init dump
+               .env("RECURSION_DIAG", "1")   // watch addr 316465 init dump
+               .env("WITHOUT_VK_VERIFICATION", "1");
         }
         _ => {}
     }

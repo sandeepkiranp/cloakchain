@@ -1,5 +1,45 @@
 # SP1 6.2.3 DivF Crash — Diagnostic Summary
 
+## Update: earlier, unrelated blocker — `vk not allowed`
+
+Before the `DivFOutOfDomain` crash below can even be reproduced, a first nsac run hit a
+**different, earlier** failure during VFY-G16 compression (before coinproof is even reached):
+
+```
+ERROR task failed with fatal error: vk not allowed
+ERROR Controller: task failed: Fatal(Reduction task local_worker_... failed)
+```
+
+This is not a runtime ASM crash — it's `RecursionVks::open()`/`verify()` in
+`sp1-prover-6.2.3/src/worker/prover/recursion.rs` rejecting a recursion-circuit
+verifying-key hash that isn't present in SP1's embedded `vk_map.bin` allow-list. That
+check is controlled by `vk_verification`, which **defaults to `true`** for the CPU
+prover (`RecursionProverConfig::default()`), meaning every normalize/compress/deferred/
+shrink shape produced while proving a custom program must already be registered in
+Succinct's shipped map. VFY-G16 and coinproof are custom, BN254-heavy guest programs —
+not part of that registered set — so this fails immediately.
+
+SP1 ships an escape hatch for exactly this (local/dev proving of custom programs):
+`WITHOUT_VK_VERIFICATION=1`, read in `cpu_worker_builder_with_machine`
+(`sp1-prover-6.2.3/src/worker/builder.rs:328`) — **but only when compiled with
+`sp1-prover`'s `experimental` Cargo feature**, which `script/Cargo.toml` did not enable.
+Without it, the whole `#[cfg(feature = "experimental")]` block (including the env var
+check) is compiled out and `vk_verification` can never be turned off.
+
+**Fix applied:**
+- `script/Cargo.toml` — added `"experimental"` to `sp1-sdk`'s feature list.
+- `script/src/bin/main.rs` (`prove_subprocess`) — added `.env("WITHOUT_VK_VERIFICATION", "1")`
+  alongside the existing `SHARD_SIZE`/`RECURSION_DIAG` env vars for both the `vfy-g16` and
+  `coinproof` subprocess branches.
+
+This should let proving get past VFY-G16 and back to reproducing the `DivFOutOfDomain`
+crash described below (if it's still present — note that running with
+`vk_verification=false` also changes `RecursionVks` to its `dummy()` mode, i.e. a
+padding-index-based root rather than a real vk-hash Merkle tree, which may itself
+interact with the `vk_root` mismatch investigation below).
+
+---
+
 ## The Crash
 
 **Error:** `RuntimeError::DivFOutOfDomain { in1: 1, in2: 0 }`  
