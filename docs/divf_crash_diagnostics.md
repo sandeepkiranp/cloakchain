@@ -1,5 +1,35 @@
 # SP1 6.2.3 DivF Crash — Diagnostic Summary
 
+## Update 7: it's a raw panic inside `verify_sp1_spend_proof`, not a clean `Err` — added a panic hook
+
+The Update 6 run showed `[VFY-G16-DIAG] execute OK: cycles=636726 exit_code=1` again, but SP1's
+own trace line right before it — `public_value_stream: []` — is **empty**. That means the
+`commit_slice` call inside `if let Err(reason) = verify_sp1_spend_proof(...)` never ran: the
+`if let Err` branch was never entered at all. So `verify_sp1_spend_proof` isn't returning a
+clean `Err` — it's **panicking internally** (a slice/array bounds panic, `.unwrap()`, integer
+overflow, etc., somewhere inside the call chain into the vendored `snark-bn254-verifier`/`bn`
+crates), which bypasses the `Result`-based handling entirely. Confirmed consistent with
+`sp1-zkvm-6.2.3/src/lib.rs`'s own comment: "`panic!` already routes through
+`syscall_halt(1)`" — i.e. *every* panic, regardless of origin, funnels to the same silent
+`halt(1)`, with no message surfaced anywhere by default.
+
+**Fixed** (`program-vfy-g16/src/main.rs`): install a `std::panic::set_hook` at the very start
+of `main()`, before anything else runs. Panic hooks run on *any* panic in the current thread
+regardless of where it originates — unlike matching on `Result::Err`, this doesn't depend on
+the failure being a clean, caught error. The hook extracts the panic payload (`&str`/`String`)
+and location (`file:line`), formats them, and `commit_slice`s the result — this executes
+before whatever target-specific abort mechanism (`syscall_halt(1)`) takes over. No
+`#[panic_handler]` was found anywhere in `sp1-zkvm`/`sp1-lib` that would conflict with a
+normal std panic hook (this guest isn't `#![no_std]`), so standard hook semantics should
+apply.
+
+**Next step:** run on nsac again and grep for `VFY-G16-DIAG` — the "committed output" line
+should now contain the real panic message and source location, finally pinpointing exactly
+which line inside `groth16-verifier`/`vendor/snark-bn254-verifier`/`vendor/substrate-bn` is
+panicking.
+
+---
+
 ## Update 6: guest `println!` isn't visible through `execute()` — switched to `commit_slice`
 
 The Update 5 run confirmed `exit_code=1` again but the `[VFY-G16-GUEST]` println! text never
