@@ -1,5 +1,56 @@
 # SP1 6.2.3 DivF Crash — Diagnostic Summary
 
+## Update 8: root cause found and fixed — `build_padded_vk()`'s 4-byte misalignment
+
+The panic hook worked immediately:
+
+```
+[VFY-G16-PANIC] Invalid compressed point flag at vendor/snark-bn254-verifier/src/constants.rs:24
+```
+
+That's `CompressedPointFlag::from(u8)` panicking because a byte's top 2 bits didn't match any
+of the 3 valid flag patterns (`Positive`/`Negative`/`Infinity`). This lines up exactly with
+the "off-by-4-byte" issue found in Update 5/investigation and dismissed as harmless — it
+*was* the bug, just not in the way first assumed.
+
+**Root cause:** `vendor/snark-bn254-verifier/src/groth16/converter.rs`'s
+`load_groth16_verifying_key_from_bytes` reads, in order: `g1_alpha(32) + g1_beta(32) +
+g2_beta(64) + g2_gamma(64) + g1_delta(32) + g2_delta(64)` = 288 bytes, then `num_k(4) +
+k[0..num_k](32 each)`, then `num_of_array_of_public_and_commitment_committed(4)`. For SP1's
+VK (5 public inputs → `num_k=6`, confirmed by reading bytes `[288..292]` of the actual VK
+file) that's `288 + 4 + 32*6 + 4 = 488` bytes of real content — but `groth16-verifier`'s old
+`build_padded_vk()` appended the dummy commitment-key padding starting at `VK_LEN = 492`
+(the file's raw byte length) instead of this real 488-byte boundary. The 4-byte gap meant the
+parser read the VK file's own trailing 4 bytes (`00 00 00 00` — not part of any field this
+parser reads) as the start of `commitment_key_g`, whose flag byte (`0x00`) matches none of
+the valid `CompressedPointFlag` patterns → panic. This happened even though `verify_groth16`
+(`vendor/snark-bn254-verifier/src/groth16/verify.rs`) never actually *reads*
+`vk.commitment_key`'s value — the parse itself panics regardless of whether the result is
+used.
+
+**Fix** (`groth16-verifier/src/lib.rs`): compute the real content length dynamically (reading
+`num_k` from the VK bytes, same formula the parser uses) instead of hardcoding the padding
+boundary at `VK_LEN`.
+
+**Verified locally** (not just theoretically): added a temporary scratch test directly in
+`vendor/snark-bn254-verifier/src/groth16/converter.rs` (same-crate access to the `pub(crate)`
+parser) that:
+1. Reproduced the old bug — padding at `VK_LEN` (492) panics via `catch_unwind`, confirmed.
+2. Confirmed the fix — padding at the real 488-byte boundary parses cleanly (`Ok`, `k.len()
+   == 6`).
+
+Both passed (`cargo test -p snark-bn254-verifier scratch_verify_padding_fix`), then the
+scratch test was removed (`git diff` on that file is empty) since it was only needed to
+confirm the fix — the parsing logic it tested lives entirely in
+`groth16-verifier/build_padded_vk()`, which is the actual, permanent fix.
+
+**Next step:** run the full `--prove` pipeline on nsac. This should no longer panic inside
+VFY-G16, meaning the deferred proof should carry `exit_code=0`, meaning coinproof's deferred
+verifier should no longer hit `DivFOutOfDomain` — the crash this whole investigation started
+from.
+
+---
+
 ## Update 7: it's a raw panic inside `verify_sp1_spend_proof`, not a clean `Err` — added a panic hook
 
 The Update 6 run showed `[VFY-G16-DIAG] execute OK: cycles=636726 exit_code=1` again, but SP1's

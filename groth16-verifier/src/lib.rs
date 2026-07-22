@@ -20,11 +20,30 @@ const GNARK_PROOF_LEN: usize = 256;
 const VK_LEN: usize = 492;
 const VK_PADDED_LEN: usize = VK_LEN + 128;
 
+// `load_groth16_verifying_key_from_bytes` (vendor/snark-bn254-verifier) reads, in order:
+// g1_alpha(32) + g1_beta(32) + g2_beta(64) + g2_gamma(64) + g1_delta(32) + g2_delta(64) = 288,
+// then num_k(4) + k[0..num_k](32 each), then num_of_array_of_public_and_commitment_committed(4).
+// For this VK (5 public inputs -> num_k=6) that's 288 + 4 + 32*6 + 4 = 488 bytes of real
+// content — 4 bytes short of VK_LEN (492). The file's own trailing 4 bytes (492-VK_LEN..492,
+// all zero) aren't part of that read sequence at all.
+//
+// Appending the dummy commitment-key padding starting at VK_LEN (492) instead of this real
+// 488-byte boundary shifts everything the parser reads for `commitment_key_g`/
+// `commitment_key_g_root_sigma_neg` by 4 bytes: it ends up reading those 4 trailing zero
+// bytes as the start of `commitment_key_g`, whose top 2 bits (0x00) don't match any
+// `CompressedPointFlag`, so `unchecked_compressed_x_to_g2_point` panics ("Invalid compressed
+// point flag") — even though `verify_groth16` never actually reads the parsed commitment key.
+fn real_vk_content_len() -> usize {
+    let num_k = u32::from_be_bytes(GROTH16_VK_BYTES[288..292].try_into().unwrap()) as usize;
+    288 + 4 + 32 * num_k + 4
+}
+
 fn build_padded_vk() -> [u8; VK_PADDED_LEN] {
+    let real_len = real_vk_content_len();
     let mut out = [0u8; VK_PADDED_LEN];
-    out[..VK_LEN].copy_from_slice(GROTH16_VK_BYTES);
-    out[VK_LEN..VK_LEN + 64].copy_from_slice(&GROTH16_VK_BYTES[128..192]);
-    out[VK_LEN + 64..VK_PADDED_LEN].copy_from_slice(&GROTH16_VK_BYTES[128..192]);
+    out[..real_len].copy_from_slice(&GROTH16_VK_BYTES[..real_len]);
+    out[real_len..real_len + 64].copy_from_slice(&GROTH16_VK_BYTES[128..192]);
+    out[real_len + 64..real_len + 128].copy_from_slice(&GROTH16_VK_BYTES[128..192]);
     out
 }
 
