@@ -386,15 +386,19 @@ fn prove_subprocess(elf_id: &str, stdin: &SP1Stdin) -> SP1ProofWithPublicValues 
     // comment in main() for why they can't be set per-elf-type only.
     match elf_id {
         "vfy-g16" => {
-            cmd.env("SHARD_SIZE", "262144")  // 1<<18; ~636K cycles ≈ 3 shards
-               .env("RECURSION_DIAG", "1");  // compare init dump with coinproof
+            cmd.env("SHARD_SIZE", "262144");  // 1<<18; ~636K cycles ≈ 3 shards
         }
         "coinproof" => {
-            cmd.env("SHARD_SIZE", "262144")  // 1<<18; ~3M cycles ≈ 12 shards
-               .env("RECURSION_DIAG", "1");  // watch addr 316465 init dump
+            cmd.env("SHARD_SIZE", "262144");  // 1<<18; ~3M cycles ≈ 12 shards
         }
         _ => {}
     }
+    // RECURSION_DIAG is NOT force-set here: it's inherited from the parent env only
+    // (via .envs(std::env::vars()) above) when the caller explicitly opts in. Forcing
+    // it on for vfy-g16/coinproof made the print_debug/print_f instrumentation in
+    // vendor/sp1-recursion-circuit compile into the recursion circuit unconditionally,
+    // changing its VK hash and causing false-positive "vk not allowed" errors that had
+    // nothing to do with a real vk-registration gap.
     let status = cmd.status().expect("spawn proving subprocess");
     assert!(status.success(), "proving subprocess for {elf_id} exited with {status}");
 
