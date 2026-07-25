@@ -1,5 +1,73 @@
 # SP1 6.2.3 DivF Crash — Diagnostic Summary
 
+## Update 16: RESOLVED — three real bugs, one false-positive contamination, full pipeline verified end-to-end under standard settings
+
+Following up on Update 15's plan: ran `FORCE_VK_VERIFICATION=1 RECURSION_DIAG=1 RUST_LOG=info
+cargo run --release -- --prove` on nsac. Genesis's spend proof — which had never failed under
+`vk_verification=true` in any prior run — hit `"vk not allowed"`. This was suspicious on its
+face: genesis's own vkey is unrelated to the vfy-g16/coinproof shapes we were investigating.
+
+**Root cause of that failure: self-inflicted contamination, not a real vk gap.** The
+`RECURSION_DIAG=1` env var — which we were setting to activate the `[VK-DIAG]` print added in
+Update 15 — *also* activates the print-diagnostic instrumentation added in earlier updates
+(`builder.print_debug(...)`/`builder.print_f(...)` in `vendor/sp1-recursion-circuit`'s
+`compress.rs`/`deferred.rs`, from the "Circuit-Level Print Diagnostics" section below). Those
+prints get **compiled into the recursion circuit itself**, changing its structure and
+therefore its VK hash away from what Succinct's official `vk_map.bin` expects — so *any*
+proof compiled with `RECURSION_DIAG=1` active would fail vk lookup, independent of whether its
+underlying shape was actually registered.
+
+Worse: `prove_subprocess()` in `script/src/bin/main.rs` was unconditionally force-setting
+`RECURSION_DIAG=1` for the `vfy-g16` and `coinproof` elf types (a leftover from earlier
+debugging), regardless of what was passed on the outer command line — meaning *every*
+vfy-g16/coinproof subprocess had been running with this contamination active the whole time.
+That's why genesis (`spend`, not covered by that match arm) had always been clean while
+vfy-g16/coinproof intermittently were not: only the latter two ever had the diagnostic forced
+on. Fixed in `360352d`: removed the hardcoded `.env("RECURSION_DIAG", "1")` overrides so the
+var is only active when explicitly requested on the command line (still inherited via
+`.envs(std::env::vars())`).
+
+**Re-ran clean** (`FORCE_VK_VERIFICATION=1 RUST_LOG=info cargo run --release -- --prove`, no
+`RECURSION_DIAG`): genesis mint → Alice VFY-G16 → Alice coinproof (base) → **Alice's slot-1
+spend, folding her own coinproof as a deferred proof** (the exact scenario the original
+`DivFOutOfDomain` crash happened in) → Bob's side → **Bob's slot-2 spend, folding his own
+coinproof** → Carol's side, all the way through. Full 3-hop chain (genesis → Alice → Bob →
+Carol), 19 proof steps, zero `PRINTF` output, zero `"vk not allowed"` anywhere, under fully
+standard SP1 defaults (`vk_verification=true`, official wrap/Groth16 circuit — no bypass, no
+dev-mode circuit rebuild). Wallet states and nullifier/spent tracking all came out correct.
+
+**Conclusion:** there was never a genuine vk-registration gap for coinproof/vfy-g16's shapes —
+Succinct's official `vk_map.bin` already covers them. The crash and every subsequent "vk not
+allowed" symptom were fully explained by four causes, all now fixed, none of which required
+touching any proof-verification or circuit logic:
+
+1. `groth16-verifier`'s `build_padded_vk()` 4-byte misalignment (Update 8, `12d0f4b`)
+2. `substrate-bn`'s `AffineG1 * Fr::zero()` panic (Update 9, `f1f2b10`)
+3. `snark-bn254-verifier`'s two compensating Groth16 pairing sign errors (Update 10, `c1164e0`)
+4. Diagnostic instrumentation (added by us, for debugging) contaminating the recursion
+   circuit's VK when active — fixed by no longer force-enabling it (`360352d`)
+
+**Cleanup performed once confirmed:**
+- Removed the `FORCE_VK_VERIFICATION` toggle and the `WITHOUT_VK_VERIFICATION`/
+  `SP1_CIRCUIT_MODE=dev` dead paths from `main()` in `script/src/bin/main.rs` — standard
+  `vk_verification=true` + release circuit mode is simply correct, no override needed.
+- Diffed all three vendored crates (`sp1-recursion-executor`, `sp1-recursion-circuit`,
+  `sp1-prover`) against their pristine crates.io 6.2.3 sources and confirmed every patch was
+  purely diagnostic (print/dump instrumentation gated behind `RECURSION_DIAG`), with **zero**
+  functional/logic changes remaining in any of them. Fully un-vendored all three: deleted
+  `vendor/sp1-recursion-executor`, `vendor/sp1-recursion-circuit`, `vendor/sp1-prover`, removed
+  their `[patch.crates-io]` entries from the root `Cargo.toml`, and let `Cargo.lock` resolve
+  back to plain crates.io sources.
+- `vendor/substrate-bn` and `vendor/snark-bn254-verifier` remain vendored — those carry real
+  bug fixes (#2 and #3 above), not diagnostics.
+
+The SHARD_SIZE=262144 override for vfy-g16/coinproof (avoiding the single-shard BaseAlu
+padding DivF bug) and the guest-side BN254 precompile-activation fixes (`42703df`, `e17c871`,
+in `program-coinproof`) remain in place — those are the actual functional fixes and are
+unrelated to this diagnostic cleanup.
+
+---
+
 ## Update 15: `SP1_CIRCUIT_MODE=dev` is a dead end — investigating whether coinproof/vfy-g16's shapes are genuinely unregistered
 
 Update 14's fix ran on nsac far enough to build a local dev Groth16 circuit (~15 min,

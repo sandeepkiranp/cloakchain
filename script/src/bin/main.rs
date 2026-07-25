@@ -363,27 +363,17 @@ fn prove_subprocess(elf_id: &str, stdin: &SP1Stdin) -> SP1ProofWithPublicValues 
 
     println!("  [subprocess] proving {} in child process …", elf_id);
     let exe = std::env::current_exe().expect("current_exe");
-    // For vfy-g16 (636K cycles with BN254 precompiles), the default 16M shard size
-    // puts everything in 1 shard, which triggers a BaseAlu padding DivF bug in
-    // SP1 6.2.3's recursion circuit when used as an inner proof.  Force a smaller
-    // shard size so vfy-g16 spans multiple shards (≥2) and avoids the bug.
+    // For vfy-g16 (636K cycles with BN254 precompiles) and coinproof (1.5-3.4M
+    // cycles), the default 16M shard size puts everything in one shard, which
+    // triggers a BaseAlu padding DivF bug in SP1 6.2.3's recursion circuit when
+    // the resulting proof is used as an inner (deferred/compressed) proof. Force
+    // a smaller shard size so both span multiple shards (≥2) and avoid the bug.
     let mut cmd = std::process::Command::new(&exe);
     cmd.args([
         "--internal-prove-elf",    elf_id,
         "--internal-prove-stdin",  stdin_path.to_str().unwrap(),
         "--internal-prove-output", proof_path.to_str().unwrap(),
     ]).envs(std::env::vars());
-    // SP1 6.2.3 recursion compress fix: the circuit divides by the combined BN254
-    // chip evaluation (address 316465 in the recursion program) loaded from the
-    // proof at step 1.  VFY-G16 fires BN254 precompiles (substrate-bn) → eval≠0.
-    // coinproof now fires 8 dummy BN254 ecalls → eval≠0 for all BN254 chip types.
-    // SHARD_SIZE=262144 kept so both programs span multiple shards; RECURSION_DIAG
-    // activates the write-tracker in vendor/sp1-recursion-executor to post-mortem
-    // any remaining DivF failure.
-    // WITHOUT_VK_VERIFICATION and SP1_CIRCUIT_MODE=dev are set process-wide in main()
-    // (inherited here via .envs(std::env::vars()) above) so every subprocess - spend
-    // included - consistently agrees on the same (dummy) recursion vk_root; see the
-    // comment in main() for why they can't be set per-elf-type only.
     match elf_id {
         "vfy-g16" => {
             cmd.env("SHARD_SIZE", "262144");  // 1<<18; ~636K cycles ≈ 3 shards
@@ -393,12 +383,6 @@ fn prove_subprocess(elf_id: &str, stdin: &SP1Stdin) -> SP1ProofWithPublicValues 
         }
         _ => {}
     }
-    // RECURSION_DIAG is NOT force-set here: it's inherited from the parent env only
-    // (via .envs(std::env::vars()) above) when the caller explicitly opts in. Forcing
-    // it on for vfy-g16/coinproof made the print_debug/print_f instrumentation in
-    // vendor/sp1-recursion-circuit compile into the recursion circuit unconditionally,
-    // changing its VK hash and causing false-positive "vk not allowed" errors that had
-    // nothing to do with a real vk-registration gap.
     let status = cmd.status().expect("spawn proving subprocess");
     assert!(status.success(), "proving subprocess for {elf_id} exited with {status}");
 
@@ -622,34 +606,6 @@ fn build_spend_stdin(
 fn main() {
     sp1_sdk::utils::setup_logger();
     dotenv::dotenv().ok();
-
-    // coinproof/vfy-g16 are custom guest programs whose recursion-circuit shapes aren't in
-    // SP1's shipped vk_map.bin, so proving them needs WITHOUT_VK_VERIFICATION=1 (skip the
-    // official vk allow-list, use a deterministic dummy root instead) - requires sp1-sdk's
-    // "experimental" feature. That dummy root has to be used *consistently* everywhere a
-    // vk_root gets checked or produced - including spend, since a non-genesis spend proof
-    // folds in a prior coinproof proof as a deferred proof, and the two must agree on the
-    // same root. SP1_CIRCUIT_MODE=dev makes spend's Groth16 wrap step rebuild its circuit
-    // locally to match that dummy root, instead of expecting Succinct's official one (which
-    // it otherwise hardcodes and can never satisfy once vk_verification is off).
-    //
-    // NOTE: both of these are dev/test-only mechanisms by SP1's own design (the dummy root
-    // isn't a registered/audited vk set, and the SP1_CIRCUIT_MODE=dev Groth16 circuit is
-    // built with a local, non-ceremony trusted setup rather than SP1's official one) - this
-    // makes the pipeline run correctly end-to-end, but the resulting proofs are not
-    // production/mainnet-grade until that's addressed separately (e.g. registering these
-    // programs' shapes in a real vk_map).
-    // FORCE_VK_VERIFICATION=1 skips both of the above (falls back to SP1's default
-    // vk_verification=true + release circuit mode) - a temporary diagnostic toggle to
-    // reproduce and inspect the original "vk not allowed" error with the new [VK-DIAG]
-    // print in vendor/sp1-prover (set RECURSION_DIAG=1 too, to actually see it), without
-    // needing to hand-edit/revert this block for a one-off investigative run.
-    if std::env::var("FORCE_VK_VERIFICATION").map(|v| v == "1").unwrap_or(false) {
-        eprintln!("[main] FORCE_VK_VERIFICATION=1: using default vk_verification=true, release circuit mode");
-    } else {
-        std::env::set_var("WITHOUT_VK_VERIFICATION", "1");
-        std::env::set_var("SP1_CIRCUIT_MODE", "dev");
-    }
 
     let args = Args::parse();
 

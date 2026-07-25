@@ -4298,6 +4298,8 @@ dependencies = [
 [[package]]
 name = "sp1-prover"
 version = "6.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72c3cb0201a41e9da5372b2b437af07ee3ccd6dca99a69ece4213af40d9436b7"
 dependencies = [
  "anyhow",
  "bincode",
@@ -4384,6 +4386,8 @@ dependencies = [
 [[package]]
 name = "sp1-recursion-circuit"
 version = "6.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19d9ce031605bc111474c11e7841536f3469311253791ef326ee16427e10178e"
 dependencies = [
  "bincode",
  "itertools 0.14.0",
@@ -4443,6 +4447,8 @@ dependencies = [
 [[package]]
 name = "sp1-recursion-executor"
 version = "6.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "983d18b6e0e641c8173b250c234fe355c3a9ba5b7485d3af5a54ddb7ab51e814"
 dependencies = [
  "backtrace",
  "cfg-if",
