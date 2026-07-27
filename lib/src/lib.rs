@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, HashMap};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
@@ -311,14 +313,19 @@ fn merkle_combine(l: &[u8; 32], r: &[u8; 32]) -> [u8; 32] {
 
 /// Precomputed hashes of empty subtrees at each depth.
 /// `zero_hashes()[d]` = root of a complete subtree of depth `d` with all
-/// leaves equal to [0u8;32].
-fn zero_hashes() -> Vec<[u8; 32]> {
-    let mut out = vec![[0u8; 32]]; // depth 0: the zero leaf itself
-    for _ in 0..TREE_DEPTH {
-        let prev = *out.last().unwrap();
-        out.push(merkle_combine(&prev, &prev));
-    }
-    out
+/// leaves equal to [0u8;32]. Computed once and cached — `NullifierTree::insert`
+/// calls this on every leaf update, and recomputing 32 hashes from scratch
+/// each time (rather than once, ever) was the dominant cost at scale.
+fn zero_hashes() -> &'static [[u8; 32]] {
+    static ZERO_HASHES: std::sync::OnceLock<Vec<[u8; 32]>> = std::sync::OnceLock::new();
+    ZERO_HASHES.get_or_init(|| {
+        let mut out = vec![[0u8; 32]]; // depth 0: the zero leaf itself
+        for _ in 0..TREE_DEPTH {
+            let prev = *out.last().unwrap();
+            out.push(merkle_combine(&prev, &prev));
+        }
+        out
+    })
 }
 
 /// Root of the empty fixed-depth tree (all leaves = [0u8;32]).
@@ -326,8 +333,8 @@ pub fn empty_root() -> [u8; 32] {
     zero_hashes()[TREE_DEPTH]
 }
 
-/// Walk the path from `leaf` at `slot` to the root. Used by both
-/// `merkle_root_of` and `check_coin_proof_step`.
+/// Walk the path from `leaf` at `slot` to the root. Used by
+/// `merkle_root_of`, `check_coin_receipt`, and `check_spend`.
 pub fn compute_root_from_path(leaf: [u8; 32], slot: usize, path: &[[u8; 32]]) -> [u8; 32] {
     let mut current = leaf;
     let mut idx = slot;
@@ -353,20 +360,16 @@ pub fn merkle_root_of(entries: &[BoardEntry]) -> [u8; 32] {
     compute_root_from_path(merkle_leaf(last, &entries[last]), last, &path)
 }
 
-/// Inclusion proof for `slot` in the fixed-depth tree over `entries`.
-/// At each level the sibling is either the real hash of the adjacent subtree
-/// (if it was already filled by prior entries) or the zero-subtree hash.
-pub fn append_proof_for(entries: &[BoardEntry]) -> Vec<[u8; 32]> {
-    let slot = entries.len() - 1;
+/// Build the fixed-depth (`TREE_DEPTH`) Merkle path for position `target_idx`,
+/// given the hashes of whatever leaves are currently filled. Any position at
+/// or beyond `leaf_hashes.len()` (including `target_idx` itself) is treated
+/// as unfilled and uses the zero-subtree hash — this works equally well for
+/// proving an *existing* leaf or for proving the next, as-yet-empty slot.
+fn merkle_path_for_index(leaf_hashes: &[[u8; 32]], target_idx: usize) -> Vec<[u8; 32]> {
     let zeros = zero_hashes();
     let mut path = Vec::with_capacity(TREE_DEPTH);
-
-    // Build the filled portion of the current level from real entries.
-    let mut level: Vec<[u8; 32]> = entries.iter().enumerate()
-        .map(|(i, e)| merkle_leaf(i, e))
-        .collect();
-
-    let mut idx = slot;
+    let mut level: Vec<[u8; 32]> = leaf_hashes.to_vec();
+    let mut idx = target_idx;
     for d in 0..TREE_DEPTH {
         let sibling_idx = idx ^ 1;
         let sibling = if sibling_idx < level.len() {
@@ -391,10 +394,227 @@ pub fn append_proof_for(entries: &[BoardEntry]) -> Vec<[u8; 32]> {
     path
 }
 
+/// Inclusion proof for `slot` in the fixed-depth tree over `entries`.
+/// At each level the sibling is either the real hash of the adjacent subtree
+/// (if it was already filled by prior entries) or the zero-subtree hash.
+pub fn append_proof_for(entries: &[BoardEntry]) -> Vec<[u8; 32]> {
+    let slot = entries.len() - 1;
+    let hashes: Vec<[u8; 32]> = entries.iter().enumerate().map(|(i, e)| merkle_leaf(i, e)).collect();
+    merkle_path_for_index(&hashes, slot)
+}
+
+/// Append-path for the *next*, as-yet-unfilled slot after `entries` — used by
+/// `check_spend` to prove the board state immediately before `tx_star` is
+/// posted, without needing the entire prior board history as a witness (only
+/// its leaf hashes, derived here from the entries the caller already has).
+pub fn append_path_for_next(entries: &[BoardEntry]) -> Vec<[u8; 32]> {
+    let hashes: Vec<[u8; 32]> = entries.iter().enumerate().map(|(i, e)| merkle_leaf(i, e)).collect();
+    merkle_path_for_index(&hashes, entries.len())
+}
+
 /// Verify that `entry` is the genuine content of `slot` in a fixed-depth tree
 /// with the given `root`.
 pub fn merkle_verify(root: [u8; 32], slot: usize, entry: &BoardEntry, proof: &[[u8; 32]]) -> bool {
     compute_root_from_path(merkle_leaf(slot, entry), slot, proof) == root
+}
+
+// ---- Nullifier accumulator (indexed Merkle tree) --------------------------
+//
+// Double-spend detection no longer requires walking every board slot in an
+// IVC chain. Every nullifier ever published (`BoardEntry.nullifier`, already
+// public) is inserted into a single indexed Merkle tree — a sorted linked
+// list of leaves, each storing `(value, next_value, next_index)`. A single
+// Merkle path to a leaf whose `value < target < next_value` proves `target`
+// is absent from the *entire* set the tree's root represents, in one
+// O(TREE_DEPTH) proof instead of an O(slots) scan. Reuses the same SHA256
+// combine/path primitives as the board tree above.
+
+/// One leaf of the indexed nullifier tree.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexedLeaf {
+    pub value: [u8; 32],
+    pub next_value: [u8; 32],
+    pub next_index: u64,
+}
+
+/// Sentinel "infinity" value: no real nullifier (a SHA256 output) will ever
+/// equal this, so it safely upper-bounds every real value.
+const MAX_NULLIFIER: [u8; 32] = [0xFF; 32];
+
+impl IndexedLeaf {
+    fn hash(&self) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(self.value);
+        h.update(self.next_value);
+        h.update(self.next_index.to_le_bytes());
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&h.finalize());
+        out
+    }
+}
+
+/// A non-membership proof: the "low" leaf whose `value < target < next_value`
+/// — impossible to construct unless `target` is genuinely absent — plus its
+/// Merkle inclusion path. (If `target` happens to already be a member, the
+/// natural low leaf instead has `next_value == target`, which fails the
+/// strict `target < next_value` check in `verify_nonmembership` below.)
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NonMembershipWitness {
+    pub low_leaf: IndexedLeaf,
+    pub low_leaf_index: u64,
+    pub sibling_path: Vec<[u8; 32]>,
+}
+
+/// Verify a non-membership witness against `root`: `target` cannot be a
+/// member if some leaf's `value < target < next_value` genuinely Merkle-opens
+/// to `root` — no member could exist strictly between two adjacent leaves.
+pub fn verify_nonmembership(root: [u8; 32], target: [u8; 32], witness: &NonMembershipWitness) -> bool {
+    if !(witness.low_leaf.value < target && target < witness.low_leaf.next_value) {
+        return false;
+    }
+    let leaf_hash = witness.low_leaf.hash();
+    compute_root_from_path(leaf_hash, witness.low_leaf_index as usize, &witness.sibling_path) == root
+}
+
+/// Host-side append-only indexed Merkle tree of nullifiers. Anyone can rebuild
+/// this deterministically from the public `BoardEntry.nullifier` values, the
+/// same way `merkle_root_of` lets anyone rebuild the board's root.
+///
+/// Maintained *incrementally*: `index_of` gives O(log n) low-leaf lookup
+/// (instead of scanning every leaf), and `nodes` caches every level's node
+/// hashes so inserting only recomputes the O(TREE_DEPTH) ancestors of the two
+/// leaves that actually changed — not the whole tree from scratch. Both
+/// matter once the board has hundreds of thousands of entries: without them,
+/// `insert` is O(n) and `replay` (which calls `insert` in a loop) becomes
+/// O(n²), the same class of problem sorted-leaf Merkle trees have, just
+/// arrived at via a slow implementation rather than a sorted array.
+#[derive(Clone, Debug)]
+pub struct NullifierTree {
+    leaves: Vec<IndexedLeaf>,
+    /// value → leaf index, sorted — gives the low leaf for any target via one
+    /// `range(..target).next_back()` lookup instead of a linear scan.
+    index_of: BTreeMap<[u8; 32], usize>,
+    /// `nodes[d]` holds the hash of every *filled* node at depth d (0 =
+    /// leaves, `TREE_DEPTH` = root), keyed by its position at that depth.
+    /// A missing entry means "unfilled" — use the precomputed zero-subtree
+    /// hash for that depth instead (see `zero_hashes`).
+    nodes: Vec<HashMap<usize, [u8; 32]>>,
+}
+
+impl NullifierTree {
+    /// A fresh tree, seeded with the single "everything" sentinel leaf.
+    pub fn new() -> Self {
+        let sentinel = IndexedLeaf { value: [0u8; 32], next_value: MAX_NULLIFIER, next_index: 0 };
+        let mut tree = Self {
+            leaves: vec![sentinel.clone()],
+            index_of: BTreeMap::new(),
+            nodes: vec![HashMap::new(); TREE_DEPTH + 1],
+        };
+        tree.index_of.insert(sentinel.value, 0);
+        tree.set_leaf(0, sentinel.hash());
+        tree
+    }
+
+    /// Set leaf `idx`'s hash and propagate the change up to the root —
+    /// O(TREE_DEPTH), independent of how many leaves currently exist.
+    fn set_leaf(&mut self, idx: usize, hash: [u8; 32]) {
+        let zeros = zero_hashes();
+        let mut cur_idx = idx;
+        let mut cur_hash = hash;
+        for d in 0..TREE_DEPTH {
+            self.nodes[d].insert(cur_idx, cur_hash);
+            let sibling_idx = cur_idx ^ 1;
+            let sibling = self.nodes[d].get(&sibling_idx).copied().unwrap_or(zeros[d]);
+            cur_hash = if cur_idx % 2 == 0 { merkle_combine(&cur_hash, &sibling) } else { merkle_combine(&sibling, &cur_hash) };
+            cur_idx >>= 1;
+        }
+        self.nodes[TREE_DEPTH].insert(cur_idx, cur_hash); // cur_idx == 0: the root
+    }
+
+    pub fn root(&self) -> [u8; 32] {
+        self.nodes[TREE_DEPTH].get(&0).copied().unwrap_or_else(|| zero_hashes()[TREE_DEPTH])
+    }
+
+    pub fn contains(&self, value: [u8; 32]) -> bool {
+        self.index_of.contains_key(&value)
+    }
+
+    /// The leaf whose `value < target <= next_value` — for a genuine
+    /// non-member this is the unique insertion point (`target < next_value`
+    /// strictly); for an existing member it's that value's predecessor
+    /// (`next_value == target`), which correctly yields a witness that
+    /// `verify_nonmembership` will reject rather than one that panics here.
+    /// O(log n) via `index_of` instead of scanning every leaf.
+    fn find_low_leaf_index(&self, target: [u8; 32]) -> usize {
+        *self.index_of.range(..target).next_back().map(|(_, idx)| idx)
+            .expect("no matching leaf — target is [0u8;32] or tree invariant violated")
+    }
+
+    /// Insert `value` (a no-op if already present) and return the new root.
+    /// O(log n): one BTreeMap lookup plus two O(TREE_DEPTH) path updates.
+    pub fn insert(&mut self, value: [u8; 32]) -> [u8; 32] {
+        if self.contains(value) {
+            return self.root();
+        }
+        let low_idx = self.find_low_leaf_index(value);
+        let low = self.leaves[low_idx].clone();
+        let new_index = self.leaves.len();
+        let updated_low = IndexedLeaf { value: low.value, next_value: value, next_index: new_index as u64 };
+        let new_leaf = IndexedLeaf { value, next_value: low.next_value, next_index: low.next_index };
+
+        self.leaves[low_idx] = updated_low.clone();
+        self.leaves.push(new_leaf.clone());
+        self.index_of.insert(value, new_index);
+
+        self.set_leaf(low_idx, updated_low.hash());
+        self.set_leaf(new_index, new_leaf.hash());
+        self.root()
+    }
+
+    /// Sibling path for leaf `idx`, read directly from the maintained
+    /// per-level node hashes — O(TREE_DEPTH), not a from-scratch rebuild.
+    fn path_for(&self, idx: usize) -> Vec<[u8; 32]> {
+        let zeros = zero_hashes();
+        let mut path = Vec::with_capacity(TREE_DEPTH);
+        let mut cur_idx = idx;
+        for d in 0..TREE_DEPTH {
+            let sibling_idx = cur_idx ^ 1;
+            path.push(self.nodes[d].get(&sibling_idx).copied().unwrap_or(zeros[d]));
+            cur_idx >>= 1;
+        }
+        path
+    }
+
+    /// Build a non-membership witness for `target` against the tree's current
+    /// state. Safe to call even if `target` is already a member — the
+    /// resulting witness simply won't pass `verify_nonmembership`.
+    pub fn prove_non_membership(&self, target: [u8; 32]) -> NonMembershipWitness {
+        let low_idx = self.find_low_leaf_index(target);
+        NonMembershipWitness {
+            low_leaf: self.leaves[low_idx].clone(),
+            low_leaf_index: low_idx as u64,
+            sibling_path: self.path_for(low_idx),
+        }
+    }
+
+    /// Rebuild the tree as it stood after exactly `count` of `inserted`'s
+    /// values were inserted, by replaying from scratch. Used to answer "was X
+    /// absent as of slot S" for the historical parent-nullifier check below.
+    /// O(count log count) given the incremental `insert` above — cheap,
+    /// no SNARK cost, run entirely host-side.
+    pub fn replay(inserted: &[[u8; 32]], count: usize) -> Self {
+        let mut tree = Self::new();
+        for &n in &inserted[..count] {
+            tree.insert(n);
+        }
+        tree
+    }
+}
+
+impl Default for NullifierTree {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ---- Public values -------------------------------------------------------
@@ -422,8 +642,13 @@ pub struct ValidPublicValues {
     pub vkey: [u32; 8],
     pub board_root: [u8; 32],
     /// The output coin commitments created by this spend — used by recipients
-    /// to chain-verify provenance in their IVC coin-proof.
+    /// to chain-verify provenance in their receipt proof.
     pub output_commitments: Vec<[u8; 32]>,
+    /// The nullifier-accumulator root as of just before this spend (i.e. not
+    /// yet including this spend's own `input_nullifier`) — lets downstream
+    /// verifiers independently confirm it against their own rebuilt tree, the
+    /// same way `board_root` already lets them confirm board state.
+    pub nullifier_root: [u8; 32],
 }
 
 impl ValidPublicValues {
@@ -432,40 +657,40 @@ impl ValidPublicValues {
     }
 }
 
-// ---- IVC coin-proof -------------------------------------------------------
+// ---- Coin receipt ----------------------------------------------------------
 //
-// Instead of a single batch proof at spend time that scans the whole board,
-// every coin owner maintains a "coin-proof": a recursive proof updated by one
-// step per new board slot. Each step asserts:
+// A coin's receipt is a single proof, built once when the coin is first
+// discovered — not an IVC chain re-extended every board slot. It proves:
 //
-//   - `received_at`: the slot (if any) where the owner received this coin.
-//   - `spent`: whether the owner has already sent this coin in any slot seen
-//     so far.
+//   - `entry_k` (the transaction that created this coin) really is included
+//     in the board at `received_at`, via one Merkle append-path.
+//   - that creating transaction's own Groth16 receipt is valid (the VFY-G16
+//     fold, unchanged from before).
+//   - the creating transaction's own nullifier had not already been used
+//     anywhere on the board as of its own slot — via one non-membership
+//     proof against the nullifier accumulator (see above), replacing the old
+//     per-slot byte-scan for "parent_nullifier_seen". This is enforced
+//     directly: a receipt simply cannot be constructed over a double-spending
+//     parent transaction (see `check_coin_receipt` below).
 //
-// The final spend proof just checks the latest coin-proof's `received_at` is
-// `Some` and `spent` is `false` — O(1) instead of an O(T) scan.
+// Whether the coin has since been *spent* is no longer tracked here at all —
+// that's answered fresh, at spend time, with a single non-membership check
+// against the *current* nullifier root (see `check_spend`), not maintained
+// incrementally while the coin just sits held.
 
-/// The public values committed by every step of the coin-proof relation.
+/// The public values committed by a coin's receipt proof.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CoinProofPublicValues {
+pub struct CoinReceiptPublicValues {
     pub vkey: [u32; 8],
     pub owner_pk: [u8; 32],
     pub coin_commitment: [u8; 32],
     pub board_root: [u8; 32],
-    pub board_size: usize,
-    pub received_at: Option<u64>,
-    pub spent: bool,
-    /// The nullifier to watch for across prior slots (= H(parent_input_commitment || sk_parent_spender)).
-    /// Known upfront before bootstrap starts; carried through the IVC unchanged.
-    pub parent_nullifier: [u8; 32],
-    /// Set to true if `parent_nullifier` was found (as a substring) in any prior slot's entry bytes.
-    /// If true at the receipt slot, the creating transaction was a double-spend → receipt invalid.
-    pub parent_nullifier_seen: bool,
+    pub received_at: u64,
 }
 
-impl CoinProofPublicValues {
+impl CoinReceiptPublicValues {
     pub fn encode(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("CoinProofPublicValues is always serializable")
+        bincode::serialize(self).expect("CoinReceiptPublicValues is always serializable")
     }
 }
 
@@ -481,7 +706,7 @@ pub struct SpendProofPackage {
     /// Empty in execute/mock mode — logical output_commitments check is sufficient then.
     pub proof_bytes: Vec<u8>,
     /// `ValidPublicValues::encode()` — the spend proof's committed public values.
-    /// Checked in `check_coin_proof_step` to verify the spend commits to this coin.
+    /// Checked in `check_coin_receipt` to verify the spend commits to this coin.
     pub pv_encode: Vec<u8>,
     /// Spend program vkey hash from `spend_pk.verifying_key().bytes32()`.
     pub spend_vkey_hash: String,
@@ -495,150 +720,104 @@ pub struct ReceiptInfo {
     pub pv_encode: Vec<u8>,
 }
 
-/// What justifies a coin-proof step.
+/// What the receipt proof needs the guest program to additionally verify.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CoinProofJustification {
-    /// `slot == 0`: no recursive inner proof to verify.
-    Base {
-        /// Present iff this is the receipt slot; program calls `verify_sp1_proof`.
-        receipt: Option<ReceiptInfo>,
-    },
-    /// `slot > 0`: extends the chain from `inner_public_values`.
-    Step {
-        inner_public_values: CoinProofPublicValues,
-        /// Present iff this is the receipt slot.
-        receipt: Option<ReceiptInfo>,
-    },
+pub struct CoinReceiptJustification {
+    /// Present iff the creating transaction has a Groth16 spend proof to fold
+    /// (empty only in mock/execute mode — see `SpendProofPackage`).
+    pub receipt: Option<ReceiptInfo>,
 }
 
-/// One step of the coin-proof IVC, extended for slot `slot` (= k).
+/// Build a coin's one-shot receipt proof.
 ///
-/// Instead of receiving all prior entries and recomputing the root in O(n),
-/// this step receives only:
-///   - `entry_k`: the single new board entry at position `slot`
-///   - `append_path`: its Merkle inclusion proof in the fixed-depth tree
-///     (TREE_DEPTH sibling hashes, leaf → root)
+/// `entry_k` is the single board entry that transfers `coin_commitment` to
+/// `owner_sk`'s holder, at `received_slot`; `append_path` is its Merkle
+/// inclusion proof (`TREE_DEPTH` sibling hashes, leaf → root) — the same
+/// mechanism `merkle_root_of` uses, just proving one specific leaf instead of
+/// recomputing the whole tree, and used exactly once instead of per-slot.
 ///
-/// The root is updated in O(TREE_DEPTH) = O(1):
-///   old root = compute_root_from_path([0u8;32],    slot, &append_path)
-///   new root = compute_root_from_path(leaf_k,      slot, &append_path)
-///
-/// The inner proof's `board_root` is verified against the old root, binding
-/// the chain to a genuine board history without passing all prior entries.
-pub fn check_coin_proof_step(
+/// The creating transaction's own nullifier (= `entry_k.nullifier`, since
+/// `BoardEntry.nullifier` is always set to `tx.input_nullifier`) must not
+/// already have been used anywhere on the board as of that transaction's own
+/// slot — `parent_nonmembership`/`nullifier_root_at_parent_slot` prove this.
+/// If that check fails, the creating transaction was itself a double-spend,
+/// and this function returns `Err` rather than a usable receipt (replacing
+/// the old per-slot `parent_nullifier_seen` scan, which was computed but
+/// never actually enforced).
+pub fn check_coin_receipt(
     vkey: [u32; 8],
     owner_sk: [u8; 32],
     coin_commitment: [u8; 32],
     entry_k: BoardEntry,
-    slot: usize,
+    received_slot: usize,
     append_path: Vec<[u8; 32]>,
-    inner: Option<CoinProofPublicValues>,
-    // H(parent_input_commitment || sk_parent_spender) — the nullifier of the
-    // transaction that CREATED the tracked coin. Known upfront; checked via
-    // substring search in every prior slot's raw entry bytes.
-    parent_nullifier: [u8; 32],
-    // H(coin_commitment || sk_owner) — the owner's own spending nullifier.
-    // If found in a prior slot, the coin was already spent (double-spend).
-    own_nullifier: [u8; 32],
-) -> Result<(CoinProofPublicValues, CoinProofJustification), &'static str> {
+    parent_nonmembership: NonMembershipWitness,
+    nullifier_root_at_parent_slot: [u8; 32],
+) -> Result<(CoinReceiptPublicValues, CoinReceiptJustification), &'static str> {
     let owner_pk = derive_pk(&owner_sk);
-    let leaf_k = merkle_leaf(slot, &entry_k);
-    let board_root = compute_root_from_path(leaf_k, slot, &append_path);
 
-    let (prev_received_at, prev_spent, prev_parent_nullifier_seen, maybe_inner) = if slot == 0 {
-        (None, false, false, None)
-    } else {
-        let inner = inner.ok_or("steps after the base case require an inner coin-proof")?;
-        if inner.vkey != vkey {
-            return Err("inner coin-proof was produced under a different vkey");
-        }
-        if inner.owner_pk != owner_pk {
-            return Err("inner coin-proof has a different owner");
-        }
-        if inner.coin_commitment != coin_commitment {
-            return Err("inner coin-proof tracks a different coin");
-        }
-        if inner.parent_nullifier != parent_nullifier {
-            return Err("inner coin-proof tracks a different parent nullifier");
-        }
-        if inner.board_size != slot {
-            return Err("inner coin-proof must cover exactly the prefix before this slot");
-        }
-        let old_root = compute_root_from_path([0u8; 32], slot, &append_path);
-        if inner.board_root != old_root {
-            return Err("inner coin-proof's board root does not match this prefix");
-        }
-        let (pra, ps, pns) = (inner.received_at, inner.spent, inner.parent_nullifier_seen);
-        (pra, ps, pns, Some(inner))
-    };
+    if !verify_nonmembership(nullifier_root_at_parent_slot, entry_k.nullifier, &parent_nonmembership) {
+        return Err("parent transaction's nullifier was already present on the board — it was a double-spend");
+    }
 
-    let raw = bincode::serialize(&entry_k).unwrap_or_default();
+    let leaf_k = merkle_leaf(received_slot, &entry_k);
+    let board_root = compute_root_from_path(leaf_k, received_slot, &append_path);
 
-    let mut received_at = prev_received_at;
+    let tx = scan_entry(&owner_sk, &entry_k).ok_or("entry_k does not decrypt for this owner")?;
+    if !tx.receives_coin(&coin_commitment) {
+        return Err("entry_k's transaction does not transfer coin_commitment to this owner");
+    }
+
+    // Extract the spend proof package from the creating transaction and verify
+    // that it commits to this coin. The program will call verify_sp1_proof on
+    // it; here we only do the logical provenance check.
     let mut receipt: Option<ReceiptInfo> = None;
-
-    if let Some(tx) = scan_entry(&owner_sk, &entry_k) {
-        if tx.receives_coin(&coin_commitment) && received_at.is_none() {
-            if !prev_parent_nullifier_seen {
-                // Extract the spend proof package from the creating transaction and verify
-                // that it commits to this coin.  The program will call verify_sp1_proof on
-                // it; here we only do the logical provenance check.
-                if !tx.spend_proof.is_empty() {
-                    let pkg = bincode::deserialize::<SpendProofPackage>(&tx.spend_proof)
-                        .map_err(|_| "receipt tx.spend_proof is not a valid SpendProofPackage")?;
-                    let pv = bincode::deserialize::<ValidPublicValues>(&pkg.pv_encode)
-                        .map_err(|_| "SpendProofPackage has invalid pv_encode")?;
-                    if !pv.output_commitments.contains(&coin_commitment) {
-                        return Err("parent spend proof does not commit to this coin commitment");
-                    }
-                    // Non-empty proof_bytes → real Groth16 proof; program verifies it.
-                    // Empty → mock/execute mode; output_commitments check is sufficient.
-                    if !pkg.proof_bytes.is_empty() {
-                        receipt = Some(ReceiptInfo { pv_encode: pkg.pv_encode });
-                    }
-                }
-                received_at = Some(slot as u64);
-            }
+    if !tx.spend_proof.is_empty() {
+        let pkg = bincode::deserialize::<SpendProofPackage>(&tx.spend_proof)
+            .map_err(|_| "receipt tx.spend_proof is not a valid SpendProofPackage")?;
+        let pv = bincode::deserialize::<ValidPublicValues>(&pkg.pv_encode)
+            .map_err(|_| "SpendProofPackage has invalid pv_encode")?;
+        if !pv.output_commitments.contains(&coin_commitment) {
+            return Err("parent spend proof does not commit to this coin commitment");
+        }
+        // Non-empty proof_bytes → real Groth16 proof; program verifies it.
+        // Empty → mock/execute mode; output_commitments check is sufficient.
+        if !pkg.proof_bytes.is_empty() {
+            receipt = Some(ReceiptInfo { pv_encode: pkg.pv_encode });
         }
     }
 
-    // Only scan for parent_nullifier while the coin has not yet been received.
-    // Once received_at is set, further appearances of parent_nullifier on the
-    // board are irrelevant and must not be able to retroactively invalidate it.
-    let parent_nullifier_seen = prev_parent_nullifier_seen
-        || (prev_received_at.is_none()
-            && raw.windows(32).any(|w| w == parent_nullifier));
-    let spent = prev_spent
-        || raw.windows(32).any(|w| w == own_nullifier);
-
-    let justification = match maybe_inner {
-        None    => CoinProofJustification::Base { receipt },
-        Some(i) => CoinProofJustification::Step { inner_public_values: i, receipt },
-    };
-
     Ok((
-        CoinProofPublicValues {
+        CoinReceiptPublicValues {
             vkey,
             owner_pk,
             coin_commitment,
             board_root,
-            board_size: slot + 1,
-            received_at,
-            spent,
-            parent_nullifier,
-            parent_nullifier_seen,
+            received_at: received_slot as u64,
         },
-        justification,
+        CoinReceiptJustification { receipt },
     ))
 }
 
 // ---- Spend relation --------------------------------------------------------
 
 /// Checks every condition of the `Valid` (spend) relation except actually
-/// verifying the recursive coin-proof's ZK proof.
+/// verifying the recursive receipt proof's ZK proof.
 ///
-/// `prior_entries` is the board history *before* tx* (`entries[0..last]`);
-/// `tx_star` is the spending transaction (commitments only — no raw values).
+/// `entry_position` is the slot `tx_star` will land at (== current board
+/// size); `append_path` is its Merkle append proof, verified against the
+/// *old* root (`[0u8;32]` placeholder at that position) — the same technique
+/// `check_coin_receipt` uses for a receiving entry, just for an unfilled
+/// position. This replaces passing the entire prior board history and
+/// recomputing its root from scratch on every spend.
+///
+/// `own_nullifier_nonmembership`/`current_nullifier_root` prove the coin has
+/// not already been spent: a single non-membership check against the
+/// nullifier accumulator's current state, replacing the old `cp.spent` field
+/// that had to be kept fresh via a per-slot IVC. This check is uniform for
+/// genesis and non-genesis spends — an empty/near-empty accumulator trivially
+/// proves non-membership, so no special-casing is needed for an empty board.
+///
 /// `input_coins` and `output_coins` are the private witnesses: the actual coin
 /// data whose commitments are asserted to match `tx_star`'s commitment lists.
 /// This lets the circuit verify conservation (`Σ input values == Σ output values`)
@@ -649,18 +828,21 @@ pub fn check_spend(
     sk_p: [u8; 32],
     pk_p: [u8; 32],
     coin_commitment: [u8; 32],
-    prior_entries: Vec<BoardEntry>,
+    entry_position: usize,
+    append_path: Vec<[u8; 32]>,
     tx_star: Transaction,
     input_coins: Vec<Coin>,
     output_coins: Vec<Coin>,
     is_genesis: bool,
-    coin_proof: Option<CoinProofPublicValues>,
+    coin_proof: Option<CoinReceiptPublicValues>,
+    own_nullifier_nonmembership: NonMembershipWitness,
+    current_nullifier_root: [u8; 32],
 ) -> Result<ValidPublicValues, &'static str> {
     if derive_pk(&sk_p) != pk_p {
         return Err("pk_P must be the public key for sk_P");
     }
 
-    let anchor = merkle_root_of(&prior_entries);
+    let board_root = compute_root_from_path([0u8; 32], entry_position, &append_path);
 
     // Compute and verify the spender's own nullifier.
     // This replaces the old sender_pk check and also serves as the double-spend guard.
@@ -674,6 +856,12 @@ pub fn check_spend(
     };
     if tx_star.input_nullifier != own_nullifier {
         return Err("tx* input_nullifier does not match H(coin_commitment || sk_p)");
+    }
+
+    // Double-spend guard: own_nullifier must be absent from the nullifier
+    // accumulator's current state. Uniform for genesis and non-genesis.
+    if !verify_nonmembership(current_nullifier_root, own_nullifier, &own_nullifier_nonmembership) {
+        return Err("P must not have spent this coin before (double spend)");
     }
 
     // Verify input coin preimages match the transaction's committed commitments.
@@ -716,33 +904,6 @@ pub fn check_spend(
         if pk_p != genesis_pk() {
             return Err("only the genesis key may mint without provenance");
         }
-        if prior_entries.is_empty() {
-            // Empty board → own_nullifier cannot exist anywhere → double-spend
-            // is trivially impossible. No coin-proof needed.
-        } else {
-            // Prior entries exist → require a coin-proof so cp.spent (set by
-            // the IVC's per-slot own-nullifier search) gives us O(1) double-spend
-            // detection without scanning all entries again here.
-            let cp = coin_proof.ok_or("genesis at a non-empty board requires a coin-proof")?;
-            if cp.vkey != coin_proof_vkey {
-                return Err("coin-proof was produced under an unexpected vkey");
-            }
-            if cp.owner_pk != pk_p {
-                return Err("coin-proof owner must be P");
-            }
-            if cp.coin_commitment != coin_commitment {
-                return Err("coin-proof tracks a different coin");
-            }
-            if cp.board_size != prior_entries.len() {
-                return Err("coin-proof must cover exactly the board prefix before tx*");
-            }
-            if cp.board_root != anchor {
-                return Err("coin-proof's board root does not match the board prefix");
-            }
-            if cp.spent {
-                return Err("P must not have spent this coin before (double spend)");
-            }
-        }
     } else {
         let cp = coin_proof.ok_or("non-genesis spends require a coin-proof")?;
         if cp.vkey != coin_proof_vkey {
@@ -754,23 +915,14 @@ pub fn check_spend(
         if cp.coin_commitment != coin_commitment {
             return Err("coin-proof tracks a different coin");
         }
-        if cp.board_size != prior_entries.len() {
-            return Err("coin-proof must cover exactly the board prefix before tx*");
-        }
-        if cp.board_root != anchor {
-            return Err("coin-proof's board root does not match the board prefix");
-        }
-        if cp.received_at.is_none() {
-            return Err("P must have received this coin at some prior slot");
-        }
-        // Double-spend check: the IVC encoded cp.spent via per-slot own-nullifier
-        // search → O(1) here, no redundant O(n) scan.
-        if cp.spent {
-            return Err("P must not have spent this coin before (double spend)");
-        }
     }
 
-    Ok(ValidPublicValues { vkey, board_root: anchor, output_commitments: tx_star.output_commitments.clone() })
+    Ok(ValidPublicValues {
+        vkey,
+        board_root,
+        output_commitments: tx_star.output_commitments.clone(),
+        nullifier_root: current_nullifier_root,
+    })
 }
 
 #[cfg(test)]
@@ -828,32 +980,35 @@ mod tests {
         encrypt_tx(tx, recipient_pks, session_key)
     }
 
-    fn coin_proof_chain(
+    /// Build a coin's one-shot receipt: `entries[received_slot]` must be the
+    /// transaction that transfers `coin_commitment` to `owner_sk`'s holder.
+    /// The parent-nullifier non-membership witness/root are derived by
+    /// replaying all of `entries`' nullifiers up to (excluding)
+    /// `received_slot` — the board state as it stood just before the
+    /// creating transaction itself.
+    fn make_receipt(
         owner_sk: [u8; 32],
         coin_commitment: [u8; 32],
         entries: &[BoardEntry],
-        parent_nullifier: [u8; 32],
-    ) -> Vec<CoinProofPublicValues> {
-        let own_nullifier = {
-            let mut h = Sha256::new();
-            h.update(coin_commitment); h.update(owner_sk);
-            let mut out = [0u8; 32]; out.copy_from_slice(&h.finalize()); out
-        };
-        let mut out = Vec::new();
-        let mut inner: Option<CoinProofPublicValues> = None;
-        for k in 0..entries.len() {
-            let ap = append_proof_for(&entries[..=k]);
-            let (pv, _) = check_coin_proof_step(
-                TEST_COIN_PROOF_VKEY, owner_sk, coin_commitment,
-                entries[k].clone(), k, ap, inner.clone(),
-                parent_nullifier, own_nullifier,
-            ).unwrap();
-            inner = Some(pv.clone());
-            out.push(pv);
-        }
-        out
+        received_slot: usize,
+    ) -> Result<(CoinReceiptPublicValues, CoinReceiptJustification), &'static str> {
+        let ap = append_proof_for(&entries[..=received_slot]);
+        let all_nullifiers: Vec<[u8; 32]> = entries.iter().map(|e| e.nullifier).collect();
+        let tree = NullifierTree::replay(&all_nullifiers, received_slot);
+        let parent_root = tree.root();
+        let parent_witness = tree.prove_non_membership(entries[received_slot].nullifier);
+        check_coin_receipt(
+            TEST_COIN_PROOF_VKEY, owner_sk, coin_commitment,
+            entries[received_slot].clone(), received_slot, ap,
+            parent_witness, parent_root,
+        )
     }
 
+    /// Spend `coin_commitment` given the board state `prior_entries` (i.e.
+    /// before `tx_star` is posted). The nullifier non-membership witness and
+    /// current root are derived by replaying all of `prior_entries`' own
+    /// nullifiers — the same accumulator state any external verifier could
+    /// independently rebuild.
     fn spend(
         sk: [u8; 32],
         pk: [u8; 32],
@@ -863,13 +1018,23 @@ mod tests {
         input_coins: &[Coin],
         output_coins: &[Coin],
         is_genesis: bool,
-        coin_proof: Option<CoinProofPublicValues>,
+        coin_proof: Option<CoinReceiptPublicValues>,
     ) -> Result<ValidPublicValues, &'static str> {
+        let ap = append_path_for_next(prior_entries);
+        let all_nullifiers: Vec<[u8; 32]> = prior_entries.iter().map(|e| e.nullifier).collect();
+        let tree = NullifierTree::replay(&all_nullifiers, prior_entries.len());
+        let own_nullifier = {
+            let mut h = Sha256::new();
+            h.update(coin_commitment); h.update(sk);
+            let mut out = [0u8; 32]; out.copy_from_slice(&h.finalize()); out
+        };
+        let witness = tree.prove_non_membership(own_nullifier);
+        let root = tree.root();
         check_spend(
             TEST_VKEY, TEST_COIN_PROOF_VKEY, sk, pk, coin_commitment,
-            prior_entries.to_vec(), tx_star.clone(),
+            prior_entries.len(), ap, tx_star.clone(),
             input_coins.to_vec(), output_coins.to_vec(),
-            is_genesis, coin_proof,
+            is_genesis, coin_proof, witness, root,
         )
     }
 
@@ -936,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn coin_proof_tracks_receipt_and_spend_for_demo_chain() {
+    fn receipt_tracks_correct_received_slot() {
         let (alice_sk, alice_pk) = party(1);
         let (bob_sk, bob_pk) = party(2);
         let (_, carol_pk) = party(3);
@@ -954,14 +1119,11 @@ mod tests {
         let cn_alice = alice_coin.commitment();
         let cn_bob   = bob_coin.commitment();
 
-        let alice_cp = coin_proof_chain(alice_sk, cn_alice, &entries[..1], [0u8;32]);
-        assert_eq!(alice_cp[0].received_at, Some(0));
-        assert!(!alice_cp[0].spent);
+        let (alice_receipt, _) = make_receipt(alice_sk, cn_alice, &entries, 0).unwrap();
+        assert_eq!(alice_receipt.received_at, 0);
 
-        let bob_cp = coin_proof_chain(bob_sk, cn_bob, &entries[..2], [0u8;32]);
-        assert_eq!(bob_cp[0].received_at, None);
-        assert_eq!(bob_cp[1].received_at, Some(1));
-        assert!(!bob_cp[1].spent);
+        let (bob_receipt, _) = make_receipt(bob_sk, cn_bob, &entries, 1).unwrap();
+        assert_eq!(bob_receipt.received_at, 1);
     }
 
     #[test]
@@ -978,10 +1140,8 @@ mod tests {
         let entries = vec![enc(&tx0,&r0,sk0), enc(&tx1,&r1,sk1)];
 
         let cn_change = alice_change.commitment();
-        let cp = coin_proof_chain(alice_sk, cn_change, &entries, [0u8;32]);
-        assert_eq!(cp[0].received_at, None);
-        assert_eq!(cp[1].received_at, Some(1));
-        assert!(!cp[1].spent);
+        let (receipt, _) = make_receipt(alice_sk, cn_change, &entries, 1).unwrap();
+        assert_eq!(receipt.received_at, 1);
         let _ = bob_sk;
     }
 
@@ -1009,15 +1169,15 @@ mod tests {
         spend(GENESIS_SK, genesis_pk(), cn_genesis, &[], &tx0,
             &[genesis_coin], &[alice_coin.clone()], true, None).unwrap();
 
-        let alice_cp = coin_proof_chain(alice_sk, cn_alice, &entries[..1], [0u8;32]);
+        let (alice_receipt, _) = make_receipt(alice_sk, cn_alice, &entries, 0).unwrap();
         spend(alice_sk, alice_pk, cn_alice, &entries[..1], &tx1,
             &[alice_coin.clone()], &[bob_coin.clone(), alice_change], false,
-            Some(alice_cp[0].clone())).unwrap();
+            Some(alice_receipt)).unwrap();
 
-        let bob_cp = coin_proof_chain(bob_sk, cn_bob, &entries[..2], [0u8;32]);
+        let (bob_receipt, _) = make_receipt(bob_sk, cn_bob, &entries, 1).unwrap();
         spend(bob_sk, bob_pk, cn_bob, &entries[..2], &tx2,
             &[bob_coin.clone()], &[carol_coin], false,
-            Some(bob_cp[1].clone())).unwrap();
+            Some(bob_receipt)).unwrap();
     }
 
     #[test]
@@ -1046,28 +1206,46 @@ mod tests {
     }
 
     #[test]
-    fn rejects_spending_a_coin_one_never_received() {
+    fn rejects_building_a_receipt_for_a_coin_never_received() {
         let (alice_sk, alice_pk) = party(1);
         let (carol_sk, carol_pk) = party(3);
 
         let genesis_coin     = coin(0xA1, 100, genesis_pk());
         let alice_coin       = coin(0xA2, 100, alice_pk);
         let carol_fake_input = coin(0xC1, 100, carol_pk);
-        let carol_fake_out   = coin(0xC2, 100, alice_pk);
 
-        let (tx0,     sk0, r0) = make_tx(0, GENESIS_SK, &[genesis_coin], &[(alice_coin, alice_pk)]);
-        let (tx_fake, _,   _ ) = make_tx(1, carol_sk, &[carol_fake_input.clone()], &[(carol_fake_out.clone(), alice_pk)]);
+        let (tx0, sk0, r0) = make_tx(0, GENESIS_SK, &[genesis_coin], &[(alice_coin, alice_pk)]);
         let entries = vec![enc(&tx0,&r0,sk0)];
         let cn_carol = carol_fake_input.commitment();
 
-        let carol_cp = coin_proof_chain(carol_sk, cn_carol, &entries, [0u8;32]);
-        assert_eq!(carol_cp[0].received_at, None);
+        // Carol never actually received this coin — tx0 doesn't even decrypt
+        // for her — so a receipt for it simply cannot be built.
+        let err = make_receipt(carol_sk, cn_carol, &entries, 0).unwrap_err();
+        assert_eq!(err, "entry_k does not decrypt for this owner");
+    }
 
-        let err = spend(carol_sk, carol_pk, cn_carol, &entries, &tx_fake,
-            &[carol_fake_input], &[carol_fake_out], false,
-            Some(carol_cp[0].clone())).unwrap_err();
-        assert_eq!(err, "P must have received this coin at some prior slot");
-        let _ = alice_sk;
+    #[test]
+    fn rejects_receipt_when_creating_transaction_was_itself_a_double_spend() {
+        let (alice_sk, alice_pk) = party(1);
+        let (bob_sk, bob_pk) = party(2);
+        let (carol_sk, carol_pk) = party(3);
+
+        let genesis_coin = coin(0xA1, 100, genesis_pk());
+        let alice_coin   = coin(0xA2, 100, alice_pk);
+        let bob_coin     = coin(0xB1, 100, bob_pk);
+        let carol_coin   = coin(0xC1, 100, carol_pk);
+
+        let (tx0, sk0, r0) = make_tx(0, GENESIS_SK, &[genesis_coin], &[(alice_coin.clone(), alice_pk)]);
+        // Alice double-spends alice_coin: tx1 and tx2 both claim to spend it
+        // (same coin, same key ⇒ identical input_nullifier for both).
+        let (tx1, sk1, r1) = make_tx(1, alice_sk, &[alice_coin.clone()], &[(bob_coin, bob_pk)]);
+        let (tx2, sk2, r2) = make_tx(2, alice_sk, &[alice_coin], &[(carol_coin.clone(), carol_pk)]);
+        let entries = vec![enc(&tx0,&r0,sk0), enc(&tx1,&r1,sk1), enc(&tx2,&r2,sk2)];
+
+        let cn_carol = carol_coin.commitment();
+        let err = make_receipt(carol_sk, cn_carol, &entries, 2).unwrap_err();
+        assert_eq!(err, "parent transaction's nullifier was already present on the board — it was a double-spend");
+        let _ = bob_sk;
     }
 
     #[test]
@@ -1093,45 +1271,50 @@ mod tests {
         spend(GENESIS_SK, genesis_pk(), cn_genesis, &[], &tx0,
             &[genesis_coin], &[alice_coin.clone()], true, None).unwrap();
 
-        let alice_cp = coin_proof_chain(alice_sk, cn_alice, &entries, [0u8;32]);
-        assert_eq!(alice_cp[0].received_at, Some(0));
-        assert!(alice_cp[1].spent);
+        // The receipt is built once — no per-slot re-extension needed before
+        // either spend attempt below; freshness comes from the live
+        // nullifier-accumulator check inside `spend`/`check_spend` instead.
+        let (alice_receipt, _) = make_receipt(alice_sk, cn_alice, &entries, 0).unwrap();
+        assert_eq!(alice_receipt.received_at, 0);
 
         spend(alice_sk, alice_pk, cn_alice, &entries[..1], &tx1,
             &[alice_coin.clone()], &[bob_coin, alice_change], false,
-            Some(alice_cp[0].clone())).unwrap();
+            Some(alice_receipt.clone())).unwrap();
 
         let err = spend(alice_sk, alice_pk, cn_alice, &entries, &tx1b,
             &[alice_coin], &[carol_coin], false,
-            Some(alice_cp[1].clone())).unwrap_err();
+            Some(alice_receipt)).unwrap_err();
         assert_eq!(err, "P must not have spent this coin before (double spend)");
         let _ = bob_sk;
     }
 
     #[test]
-    fn rejects_tampered_board_entry() {
+    fn rejects_spend_using_a_receipt_for_a_different_coin() {
         let (alice_sk, alice_pk) = party(1);
         let (bob_sk, bob_pk) = party(2);
 
         let genesis_coin = coin(0xA1, 100, genesis_pk());
         let alice_coin   = coin(0xA2, 100, alice_pk);
-        let bob_coin     = coin(0xB1, 100, bob_pk);
+        let bob_coin     = coin(0xB1,  40, bob_pk);
+        let alice_change = coin(0xB2,  60, alice_pk);
 
-        let (tx0_real, sk0r, r0r) = make_tx(0, GENESIS_SK, &[genesis_coin.clone()], &[(alice_coin.clone(), alice_pk)]);
-        let (tx1,      _,    r1 ) = make_tx(1, alice_sk, &[alice_coin.clone()], &[(bob_coin.clone(), bob_pk)]);
-        let entries_real = vec![enc(&tx0_real,&r0r,sk0r)];
-        let cn_alice = alice_coin.commitment();
-        let alice_cp = coin_proof_chain(alice_sk, cn_alice, &entries_real, [0u8;32]);
+        let (tx0, sk0, r0) = make_tx(0, GENESIS_SK, &[genesis_coin], &[(alice_coin.clone(), alice_pk)]);
+        let (tx1, sk1, r1) = make_tx(1, alice_sk, &[alice_coin.clone()], &[(bob_coin.clone(), bob_pk), (alice_change.clone(), alice_pk)]);
+        let entries = vec![enc(&tx0,&r0,sk0), enc(&tx1,&r1,sk1)];
 
-        let fake_coin = coin(0xB3, 100, alice_pk);
-        let (tx0_fake, skf, rf) = make_tx(0, GENESIS_SK, &[genesis_coin], &[(fake_coin, alice_pk)]);
-        let entries_tampered = vec![enc(&tx0_fake,&rf,skf)];
+        let cn_alice  = alice_coin.commitment();
+        let cn_change = alice_change.commitment();
 
-        let err = spend(alice_sk, alice_pk, cn_alice, &entries_tampered, &tx1,
-            &[alice_coin], &[bob_coin], false,
-            Some(alice_cp[0].clone())).unwrap_err();
-        assert_eq!(err, "coin-proof's board root does not match the board prefix");
-        let _ = (bob_sk, r1);
+        let (alice_receipt, _) = make_receipt(alice_sk, cn_alice, &entries, 0).unwrap();
+
+        // tx2 legitimately spends alice_change, but we supply the receipt for
+        // alice_coin — a different (and already-spent) commitment — instead.
+        let payout = coin(0xC1, 60, bob_pk);
+        let (tx2, _, _) = make_tx(2, alice_sk, &[alice_change.clone()], &[(payout.clone(), bob_pk)]);
+        let err = spend(alice_sk, alice_pk, cn_change, &entries, &tx2,
+            &[alice_change], &[payout], false, Some(alice_receipt)).unwrap_err();
+        assert_eq!(err, "coin-proof tracks a different coin");
+        let _ = (bob_sk, sk1, r1);
     }
 
     #[test]
@@ -1147,5 +1330,62 @@ mod tests {
         let err = spend(GENESIS_SK, genesis_pk(), genesis_coin.commitment(), &[], &tx0,
             &[genesis_coin], &[alice_coin, extra_coin], true, None).unwrap_err();
         assert_eq!(err, "transaction violates value conservation: sum(inputs) must equal sum(outputs)");
+    }
+
+    #[test]
+    fn nullifier_tree_insert_cost_does_not_grow_with_tree_size() {
+        // Regression test for an earlier version with an O(n) `find_low_leaf_index`
+        // (linear scan) and a `root()` that rehashed the whole tree from scratch:
+        // that made `insert` cost scale with current tree size, turning `replay`
+        // (which calls `insert` in a loop) into O(k²) — catastrophic once the
+        // board has hundreds of thousands of entries. The incremental version
+        // (BTreeMap index + cached per-level node hashes) should insert in O(1)
+        // amortized, regardless of how many leaves already exist.
+        //
+        // Compares per-insert cost at two tree sizes 8x apart rather than
+        // asserting an absolute wall-clock budget, so it isn't flaky across
+        // debug/release builds or slower CI hardware — only relative growth
+        // matters here.
+        fn value(i: u32) -> [u8; 32] {
+            let mut v = [0u8; 32];
+            v[..4].copy_from_slice(&i.to_be_bytes());
+            v[31] = 1; // keep every value > [0u8;32], avoiding the sentinel edge case
+            v
+        }
+
+        let mut tree = NullifierTree::new();
+        let batch = 500u32;
+        let t = std::time::Instant::now();
+        for i in 0..batch {
+            tree.insert(value(i));
+        }
+        let small_per_insert = t.elapsed() / batch;
+
+        // Grow the tree 8x larger, then time an equal-sized batch again.
+        for i in batch..(batch * 8) {
+            tree.insert(value(i));
+        }
+        let t = std::time::Instant::now();
+        for i in (batch * 8)..(batch * 9) {
+            tree.insert(value(i));
+        }
+        let large_per_insert = t.elapsed() / batch;
+
+        assert!(
+            large_per_insert.as_secs_f64() < small_per_insert.as_secs_f64() * 4.0 + 0.001,
+            "insert cost grew from {small_per_insert:?}/insert at a small tree size to \
+             {large_per_insert:?}/insert at 8x the size — looks non-incremental"
+        );
+
+        // Correctness alongside the scale check: a never-inserted value still
+        // verifies as absent, and an inserted one no longer does.
+        let mut absent = [0xAAu8; 32];
+        absent[0] = 0xFF;
+        let witness = tree.prove_non_membership(absent);
+        assert!(verify_nonmembership(tree.root(), absent, &witness));
+
+        let member = value(batch * 8);
+        let w = tree.prove_non_membership(member);
+        assert!(!verify_nonmembership(tree.root(), member, &w));
     }
 }

@@ -2,7 +2,7 @@
 sp1_zkvm::entrypoint!(main);
 
 use sha2::{Digest, Sha256};
-use cloakkchain_lib::{check_spend, BoardEntry, Coin, CoinProofPublicValues, Transaction};
+use cloakkchain_lib::{check_spend, Coin, CoinReceiptPublicValues, NonMembershipWitness, Transaction};
 
 pub fn main() {
     let vkey: [u32; 8]             = sp1_zkvm::io::read();
@@ -10,13 +10,16 @@ pub fn main() {
     let sk_p: [u8; 32]             = sp1_zkvm::io::read();
     let pk_p: [u8; 32]             = sp1_zkvm::io::read();
     let coin_commitment: [u8; 32]  = sp1_zkvm::io::read();
-    let prior_entries: Vec<BoardEntry> = sp1_zkvm::io::read();
+    let entry_position: usize      = sp1_zkvm::io::read();
+    let append_path: Vec<[u8; 32]> = sp1_zkvm::io::read();
     let tx_star: Transaction       = sp1_zkvm::io::read();
     let input_coins: Vec<Coin>     = sp1_zkvm::io::read();
     let output_coins: Vec<Coin>    = sp1_zkvm::io::read();
     let is_genesis: bool           = sp1_zkvm::io::read();
-    let coin_proof: Option<CoinProofPublicValues> =
+    let coin_proof: Option<CoinReceiptPublicValues> =
         if is_genesis { None } else { Some(sp1_zkvm::io::read()) };
+    let own_nullifier_nonmembership: NonMembershipWitness = sp1_zkvm::io::read();
+    let current_nullifier_root: [u8; 32] = sp1_zkvm::io::read();
 
     let public_values = check_spend(
         vkey,
@@ -24,16 +27,19 @@ pub fn main() {
         sk_p,
         pk_p,
         coin_commitment,
-        prior_entries,
+        entry_position,
+        append_path,
         tx_star,
         input_coins,
         output_coins,
         is_genesis,
         coin_proof.clone(),
+        own_nullifier_nonmembership,
+        current_nullifier_root,
     )
     .expect("the Valid relation does not hold for this transaction");
 
-    // Non-genesis: verify spender's coin-proof via deferred compressed-STARK check.
+    // Non-genesis: verify spender's receipt via deferred compressed-STARK check.
     // Consumes the proof written via stdin.write_proof.
     if let Some(cp) = &coin_proof {
         let pv_digest: [u8; 32] = Sha256::digest(&cp.encode()).into();
