@@ -95,16 +95,23 @@ impl<'a> Wallet<'a> {
     /// coin's receipt is a single proof built once here — never re-proven or
     /// re-extended on later slots, since "still unspent" is answered fresh
     /// (via the nullifier accumulator) at spend time instead.
+    /// `nullifier_tree` must reflect exactly the state *before* this slot's
+    /// own entry — i.e. call this before inserting `all_entries[slot]`'s
+    /// nullifier into it. That's what lets any coin discovered here (created
+    /// by this very entry) correctly check its parent wasn't a double-spend.
+    #[allow(clippy::too_many_arguments)]
     fn process_slot<C: Prover>(
         &mut self,
         slot: usize,
         all_entries: &[BoardEntry],
+        nullifier_tree: &NullifierTree,
         coinproof_pk: &C::ProvingKey,
         coinproof_vkey: &[u32; 8],
         vfy_g16_pk: &C::ProvingKey,
         vfy_g16_vkey: &[u32; 8],
         client: &C,
         stats: &mut Vec<ProveStats>,
+        nullifier_ops: &mut Vec<(String, std::time::Duration)>,
     ) {
         assert_eq!(all_entries.len(), slot + 1);
         let entry = &all_entries[slot];
@@ -119,10 +126,10 @@ impl<'a> Wallet<'a> {
                         if !self.coins.contains_key(&cn) {
                             println!("  [{}] discovered coin (value={}) at slot {} — bootstrapping",
                                 self.party.name, note_coin.value, slot);
-                            self.bootstrap(cn, slot, all_entries,
+                            self.bootstrap(cn, slot, all_entries, nullifier_tree,
                                 coinproof_pk, coinproof_vkey,
                                 vfy_g16_pk, vfy_g16_vkey,
-                                client, stats);
+                                client, stats, nullifier_ops);
                         }
                     }
                 }
@@ -131,18 +138,23 @@ impl<'a> Wallet<'a> {
     }
 
     /// Build a coin's one-shot receipt: `all_entries[received_slot]` is the
-    /// transaction that transferred it to this wallet.
+    /// transaction that transferred it to this wallet. `nullifier_tree` must
+    /// reflect the state *before* `received_slot`'s own entry (see
+    /// `process_slot`) — the parent-nullifier check needs exactly that.
+    #[allow(clippy::too_many_arguments)]
     fn bootstrap<C: Prover>(
         &mut self,
         cn: [u8; 32],
         received_slot: usize,
         all_entries: &[BoardEntry],
+        nullifier_tree: &NullifierTree,
         coinproof_pk: &C::ProvingKey,
         coinproof_vkey: &[u32; 8],
         vfy_g16_pk: &C::ProvingKey,
         vfy_g16_vkey: &[u32; 8],
         client: &C,
         stats: &mut Vec<ProveStats>,
+        nullifier_ops: &mut Vec<(String, std::time::Duration)>,
     ) {
         let entry = &all_entries[received_slot];
 
@@ -165,9 +177,10 @@ impl<'a> Wallet<'a> {
         };
 
         let ap = append_proof_for(&all_entries[..=received_slot]);
-        let parent_tree = nullifier_tree_as_of(all_entries, received_slot);
-        let parent_root = parent_tree.root();
-        let parent_witness = parent_tree.prove_non_membership(entry.nullifier);
+        let parent_label = format!("parent-nullifier witness ({} receipt slot {})", self.party.name, received_slot);
+        let (parent_root, parent_witness) = timed(&parent_label, nullifier_ops, || {
+            (nullifier_tree.root(), nullifier_tree.prove_non_membership(entry.nullifier))
+        });
         let mut stdin = build_coinproof_stdin(
             coinproof_vkey, vfy_g16_vkey,
             self.party.sk, cn, entry, received_slot, &ap,
@@ -218,21 +231,37 @@ impl<'a> Wallet<'a> {
 fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{:02x}", x)).collect() }
 
 // ---- Nullifier accumulator helpers ------------------------------------------
+//
+// `main()` maintains a single `NullifierTree`, inserting each slot's own
+// (already-public) nullifier into it exactly once, right after that slot's
+// spend proof and all wallets' receipt processing are done — never rebuilt
+// from scratch per coin. Anyone could independently reconstruct the same
+// tree from the public `BoardEntry.nullifier` history, the same way
+// `merkle_root_of` lets anyone reconstruct the board's root.
 
-/// Rebuild the nullifier tree as it stood after the first `count` board
-/// entries' own (already-public) nullifiers were inserted — the same tree any
-/// external verifier could independently reconstruct. Pure hashing, run
-/// entirely host-side; cheap enough to recompute on demand rather than
-/// maintain incremental snapshots for this scope.
-fn nullifier_tree_as_of(entries: &[BoardEntry], count: usize) -> NullifierTree {
-    let all: Vec<[u8; 32]> = entries.iter().map(|e| e.nullifier).collect();
-    NullifierTree::replay(&all, count)
+/// Run `f`, recording its wall-clock time under `label` — used to separate
+/// the nullifier accumulator's host-side cost (microseconds) from actual
+/// SNARK proving time (minutes) in the final report.
+fn timed<T>(label: &str, ops: &mut Vec<(String, std::time::Duration)>, f: impl FnOnce() -> T) -> T {
+    let t = Instant::now();
+    let result = f();
+    ops.push((label.to_string(), t.elapsed()));
+    result
 }
 
-/// Non-membership witness + current root for `H(coin_commitment || sk)`
-/// against the nullifier tree built from all of `entries`.
-fn own_nullifier_witness(entries: &[BoardEntry], coin_commitment: [u8; 32], sk: [u8; 32]) -> (NonMembershipWitness, [u8; 32]) {
-    let tree = nullifier_tree_as_of(entries, entries.len());
+fn print_nullifier_tree_stats(ops: &[(String, std::time::Duration)]) {
+    println!("\n{}", "=".repeat(64));
+    println!("  Nullifier Accumulator — host-side timing (not SNARK proving)");
+    println!("{}", "=".repeat(64));
+    for (label, d) in ops {
+        println!("{:<44} {:>15}", label, format!("{:?}", d));
+    }
+    println!("{}", "=".repeat(64));
+}
+
+/// Non-membership witness + root for `H(coin_commitment || sk)` against
+/// `tree`'s current state.
+fn own_nullifier_witness(tree: &NullifierTree, coin_commitment: [u8; 32], sk: [u8; 32]) -> (NonMembershipWitness, [u8; 32]) {
     let own_null = nullifier(coin_commitment, sk);
     (tree.prove_non_membership(own_null), tree.root())
 }
@@ -609,12 +638,13 @@ fn main() {
         let alice_coin_b   = coin(0xA2, 100, alice_b.pk);
         let cn_genesis_b   = genesis_coin_b.commitment();
         let entries_b: Vec<BoardEntry> = vec![];
+        let nullifier_tree_b = NullifierTree::new();
 
         println!("--- Step 1: generating genesis spend proof (Groth16) ---");
         let (tx0_b, _, _) = make_tx(0, GENESIS_SK,
             &[genesis_coin_b.clone()], &[(alice_coin_b.clone(), alice_b.pk)]);
         let ap_b = append_path_for_next(&entries_b);
-        let (witness_b, root_b) = own_nullifier_witness(&entries_b, cn_genesis_b, genesis_b.sk);
+        let (witness_b, root_b) = own_nullifier_witness(&nullifier_tree_b, cn_genesis_b, genesis_b.sk);
         let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis_b, cn_genesis_b,
             entries_b.len(), &ap_b, &tx0_b, &[genesis_coin_b.clone()], &[alice_coin_b.clone()],
             true, None, &witness_b, root_b);
@@ -670,11 +700,12 @@ fn main() {
         println!("vfy_g16 vkey:   {}", vfy_g16_pk.verifying_key().bytes32());
 
         let mut stats: Vec<ExecStats> = Vec::new();
+        let nullifier_tree = NullifierTree::new();
 
         // Slot 0: genesis mint.
         let (mut tx0, s0, r0) = make_tx(0, GENESIS_SK, &[genesis_coin.clone()], &[(alice_coin.clone(), alice.pk)]);
         let ap0_spend = append_path_for_next(&entries);
-        let (witness0, root0) = own_nullifier_witness(&entries, cn_genesis, genesis.sk);
+        let (witness0, root0) = own_nullifier_witness(&nullifier_tree, cn_genesis, genesis.sk);
         let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn_genesis,
             entries.len(), &ap0_spend, &tx0, &[genesis_coin.clone()], &[alice_coin.clone()],
             true, None, &witness0, root0);
@@ -693,11 +724,12 @@ fn main() {
         stats.push(ExecStats { name: "Slot 0: genesis mint (spend)".into(), board_size: 1, exec_ms, cycles: report.total_instruction_count() });
 
         // Only Alice actually received cn_alice — a receipt can only ever be
-        // built for a coin genuinely transferred to its holder.
+        // built for a coin genuinely transferred to its holder. `nullifier_tree`
+        // still reflects the pre-slot-0 (empty) state, exactly what the
+        // parent-nullifier check needs.
         let ap0 = append_proof_for(&entries[..1]);
-        let parent_tree = nullifier_tree_as_of(&entries, 0);
-        let parent_witness = parent_tree.prove_non_membership(entries[0].nullifier);
-        let parent_root = parent_tree.root();
+        let parent_witness = nullifier_tree.prove_non_membership(entries[0].nullifier);
+        let parent_root = nullifier_tree.root();
         let stdin = build_coinproof_stdin(
             &coinproof_vkey, &vfy_g16_vkey,
             alice.sk, cn_alice,
@@ -733,6 +765,14 @@ fn main() {
     let mut bob_wallet   = Wallet::new(&bob);
     let mut carol_wallet = Wallet::new(&carol);
     let mut stats: Vec<ProveStats> = Vec::new();
+    // Maintained across the whole run: inserted into exactly once per slot,
+    // right after that slot's spend + all wallets' receipt processing are
+    // done (never rebuilt from scratch per coin - see the module comment
+    // above `own_nullifier_witness`).
+    let mut nullifier_tree = NullifierTree::new();
+    // Host-side timing for the nullifier tree itself (microseconds), kept
+    // separate from `stats`'s SNARK prove/verify times (minutes).
+    let mut nullifier_ops: Vec<(String, std::time::Duration)> = Vec::new();
 
     // =========================================================================
     // Slot 0: genesis mints 100 units to Alice
@@ -740,7 +780,8 @@ fn main() {
     println!("\n--- Slot 0: genesis mint (1 input → 1 output) ---");
     let (mut tx0, s0, r0) = make_tx(0, GENESIS_SK, &[genesis_coin.clone()], &[(alice_coin.clone(), alice.pk)]);
     let ap0_spend = append_path_for_next(&entries);
-    let (witness0, root0) = own_nullifier_witness(&entries, cn_genesis, genesis.sk);
+    let (witness0, root0) = timed("own-nullifier witness (Genesis spend slot 0)", &mut nullifier_ops,
+        || own_nullifier_witness(&nullifier_tree, cn_genesis, genesis.sk));
     let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn_genesis,
         entries.len(), &ap0_spend, &tx0, &[genesis_coin.clone()], &[alice_coin.clone()],
         true, None, &witness0, root0);
@@ -762,9 +803,10 @@ fn main() {
     println!("  Proved & verified ({prove_secs:.1} s) — proof {} — entry {}", fmt_bytes(genesis_proof_size), fmt_bytes(e0_bytes));
 
     println!("--- Wallets scanning slot 0 ---");
-    alice_wallet.process_slot(0, &entries, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats);
-    bob_wallet  .process_slot(0, &entries, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats);
-    carol_wallet.process_slot(0, &entries, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats);
+    alice_wallet.process_slot(0, &entries, &nullifier_tree, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats, &mut nullifier_ops);
+    bob_wallet  .process_slot(0, &entries, &nullifier_tree, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats, &mut nullifier_ops);
+    carol_wallet.process_slot(0, &entries, &nullifier_tree, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats, &mut nullifier_ops);
+    timed("insert nullifier (slot 0)", &mut nullifier_ops, || nullifier_tree.insert(entries[0].nullifier));
 
     // =========================================================================
     // Slot 1: Alice sends 40 to Bob + 60 change
@@ -775,7 +817,8 @@ fn main() {
     let alice_record = alice_wallet.get(&cn_alice).expect("Alice must have cn_alice receipt");
     let alice_cp     = alice_record.proof.clone();
     let ap1_spend = append_path_for_next(&entries);
-    let (witness1, root1) = own_nullifier_witness(&entries, cn_alice, alice.sk);
+    let (witness1, root1) = timed("own-nullifier witness (Alice spend slot 1)", &mut nullifier_ops,
+        || own_nullifier_witness(&nullifier_tree, cn_alice, alice.sk));
     let mut stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &alice, cn_alice,
         entries.len(), &ap1_spend, &tx1,
         &[alice_coin.clone()], &[bob_coin.clone(), alice_change.clone()],
@@ -800,9 +843,10 @@ fn main() {
     println!("  Proved & verified ({prove_secs:.1} s) — proof {} — entry {}", fmt_bytes(alice_proof_size), fmt_bytes(e1_bytes));
 
     println!("--- Wallets scanning slot 1 ---");
-    alice_wallet.process_slot(1, &entries, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats);
-    bob_wallet  .process_slot(1, &entries, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats);
-    carol_wallet.process_slot(1, &entries, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats);
+    alice_wallet.process_slot(1, &entries, &nullifier_tree, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats, &mut nullifier_ops);
+    bob_wallet  .process_slot(1, &entries, &nullifier_tree, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats, &mut nullifier_ops);
+    carol_wallet.process_slot(1, &entries, &nullifier_tree, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats, &mut nullifier_ops);
+    timed("insert nullifier (slot 1)", &mut nullifier_ops, || nullifier_tree.insert(entries[1].nullifier));
 
     // =========================================================================
     // Slot 2: Bob sends 40 to Carol
@@ -812,7 +856,8 @@ fn main() {
     let bob_record = bob_wallet.get(&cn_bob).expect("Bob must have cn_bob receipt");
     let bob_cp     = bob_record.proof.clone();
     let ap2_spend = append_path_for_next(&entries);
-    let (witness2, root2) = own_nullifier_witness(&entries, cn_bob, bob.sk);
+    let (witness2, root2) = timed("own-nullifier witness (Bob spend slot 2)", &mut nullifier_ops,
+        || own_nullifier_witness(&nullifier_tree, cn_bob, bob.sk));
     let mut stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &bob, cn_bob,
         entries.len(), &ap2_spend, &tx2,
         &[bob_coin.clone()], &[carol_coin.clone()],
@@ -836,9 +881,10 @@ fn main() {
     println!("  Proved & verified ({prove_secs:.1} s) — proof {} — entry {}", fmt_bytes(bob_proof_size), fmt_bytes(e2_bytes));
 
     println!("--- Wallets scanning slot 2 ---");
-    alice_wallet.process_slot(2, &entries, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats);
-    bob_wallet  .process_slot(2, &entries, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats);
-    carol_wallet.process_slot(2, &entries, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats);
+    alice_wallet.process_slot(2, &entries, &nullifier_tree, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats, &mut nullifier_ops);
+    bob_wallet  .process_slot(2, &entries, &nullifier_tree, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats, &mut nullifier_ops);
+    carol_wallet.process_slot(2, &entries, &nullifier_tree, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats, &mut nullifier_ops);
+    timed("insert nullifier (slot 2)", &mut nullifier_ops, || nullifier_tree.insert(entries[2].nullifier));
 
     println!("\n=== Wallet States ===");
     alice_wallet.print_state();
@@ -846,4 +892,5 @@ fn main() {
     carol_wallet.print_state();
 
     print_prove_table(&stats);
+    print_nullifier_tree_stats(&nullifier_ops);
 }
