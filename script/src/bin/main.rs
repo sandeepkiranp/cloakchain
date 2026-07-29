@@ -168,11 +168,11 @@ impl<'a> Wallet<'a> {
             let vfy_label = format!("{} VFY-G16 slot {}", self.party.name, received_slot);
             println!("  [{}] proving VFY-G16 …", vfy_label);
             let t = Instant::now();
-            let proof = prove_subprocess("vfy-g16", &vfy_stdin);
+            let (proof, peak_mem_kb) = prove_subprocess("vfy-g16", &vfy_stdin);
             let prove_secs = t.elapsed().as_secs_f64();
             println!("  [{}]  ({:.1}s)", vfy_label, prove_secs);
             stats.push(ProveStats { name: vfy_label, board_size: received_slot + 1,
-                prove_secs, verify_ms: 0.0, proof_bytes: None, entry_bytes: None });
+                prove_secs, verify_ms: 0.0, proof_bytes: None, entry_bytes: None, peak_mem_kb });
             proof
         };
 
@@ -203,7 +203,7 @@ impl<'a> Wallet<'a> {
         stats: &mut Vec<ProveStats>,
     ) -> CoinRecord {
         let t = Instant::now();
-        let proof = prove_subprocess("coinproof", &stdin);   // compressed STARK
+        let (proof, peak_mem_kb) = prove_subprocess("coinproof", &stdin);   // compressed STARK
         let prove_secs = t.elapsed().as_secs_f64();
         let t = Instant::now();
         client.verify(&proof, coinproof_pk.verifying_key(), None).expect("coin-receipt verify failed");
@@ -212,7 +212,7 @@ impl<'a> Wallet<'a> {
             .expect("decode coin-receipt pv");
         let proof_bytes = bincode::serialize(&proof).map(|v| v.len()).ok();
         println!("  [{}]  received_at={}  ({:.1}s)", label, pv.received_at, prove_secs);
-        stats.push(ProveStats { name: label.to_string(), board_size, prove_secs, verify_ms, proof_bytes, entry_bytes: None });
+        stats.push(ProveStats { name: label.to_string(), board_size, prove_secs, verify_ms, proof_bytes, entry_bytes: None, peak_mem_kb });
         CoinRecord { pv, proof }
     }
 
@@ -275,6 +275,7 @@ struct ProveStats {
     verify_ms: f64,
     proof_bytes: Option<usize>,   // serialized proof size
     entry_bytes: Option<usize>,   // full serialized BoardEntry size (on-board cost)
+    peak_mem_kb: Option<u64>,     // peak RSS (VmHWM) of the proving subprocess
 }
 struct ExecStats  { name: String, board_size: usize, exec_ms: u128, cycles: u64 }
 
@@ -284,20 +285,28 @@ fn fmt_bytes(b: usize) -> String {
     else               { format!("{} B", b) }
 }
 
+fn fmt_mem_kb(kb: Option<u64>) -> String {
+    match kb {
+        Some(kb) => fmt_bytes(kb as usize * 1024),
+        None => "—".to_string(),
+    }
+}
+
 fn print_prove_table(stats: &[ProveStats]) {
-    let w = 96;
+    let w = 112;
     println!("\n{}", "=".repeat(w));
     println!("  Proof Statistics");
     println!("{}", "=".repeat(w));
-    println!("{:<44} {:>5}  {:>9}  {:>10}  {:>11}  {:>11}",
-             "Step", "Board", "Prove", "Verify", "Proof", "Entry");
+    println!("{:<44} {:>5}  {:>9}  {:>10}  {:>11}  {:>11}  {:>11}",
+             "Step", "Board", "Prove", "Verify", "Proof", "Entry", "Peak Mem");
     println!("{}", "-".repeat(w));
     let (mut tp, mut tv) = (0f64, 0f64);
     for s in stats {
         let proof_col = s.proof_bytes.map_or("          —".into(), |b| format!("{:>11}", fmt_bytes(b)));
         let entry_col = s.entry_bytes.map_or("          —".into(), |b| format!("{:>11}", fmt_bytes(b)));
-        println!("{:<44} {:>5}  {:>7.1} s  {:>8.1} ms  {}  {}",
-                 s.name, s.board_size, s.prove_secs, s.verify_ms, proof_col, entry_col);
+        let mem_col = format!("{:>11}", fmt_mem_kb(s.peak_mem_kb));
+        println!("{:<44} {:>5}  {:>7.1} s  {:>8.1} ms  {}  {}  {}",
+                 s.name, s.board_size, s.prove_secs, s.verify_ms, proof_col, entry_col, mem_col);
         tp += s.prove_secs; tv += s.verify_ms;
     }
     println!("{}", "-".repeat(w));
@@ -351,7 +360,31 @@ fn nullifier(cn: [u8; 32], sk: [u8; 32]) -> [u8; 32] {
 ///
 /// Subprocess isolation means the OS fully reclaims all Go/gnark pages when
 /// the child exits, so every proof starts with a clean slate.
-fn prove_subprocess(elf_id: &str, stdin: &SP1Stdin) -> SP1ProofWithPublicValues {
+/// Poll `/proc/<pid>/status` for `VmHWM` (the kernel's own running peak
+/// resident-set-size tracker) while `child` runs, returning the highest
+/// value observed (in KB) alongside its exit status. Linux-only — silently
+/// yields `None` for the memory reading anywhere `/proc` isn't available.
+fn wait_tracking_peak_memory(mut child: std::process::Child) -> (std::process::ExitStatus, Option<u64>) {
+    let pid = child.id();
+    let mut peak_kb: Option<u64> = None;
+    loop {
+        if let Ok(status_text) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            for line in status_text.lines() {
+                if let Some(rest) = line.strip_prefix("VmHWM:") {
+                    if let Some(kb) = rest.split_whitespace().next().and_then(|s| s.parse::<u64>().ok()) {
+                        peak_kb = Some(peak_kb.map_or(kb, |p: u64| p.max(kb)));
+                    }
+                }
+            }
+        }
+        match child.try_wait().expect("poll proving subprocess") {
+            Some(status) => return (status, peak_kb),
+            None => std::thread::sleep(std::time::Duration::from_millis(500)),
+        }
+    }
+}
+
+fn prove_subprocess(elf_id: &str, stdin: &SP1Stdin) -> (SP1ProofWithPublicValues, Option<u64>) {
     let tmp = std::env::temp_dir();
     let stdin_path  = tmp.join(format!("cloakchain_{elf_id}_stdin.bin"));
     let proof_path  = tmp.join(format!("cloakchain_{elf_id}_proof.bin"));
@@ -381,7 +414,8 @@ fn prove_subprocess(elf_id: &str, stdin: &SP1Stdin) -> SP1ProofWithPublicValues 
         }
         _ => {}
     }
-    let status = cmd.status().expect("spawn proving subprocess");
+    let child = cmd.spawn().expect("spawn proving subprocess");
+    let (status, peak_mem_kb) = wait_tracking_peak_memory(child);
     assert!(status.success(), "proving subprocess for {elf_id} exited with {status}");
 
     let proof_bytes = std::fs::read(&proof_path).expect("read proof file");
@@ -389,7 +423,7 @@ fn prove_subprocess(elf_id: &str, stdin: &SP1Stdin) -> SP1ProofWithPublicValues 
         bincode::deserialize(&proof_bytes).expect("deserialize SP1ProofWithPublicValues");
     let _ = std::fs::remove_file(&stdin_path);
     let _ = std::fs::remove_file(&proof_path);
-    proof
+    (proof, peak_mem_kb)
 }
 
 /// Entry point when this binary is re-invoked as a proving subprocess.
@@ -649,7 +683,7 @@ fn main() {
             entries_b.len(), &ap_b, &tx0_b, &[genesis_coin_b.clone()], &[alice_coin_b.clone()],
             true, None, &witness_b, root_b);
         let t = Instant::now();
-        let spend_proof = prove_subprocess("spend", &stdin);
+        let (spend_proof, _) = prove_subprocess("spend", &stdin);
         println!("  generated in {:.1}s ({} bytes)", t.elapsed().as_secs_f64(), spend_proof.bytes().len());
 
         println!("--- Step 2: executing VFY_G16_ELF to measure cycles ---");
@@ -787,7 +821,7 @@ fn main() {
         true, None, &witness0, root0);
     // Genesis is_genesis=true → no coin-proof write_proof needed.
     let t = Instant::now();
-    let genesis_proof = prove_subprocess("spend", &stdin);
+    let (genesis_proof, peak_mem_kb) = prove_subprocess("spend", &stdin);
     let prove_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
     client.verify(&genesis_proof, spend_pk.verifying_key(), None).expect("genesis verify");
@@ -799,7 +833,7 @@ fn main() {
     tx0.spend_proof = bincode::serialize(&genesis_pkg).expect("serialize spend proof package");
     entries.push(encrypt_tx(&tx0, &r0, s0));
     let e0_bytes = bincode::serialize(&entries[0]).map(|v| v.len()).unwrap_or(0);
-    stats.push(ProveStats { name: "Slot 0: genesis mint".into(), board_size: 1, prove_secs, verify_ms, proof_bytes: Some(genesis_proof_size), entry_bytes: Some(e0_bytes) });
+    stats.push(ProveStats { name: "Slot 0: genesis mint".into(), board_size: 1, prove_secs, verify_ms, proof_bytes: Some(genesis_proof_size), entry_bytes: Some(e0_bytes), peak_mem_kb });
     println!("  Proved & verified ({prove_secs:.1} s) — proof {} — entry {}", fmt_bytes(genesis_proof_size), fmt_bytes(e0_bytes));
 
     println!("--- Wallets scanning slot 0 ---");
@@ -827,7 +861,7 @@ fn main() {
     let SP1Proof::Compressed(ac) = alice_cp.proof else { panic!("expected compressed coin-receipt") };
     stdin.write_proof(*ac, coinproof_pk.verifying_key().vk.clone());
     let t = Instant::now();
-    let alice_spend_proof = prove_subprocess("spend", &stdin);
+    let (alice_spend_proof, peak_mem_kb) = prove_subprocess("spend", &stdin);
     let prove_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
     client.verify(&alice_spend_proof, spend_pk.verifying_key(), None).expect("alice spend verify");
@@ -839,7 +873,7 @@ fn main() {
     tx1.spend_proof = bincode::serialize(&alice_pkg).expect("serialize spend proof package");
     entries.push(encrypt_tx(&tx1, &r1, s1));
     let e1_bytes = bincode::serialize(&entries[1]).map(|v| v.len()).unwrap_or(0);
-    stats.push(ProveStats { name: "Slot 1: Alice's spend (groth16)".into(), board_size: 2, prove_secs, verify_ms, proof_bytes: Some(alice_proof_size), entry_bytes: Some(e1_bytes) });
+    stats.push(ProveStats { name: "Slot 1: Alice's spend (groth16)".into(), board_size: 2, prove_secs, verify_ms, proof_bytes: Some(alice_proof_size), entry_bytes: Some(e1_bytes), peak_mem_kb });
     println!("  Proved & verified ({prove_secs:.1} s) — proof {} — entry {}", fmt_bytes(alice_proof_size), fmt_bytes(e1_bytes));
 
     println!("--- Wallets scanning slot 1 ---");
@@ -865,7 +899,7 @@ fn main() {
     let SP1Proof::Compressed(bc) = bob_cp.proof else { panic!("expected compressed coin-receipt") };
     stdin.write_proof(*bc, coinproof_pk.verifying_key().vk.clone());
     let t = Instant::now();
-    let bob_spend_proof = prove_subprocess("spend", &stdin);
+    let (bob_spend_proof, peak_mem_kb) = prove_subprocess("spend", &stdin);
     let prove_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
     client.verify(&bob_spend_proof, spend_pk.verifying_key(), None).expect("bob spend verify");
@@ -877,7 +911,7 @@ fn main() {
     tx2.spend_proof = bincode::serialize(&bob_pkg).expect("serialize spend proof package");
     entries.push(encrypt_tx(&tx2, &r2, s2));
     let e2_bytes = bincode::serialize(&entries[2]).map(|v| v.len()).unwrap_or(0);
-    stats.push(ProveStats { name: "Slot 2: Bob's spend (groth16)".into(), board_size: 3, prove_secs, verify_ms, proof_bytes: Some(bob_proof_size), entry_bytes: Some(e2_bytes) });
+    stats.push(ProveStats { name: "Slot 2: Bob's spend (groth16)".into(), board_size: 3, prove_secs, verify_ms, proof_bytes: Some(bob_proof_size), entry_bytes: Some(e2_bytes), peak_mem_kb });
     println!("  Proved & verified ({prove_secs:.1} s) — proof {} — entry {}", fmt_bytes(bob_proof_size), fmt_bytes(e2_bytes));
 
     println!("--- Wallets scanning slot 2 ---");
