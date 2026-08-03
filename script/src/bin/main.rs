@@ -354,9 +354,14 @@ fn nullifier(cn: [u8; 32], sk: [u8; 32]) -> [u8; 32] {
 /// Run a proof (Groth16 or compressed STARK) in a fresh child process.
 ///
 /// The elf_id controls what proof type the subprocess generates:
-///   "spend"     → Groth16  (gnark, ~50 GB overhead, needs isolation)
-///   "coinproof" → compressed STARK  (tiny STARK trace, isolated for safety)
-///   "vfy-g16"   → compressed STARK  (runs Groth16Verifier inside, ~10–15 GB)
+///   "spend"     → Groth16  (gnark, ~28-29 GB peak, needs isolation)
+///   "coinproof" → compressed STARK  (tiny STARK trace, ~23 GB peak)
+///   "vfy-g16"   → compressed STARK, ~56-59 GB peak — the single most
+///                 memory-hungry step. Not from running Groth16Verifier
+///                 itself (that finishes in milliseconds); the cost is
+///                 SP1's own recursive STARK-folding stage afterward
+///                 (mode=Compressed), driven by how many BN254 precompile
+///                 chips VFY-G16's trace activates.
 ///
 /// Subprocess isolation means the OS fully reclaims all Go/gnark pages when
 /// the child exits, so every proof starts with a clean slate.
@@ -407,7 +412,15 @@ fn prove_subprocess(elf_id: &str, stdin: &SP1Stdin) -> (SP1ProofWithPublicValues
     ]).envs(std::env::vars());
     match elf_id {
         "vfy-g16" => {
-            cmd.env("SHARD_SIZE", "262144");  // 1<<18; ~636K cycles ≈ 3 shards
+            // Overridable via VFY_G16_SHARD_SIZE for experimenting with peak
+            // memory (SP1's recursive compress stage) without a rebuild -
+            // e.g. `VFY_G16_SHARD_SIZE=1048576 cargo run --release -- --prove`.
+            // Must stay ≥2 shards' worth (default 16M puts everything in 1
+            // shard, which triggers the BaseAlu padding DivF bug) and safely
+            // below 16M.
+            let shard_size = std::env::var("VFY_G16_SHARD_SIZE").unwrap_or_else(|_| "262144".into());
+            eprintln!("[main] vfy-g16 SHARD_SIZE={shard_size}");
+            cmd.env("SHARD_SIZE", shard_size);  // default 1<<18; ~3.5M cycles ≈ 14 shards
         }
         "coinproof" => {
             cmd.env("SHARD_SIZE", "262144");  // 1<<18; ~3M cycles ≈ 12 shards
