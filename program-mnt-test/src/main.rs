@@ -12,6 +12,7 @@ sp1_zkvm::entrypoint!(main);
 use ark_groth16::{Groth16, Proof, VerifyingKey};
 use ark_mnt4_753::{Fr, MNT4_753};
 use ark_serialize::CanonicalDeserialize;
+use ark_snark::SNARK;
 
 pub fn main() {
     let proof_bytes: Vec<u8> = sp1_zkvm::io::read_vec();
