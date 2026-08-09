@@ -34,6 +34,12 @@ use sp1_sdk::{
 const CLOAKKCHAIN_SPEND_ELF: Elf     = include_elf!("cloakkchain-program-spend");
 const CLOAKKCHAIN_COINPROOF_ELF: Elf = include_elf!("cloakkchain-program-coinproof");
 const VFY_G16_ELF: Elf               = include_elf!("cloakkchain-program-vfy-g16");
+// Experimental: verifies an MNT4-753 Groth16 proof instead of BN254, to
+// measure whether SP1 proving this is cheaper or more expensive than
+// VFY_G16_ELF — testing the hypothesis that no MNT precompile + larger
+// 753-bit fields makes it worse, not better. See memory:
+// native_gnark_vfy_g16_proposal.md and the MNT-curve discussion in chat.
+const MNT_TEST_ELF: Elf              = include_elf!("cloakkchain-program-mnt-test");
 
 // ---- CLI args ---------------------------------------------------------------
 
@@ -46,6 +52,8 @@ struct Args {
     prove: bool,
     #[arg(long, help = "Generate one Groth16 spend proof then execute VFY_G16_ELF to measure cycles — no full proving")]
     bench_vfy_g16: bool,
+    #[arg(long, help = "Full execute+prove of MNT_TEST_ELF against the fixed MNT4-753 test fixtures — measures real cycles and peak memory, comparable to vfy-g16's numbers")]
+    bench_mnt_test: bool,
     // Hidden flags used when this binary re-invokes itself as a proving subprocess.
     // Each proof runs in its own process so the Go/gnark circuit memory is fully
     // returned to the OS between proofs (prevents OOM on machines with ≤64 GB RAM).
@@ -425,6 +433,12 @@ fn prove_subprocess(elf_id: &str, stdin: &SP1Stdin) -> (SP1ProofWithPublicValues
         "coinproof" => {
             cmd.env("SHARD_SIZE", "262144");  // 1<<18; ~3M cycles ≈ 12 shards
         }
+        "mnt-test" => {
+            // Same guard as vfy-g16/coinproof against the single-shard
+            // BaseAlu padding DivF bug — unknown cycle count for MNT4-753
+            // verification ahead of time, so default to the same safe size.
+            cmd.env("SHARD_SIZE", "262144");
+        }
         _ => {}
     }
     let child = cmd.spawn().expect("spawn proving subprocess");
@@ -536,6 +550,23 @@ fn run_internal_prove(elf_id: &str, stdin_path: &std::path::Path, output_path: &
             }
             // ── Proof ──────────────────────────────────────────────────────────────
             let pk = client.setup(VFY_G16_ELF).expect("setup vfy-g16");
+            client.prove(&pk, stdin).compressed().run().expect("compressed prove")
+        }
+        "mnt-test" => {
+            // ── Diagnostics ────────────────────────────────────────────────────────
+            match client.execute(MNT_TEST_ELF, stdin.clone()).run() {
+                Ok((_, report)) => {
+                    eprintln!(
+                        "[MNT-TEST-DIAG] execute OK: cycles={} exit_code={}",
+                        report.total_instruction_count(),
+                        report.exit_code
+                    );
+                    eprintln!("[MNT-TEST-DIAG] full execution report:\n{report}");
+                }
+                Err(e) => eprintln!("[MNT-TEST-DIAG] execute FAILED: {e}"),
+            }
+            // ── Proof ──────────────────────────────────────────────────────────────
+            let pk = client.setup(MNT_TEST_ELF).expect("setup mnt-test");
             client.prove(&pk, stdin).compressed().run().expect("compressed prove")
         }
         other => panic!("unknown elf id: {other}"),
@@ -665,10 +696,39 @@ fn main() {
         return;
     }
 
-    let mode_count = [args.execute, args.prove, args.bench_vfy_g16].iter().filter(|&&b| b).count();
+    let mode_count = [args.execute, args.prove, args.bench_vfy_g16, args.bench_mnt_test].iter().filter(|&&b| b).count();
     if mode_count != 1 {
-        eprintln!("Error: specify exactly one of --execute, --prove, --bench-vfy-g16");
+        eprintln!("Error: specify exactly one of --execute, --prove, --bench-vfy-g16, --bench-mnt-test");
         std::process::exit(1);
+    }
+
+    // ---- --bench-mnt-test -------------------------------------------------------
+    // Full execute+prove (not just execute) against fixed fixtures generated
+    // offline (program-mnt-test/test-fixtures/, via a standalone arkworks
+    // program — see native_gnark_vfy_g16_proposal.md memory for context).
+    // Uses prove_subprocess so peak memory is tracked via VmHWM exactly like
+    // spend/coinproof/vfy-g16, giving a directly comparable number.
+    if args.bench_mnt_test {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../program-mnt-test/test-fixtures");
+        let proof_bytes = std::fs::read(base.join("proof.bin")).expect("read proof.bin fixture");
+        let vk_bytes = std::fs::read(base.join("vk.bin")).expect("read vk.bin fixture");
+        let public_input_bytes = std::fs::read(base.join("public_input.bin")).expect("read public_input.bin fixture");
+        println!("--- MNT4-753 test fixtures ---");
+        println!("  proof.bin={} bytes  vk.bin={} bytes  public_input.bin={} bytes",
+            proof_bytes.len(), vk_bytes.len(), public_input_bytes.len());
+
+        let mut stdin = SP1Stdin::new();
+        stdin.write_vec(proof_bytes);
+        stdin.write_vec(vk_bytes);
+        stdin.write_vec(public_input_bytes);
+
+        println!("--- Proving MNT_TEST_ELF (execute for cycles, then compressed prove for peak memory) ---");
+        let t = Instant::now();
+        let (_proof, peak_mem_kb) = prove_subprocess("mnt-test", &stdin);
+        println!("  done in {:.1}s, peak mem = {}",
+            t.elapsed().as_secs_f64(),
+            peak_mem_kb.map_or("unavailable".to_string(), |kb| format!("{:.2} MB", kb as f64 / 1024.0)));
+        return;
     }
 
     // ---- --bench-vfy-g16 -------------------------------------------------------

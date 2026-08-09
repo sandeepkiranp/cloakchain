@@ -1,0 +1,11 @@
+[package]
+name = "cloakkchain-program-mnt-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sp1-zkvm      = { version = "6.0.1", features = ["lib", "verify"] }
+ark-mnt4-753  = "0.5"
+ark-groth16   = "0.5"
+ark-serialize = "0.5"
+ark-snark     = "0.5"
