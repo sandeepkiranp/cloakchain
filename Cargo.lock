@@ -489,6 +489,7 @@ dependencies = [
  "cloakkchain-circuit-wrap",
  "cloakkchain-lib",
  "hex",
+ "serde",
  "sha2",
 ]
 

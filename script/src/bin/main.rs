@@ -11,6 +11,16 @@
 //! circuits are fixed to one specific wrapped VK; see circuit-coinproof's
 //! module doc comment), then Bob spends his 40 units to Carol.
 //!
+//! `--prove` runs each of the nine proving steps in its own fresh
+//! subprocess (`--internal-prove-step`/`--internal-prove-output`, hidden
+//! flags) so the peak-memory column reflects that step's own footprint via
+//! the kernel's `VmHWM` tracker, not a same-process running high-water
+//! mark. The whole chain is deterministic (fixed RNG seed, fixed demo
+//! data), so each subprocess just silently redoes the real proving for
+//! every step before its target and only reports the target step's stats —
+//! no proving keys/proofs need to cross the process boundary, only the
+//! small `ProveStats` struct.
+//!
 //! ```shell
 //! RUST_LOG=info cargo run --release -- --execute   # genesis circuit's constraint check only, no proving
 //! RUST_LOG=info cargo run --release -- --prove     # full chain, nine real Groth16 proofs
@@ -33,6 +43,7 @@ use cloakkchain_lib::{
 
 const GENESIS_SPEND_PUBLIC_INPUTS: usize = 6; // 2 (pk) + MAX_OUTPUTS(2) + 2 (board_root, nullifier_root)
 const RECEIPT_PUBLIC_INPUTS: usize = 5;
+const NUM_STEPS: usize = 9;
 
 // ---- CLI args ---------------------------------------------------------------
 
@@ -43,6 +54,13 @@ struct Args {
     execute: bool,
     #[arg(long)]
     prove: bool,
+    /// Hidden: re-invokes this binary as a single proving-step subprocess
+    /// (see the module doc comment). Not for direct use.
+    #[arg(long, hide = true)]
+    internal_prove_step: Option<usize>,
+    /// Hidden: where `--internal-prove-step` writes its `ProveStats`.
+    #[arg(long, hide = true)]
+    internal_prove_output: Option<String>,
 }
 
 // ---- Party / coin helpers ---------------------------------------------------
@@ -122,57 +140,69 @@ fn make_tx(
     (tx, session_key, recipient_enc_pks)
 }
 
-// ---- Peak-memory sampling ---------------------------------------------------
+// ---- Subprocess isolation + peak-memory tracking -----------------------------
 //
-// Groth16 proving here doesn't need SP1's subprocess-isolation trick (peak
-// RSS is in the hundreds-of-MB to low-GB range, not tens of GB) — a
-// background thread polling this process's own VmRSS every 50ms gives a
-// genuinely per-step peak without the complexity of re-serializing witness
-// data across a subprocess boundary.
+// Each proving step runs in a fresh child process so its peak-memory
+// reading reflects only that step's own working set, not a same-process
+// running high-water mark carried over from earlier steps (proving/
+// verifying keys held alive for later chaining, allocator pages the
+// allocator doesn't return to the OS, etc.). This mirrors `main` branch's
+// SP1-subprocess isolation, but polls the kernel's own `VmHWM` (peak RSS)
+// counter for the child rather than sampling `VmRSS` from a background
+// thread — `VmHWM` can't miss a spike between polls the way a fixed-interval
+// sample can.
 
-struct MemSampler {
-    peak_kb: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl MemSampler {
-    fn start() -> Self {
-        let peak_kb = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (peak_kb2, stop2) = (peak_kb.clone(), stop.clone());
-        let handle = std::thread::spawn(move || {
-            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Some(kb) = read_vmrss_kb() {
-                    peak_kb2.fetch_max(kb, std::sync::atomic::Ordering::Relaxed);
+/// Poll `/proc/<pid>/status` for `VmHWM` (the kernel's own running peak
+/// resident-set-size tracker) while `child` runs, returning the highest
+/// value observed (in KB) alongside its exit status. Linux-only — silently
+/// yields `None` for the memory reading anywhere `/proc` isn't available.
+fn wait_tracking_peak_memory(mut child: std::process::Child) -> (std::process::ExitStatus, Option<u64>) {
+    let pid = child.id();
+    let mut peak_kb: Option<u64> = None;
+    loop {
+        if let Ok(status_text) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            for line in status_text.lines() {
+                if let Some(rest) = line.strip_prefix("VmHWM:") {
+                    if let Some(kb) = rest.split_whitespace().next().and_then(|s| s.parse::<u64>().ok()) {
+                        peak_kb = Some(peak_kb.map_or(kb, |p: u64| p.max(kb)));
+                    }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
             }
-        });
-        Self { peak_kb, stop, handle: Some(handle) }
-    }
-
-    fn stop(mut self) -> u64 {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
         }
-        self.peak_kb.load(std::sync::atomic::Ordering::Relaxed)
+        match child.try_wait().expect("poll proving subprocess") {
+            Some(status) => return (status, peak_kb),
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
     }
 }
 
-fn read_vmrss_kb() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
-            return rest.split_whitespace().next()?.parse().ok();
-        }
-    }
-    None
+/// Spawn a fresh copy of this binary to (re-)compute the chain up through
+/// `step_idx` and report just that step's stats, tracking its peak RSS from
+/// the outside via `wait_tracking_peak_memory`.
+fn run_step_in_subprocess(step_idx: usize) -> ProveStats {
+    let out_path = std::env::temp_dir().join(format!("cloakkchain_step{step_idx}_stats.bin"));
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args([
+        "--internal-prove-step",
+        &step_idx.to_string(),
+        "--internal-prove-output",
+        out_path.to_str().expect("temp path is valid UTF-8"),
+    ]);
+    let child = cmd.spawn().expect("spawn proving subprocess");
+    let (status, peak_mem_kb) = wait_tracking_peak_memory(child);
+    assert!(status.success(), "proving subprocess for step {step_idx} exited with {status}");
+
+    let bytes = std::fs::read(&out_path).expect("read stats file");
+    let mut stat: ProveStats = bincode::deserialize(&bytes).expect("deserialize stats");
+    let _ = std::fs::remove_file(&out_path);
+    stat.peak_mem_kb = peak_mem_kb.unwrap_or(0);
+    stat
 }
 
 // ---- Statistics --------------------------------------------------------------
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ProveStats {
     name: String,
     board_size: usize,
@@ -242,6 +272,14 @@ fn ark_serialize_len<T: ark_serialize::CanonicalSerialize>(v: &T) -> usize {
 
 fn main() {
     let args = Args::parse();
+
+    if let Some(step_idx) = args.internal_prove_step {
+        let out_path = args.internal_prove_output.expect("--internal-prove-output required with --internal-prove-step");
+        let stat = run_chain_step(step_idx);
+        std::fs::write(&out_path, bincode::serialize(&stat).expect("serialize stats")).expect("write stats file");
+        return;
+    }
+
     let mode_count = [args.execute, args.prove].iter().filter(|&&b| b).count();
     if mode_count != 1 {
         eprintln!("Error: specify exactly one of --execute, --prove");
@@ -300,9 +338,29 @@ fn run_execute(genesis: &Party, genesis_coin: &Coin, alice_coin: &Coin) {
     println!("\nRun --prove for the full chain (nine real Groth16 proofs).");
 }
 
+/// Orchestrator: runs each of the nine proving steps in its own subprocess
+/// (see the module doc comment) and prints the combined stats table.
 fn run_prove() {
-    let mut rng = StdRng::seed_from_u64(0x636c6f616b); // "cloak" — deterministic demo, not a security-relevant seed
     let mut stats: Vec<ProveStats> = Vec::new();
+    for step_idx in 0..NUM_STEPS {
+        println!("--- Step {}/{NUM_STEPS} ---", step_idx + 1);
+        println!("  [subprocess] proving step {step_idx} in child process …");
+        let stat = run_step_in_subprocess(step_idx);
+        println!("  {}: proved & verified ({:.1}s)", stat.name, stat.prove_secs);
+        stats.push(stat);
+    }
+    print_prove_table(&stats);
+}
+
+/// (Re-)computes the demo chain up through `target_step` and returns that
+/// step's stats. Every step before `target_step` is real proving (needed
+/// so later steps have genuine proofs to recursively verify) but is
+/// otherwise silent — narration and stats collection only happen for
+/// `target_step` itself. Since the RNG is freshly re-seeded with a fixed
+/// value on every invocation, re-deriving the prefix here is bit-for-bit
+/// identical to what an earlier subprocess already computed for it.
+fn run_chain_step(target_step: usize) -> ProveStats {
+    let mut rng = StdRng::seed_from_u64(0x636c6f616b); // "cloak" — deterministic demo, not a security-relevant seed
     let mut entries: Vec<BoardEntry> = vec![];
 
     let genesis = Party::genesis();
@@ -311,9 +369,11 @@ fn run_prove() {
     let carol = Party::new("Carol", 3);
 
     // =========================================================================
-    // Slot 0: genesis mints 100 units to Alice
+    // Step 0: genesis mints 100 units to Alice
     // =========================================================================
-    println!("--- Slot 0: genesis mint ---");
+    if target_step == 0 {
+        println!("--- Slot 0: genesis mint ---");
+    }
     let genesis_coin = coin(0xA1, 100, genesis.pk_p);
     let alice_coin = coin(0xA2, 100, alice.pk_p);
     let genesis_outputs = pad_outputs(&[alice_coin.commitment()]);
@@ -339,8 +399,6 @@ fn run_prove() {
             .try_into()
             .unwrap();
 
-
-    let sampler = MemSampler::start();
     let t = Instant::now();
     let (genesis_pk_data, genesis_vk) = cloakkchain_circuit_spend::setup(&mut rng).unwrap();
     let genesis_proof = cloakkchain_circuit_spend::prove(&genesis_pk_data, genesis_circuit, &mut rng).unwrap();
@@ -348,16 +406,21 @@ fn run_prove() {
     let t = Instant::now();
     assert!(cloakkchain_circuit_spend::verify(&genesis_vk, &genesis_public_inputs, &genesis_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  proved & verified ({prove_secs:.1}s)");
-    stats.push(ProveStats {
+    if target_step == 0 {
+        println!("  proved & verified ({prove_secs:.1}s)");
+    }
+    let stat0 = ProveStats {
         name: "Genesis mint".into(),
         board_size: entries.len() + 1,
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&genesis_proof),
         entry_bytes: None,
-        peak_mem_kb: sampler.stop(),
-    });
+        peak_mem_kb: 0,
+    };
+    if target_step == 0 {
+        return stat0;
+    }
 
     let (mut tx0, s0, r0) =
         make_tx(0, genesis.enc_sk, &genesis.sk_p, &[genesis_coin.clone()], &[(alice_coin.clone(), alice.enc_pk)]);
@@ -366,8 +429,9 @@ fn run_prove() {
     entries.push(genesis_entry.clone());
     let entry0_bytes = bincode::serialize(&genesis_entry).map(|v| v.len()).ok();
 
-    // --- wrap the genesis proof so Alice's receipt circuit can verify it ---
-    let sampler = MemSampler::start();
+    // =========================================================================
+    // Step 1: wrap the genesis proof so Alice's receipt circuit can verify it
+    // =========================================================================
     let t = Instant::now();
     let (wrap_genesis_pk, wrap_genesis_vk) =
         cloakkchain_circuit_wrap::setup::<GENESIS_SPEND_PUBLIC_INPUTS, _>(genesis_vk, &mut rng).unwrap();
@@ -386,24 +450,31 @@ fn run_prove() {
     let t = Instant::now();
     assert!(cloakkchain_circuit_wrap::verify(&wrap_genesis_vk, &wrap_genesis_public_inputs, &wrap_genesis_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  wrapped genesis proof ({prove_secs:.1}s)");
-    stats.push(ProveStats {
+    if target_step == 1 {
+        println!("  wrapped genesis proof ({prove_secs:.1}s)");
+    }
+    let stat1 = ProveStats {
         name: "Wrap genesis proof".into(),
         board_size: entries.len(),
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&wrap_genesis_proof),
         entry_bytes: entry0_bytes,
-        peak_mem_kb: sampler.stop(),
-    });
+        peak_mem_kb: 0,
+    };
+    if target_step == 1 {
+        return stat1;
+    }
 
     // =========================================================================
-    // Alice discovers her coin and builds her receipt
+    // Step 2: Alice discovers her coin and builds her receipt
     // =========================================================================
-    println!("\n--- Alice scans slot 0, builds her receipt ---");
-    let alice_tx = scan_entry(&alice.enc_sk, &genesis_entry).expect("Alice must be able to decrypt slot 0");
-    assert!(alice_tx.receives_coin(&alice_coin.commitment()), "Alice's tx must transfer her coin");
-    println!("  [{}] discovered coin (value={}) at slot 0", alice.name, alice_coin.value);
+    if target_step == 2 {
+        println!("\n--- Alice scans slot 0, builds her receipt ---");
+        let alice_tx = scan_entry(&alice.enc_sk, &genesis_entry).expect("Alice must be able to decrypt slot 0");
+        assert!(alice_tx.receives_coin(&alice_coin.commitment()), "Alice's tx must transfer her coin");
+        println!("  [{}] discovered coin (value={}) at slot 0", alice.name, alice_coin.value);
+    }
 
     let alice_receipt_board_root =
         compute_root_from_path(merkle_leaf(0, &genesis_entry), 0, &genesis_append_path);
@@ -431,7 +502,6 @@ fn run_prove() {
             .try_into()
             .unwrap();
 
-    let sampler = MemSampler::start();
     let t = Instant::now();
     let (alice_receipt_pk, alice_receipt_vk) = cloakkchain_circuit_coinproof::setup(wrap_genesis_vk, &mut rng).unwrap();
     let alice_receipt_proof =
@@ -440,19 +510,25 @@ fn run_prove() {
     let t = Instant::now();
     assert!(cloakkchain_circuit_coinproof::verify(&alice_receipt_vk, &alice_receipt_public_inputs, &alice_receipt_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  proved & verified Alice's receipt ({prove_secs:.1}s)");
-    stats.push(ProveStats {
+    if target_step == 2 {
+        println!("  proved & verified Alice's receipt ({prove_secs:.1}s)");
+    }
+    let stat2 = ProveStats {
         name: "Alice's receipt".into(),
         board_size: entries.len(),
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&alice_receipt_proof),
         entry_bytes: None,
-        peak_mem_kb: sampler.stop(),
-    });
+        peak_mem_kb: 0,
+    };
+    if target_step == 2 {
+        return stat2;
+    }
 
-    // --- wrap Alice's receipt so her spend circuit can verify it ---
-    let sampler = MemSampler::start();
+    // =========================================================================
+    // Step 3: wrap Alice's receipt so her spend circuit can verify it
+    // =========================================================================
     let t = Instant::now();
     let (wrap_alice_receipt_pk, wrap_alice_receipt_vk) =
         cloakkchain_circuit_wrap::setup::<RECEIPT_PUBLIC_INPUTS, _>(alice_receipt_vk, &mut rng).unwrap();
@@ -471,21 +547,28 @@ fn run_prove() {
     let t = Instant::now();
     assert!(cloakkchain_circuit_wrap::verify(&wrap_alice_receipt_vk, &wrap_alice_receipt_public_inputs, &wrap_alice_receipt_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  wrapped Alice's receipt ({prove_secs:.1}s)");
-    stats.push(ProveStats {
+    if target_step == 3 {
+        println!("  wrapped Alice's receipt ({prove_secs:.1}s)");
+    }
+    let stat3 = ProveStats {
         name: "Wrap Alice's receipt".into(),
         board_size: entries.len(),
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&wrap_alice_receipt_proof),
         entry_bytes: None,
-        peak_mem_kb: sampler.stop(),
-    });
+        peak_mem_kb: 0,
+    };
+    if target_step == 3 {
+        return stat3;
+    }
 
     // =========================================================================
-    // Slot 1: Alice spends 1-in-2-out — 40 to Bob, 60 change to herself
+    // Step 4: Alice spends 1-in-2-out — 40 to Bob, 60 change to herself
     // =========================================================================
-    println!("\n--- Slot 1: Alice spends to Bob + change ---");
+    if target_step == 4 {
+        println!("\n--- Slot 1: Alice spends to Bob + change ---");
+    }
     let bob_coin = coin(0xB1, 40, bob.pk_p);
     let change_coin = coin(0xB2, 60, alice.pk_p);
     let alice_spend_outputs = pad_outputs(&[bob_coin.commitment(), change_coin.commitment()]);
@@ -520,7 +603,6 @@ fn run_prove() {
     .try_into()
     .unwrap();
 
-    let sampler = MemSampler::start();
     let t = Instant::now();
     let (alice_spend_pk, alice_spend_vk) =
         cloakkchain_circuit_spend::setup_non_genesis(wrap_alice_receipt_vk, &mut rng).unwrap();
@@ -530,16 +612,21 @@ fn run_prove() {
     let t = Instant::now();
     assert!(cloakkchain_circuit_spend::verify_non_genesis(&alice_spend_vk, &alice_spend_public_inputs, &alice_spend_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  proved & verified Alice's spend ({prove_secs:.1}s)");
-    stats.push(ProveStats {
+    if target_step == 4 {
+        println!("  proved & verified Alice's spend ({prove_secs:.1}s)");
+    }
+    let stat4 = ProveStats {
         name: "Alice -> Bob + change".into(),
         board_size: entries.len() + 1,
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&alice_spend_proof),
         entry_bytes: None,
-        peak_mem_kb: sampler.stop(),
-    });
+        peak_mem_kb: 0,
+    };
+    if target_step == 4 {
+        return stat4;
+    }
 
     let (mut tx1, s1, r1) = make_tx(
         1,
@@ -553,8 +640,9 @@ fn run_prove() {
     entries.push(alice_entry.clone());
     let entry1_bytes = bincode::serialize(&alice_entry).map(|v| v.len()).ok();
 
-    // --- wrap Alice's spend so Bob's receipt circuit can verify it ---
-    let sampler = MemSampler::start();
+    // =========================================================================
+    // Step 5: wrap Alice's spend so Bob's receipt circuit can verify it
+    // =========================================================================
     let t = Instant::now();
     let (wrap_alice_spend_pk, wrap_alice_spend_vk) =
         cloakkchain_circuit_wrap::setup::<GENESIS_SPEND_PUBLIC_INPUTS, _>(alice_spend_vk, &mut rng).unwrap();
@@ -573,28 +661,35 @@ fn run_prove() {
     let t = Instant::now();
     assert!(cloakkchain_circuit_wrap::verify(&wrap_alice_spend_vk, &wrap_alice_spend_public_inputs, &wrap_alice_spend_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  wrapped Alice's spend ({prove_secs:.1}s)");
-    stats.push(ProveStats {
+    if target_step == 5 {
+        println!("  wrapped Alice's spend ({prove_secs:.1}s)");
+    }
+    let stat5 = ProveStats {
         name: "Wrap Alice's spend".into(),
         board_size: entries.len(),
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&wrap_alice_spend_proof),
         entry_bytes: entry1_bytes,
-        peak_mem_kb: sampler.stop(),
-    });
+        peak_mem_kb: 0,
+    };
+    if target_step == 5 {
+        return stat5;
+    }
 
     // =========================================================================
-    // Bob discovers his coin and builds his receipt — a "second generation"
-    // ReceiptStepCircuit setup: it recursively verifies a wrapped *spend*
-    // proof (Alice's), not a wrapped genesis proof. Same Rust circuit type
-    // as Alice's receipt, just keyed to a different wrap_vk (see
-    // circuit-coinproof's module doc comment).
+    // Step 6: Bob discovers his coin and builds his receipt — a "second
+    // generation" ReceiptStepCircuit setup: it recursively verifies a
+    // wrapped *spend* proof (Alice's), not a wrapped genesis proof. Same
+    // Rust circuit type as Alice's receipt, just keyed to a different
+    // wrap_vk (see circuit-coinproof's module doc comment).
     // =========================================================================
-    println!("\n--- Bob scans slot 1, builds his receipt ---");
-    let bob_tx = scan_entry(&bob.enc_sk, &alice_entry).expect("Bob must be able to decrypt slot 1");
-    assert!(bob_tx.receives_coin(&bob_coin.commitment()));
-    println!("  [{}] discovered coin (value={}) at slot 1", bob.name, bob_coin.value);
+    if target_step == 6 {
+        println!("\n--- Bob scans slot 1, builds his receipt ---");
+        let bob_tx = scan_entry(&bob.enc_sk, &alice_entry).expect("Bob must be able to decrypt slot 1");
+        assert!(bob_tx.receives_coin(&bob_coin.commitment()));
+        println!("  [{}] discovered coin (value={}) at slot 1", bob.name, bob_coin.value);
+    }
 
     let bob_receipt_board_root =
         compute_root_from_path(merkle_leaf(1, &alice_entry), 1, &alice_spend_append_path);
@@ -622,7 +717,6 @@ fn run_prove() {
             .try_into()
             .unwrap();
 
-    let sampler = MemSampler::start();
     let t = Instant::now();
     let (bob_receipt_pk, bob_receipt_vk) = cloakkchain_circuit_coinproof::setup(wrap_alice_spend_vk, &mut rng).unwrap();
     let bob_receipt_proof =
@@ -631,19 +725,25 @@ fn run_prove() {
     let t = Instant::now();
     assert!(cloakkchain_circuit_coinproof::verify(&bob_receipt_vk, &bob_receipt_public_inputs, &bob_receipt_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  proved & verified Bob's receipt ({prove_secs:.1}s)");
-    stats.push(ProveStats {
+    if target_step == 6 {
+        println!("  proved & verified Bob's receipt ({prove_secs:.1}s)");
+    }
+    let stat6 = ProveStats {
         name: "Bob's receipt (gen 2)".into(),
         board_size: entries.len(),
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&bob_receipt_proof),
         entry_bytes: None,
-        peak_mem_kb: sampler.stop(),
-    });
+        peak_mem_kb: 0,
+    };
+    if target_step == 6 {
+        return stat6;
+    }
 
-    // --- wrap Bob's receipt so his spend circuit can verify it ---
-    let sampler = MemSampler::start();
+    // =========================================================================
+    // Step 7: wrap Bob's receipt so his spend circuit can verify it
+    // =========================================================================
     let t = Instant::now();
     let (wrap_bob_receipt_pk, wrap_bob_receipt_vk) =
         cloakkchain_circuit_wrap::setup::<RECEIPT_PUBLIC_INPUTS, _>(bob_receipt_vk, &mut rng).unwrap();
@@ -662,21 +762,28 @@ fn run_prove() {
     let t = Instant::now();
     assert!(cloakkchain_circuit_wrap::verify(&wrap_bob_receipt_vk, &wrap_bob_receipt_public_inputs, &wrap_bob_receipt_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  wrapped Bob's receipt ({prove_secs:.1}s)");
-    stats.push(ProveStats {
+    if target_step == 7 {
+        println!("  wrapped Bob's receipt ({prove_secs:.1}s)");
+    }
+    let stat7 = ProveStats {
         name: "Wrap Bob's receipt".into(),
         board_size: entries.len(),
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&wrap_bob_receipt_proof),
         entry_bytes: None,
-        peak_mem_kb: sampler.stop(),
-    });
+        peak_mem_kb: 0,
+    };
+    if target_step == 7 {
+        return stat7;
+    }
 
     // =========================================================================
-    // Slot 2: Bob spends his 40 units to Carol
+    // Step 8: Bob spends his 40 units to Carol
     // =========================================================================
-    println!("\n--- Slot 2: Bob spends to Carol ---");
+    if target_step == 8 {
+        println!("\n--- Slot 2: Bob spends to Carol ---");
+    }
     let carol_coin = coin(0xC1, 40, carol.pk_p);
     let bob_spend_outputs = pad_outputs(&[carol_coin.commitment()]);
 
@@ -708,7 +815,6 @@ fn run_prove() {
         tree_after_alice_spend.root(),
     );
 
-    let sampler = MemSampler::start();
     let t = Instant::now();
     let (bob_spend_pk, bob_spend_vk) =
         cloakkchain_circuit_spend::setup_non_genesis(wrap_bob_receipt_vk, &mut rng).unwrap();
@@ -718,27 +824,31 @@ fn run_prove() {
     let t = Instant::now();
     assert!(cloakkchain_circuit_spend::verify_non_genesis(&bob_spend_vk, &bob_spend_public_inputs, &bob_spend_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  proved & verified Bob's spend ({prove_secs:.1}s)");
-    stats.push(ProveStats {
+    if target_step == 8 {
+        println!("  proved & verified Bob's spend ({prove_secs:.1}s)");
+    }
+    let stat8 = ProveStats {
         name: "Bob -> Carol (gen 2)".into(),
         board_size: entries.len() + 1,
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&bob_spend_proof),
         entry_bytes: None,
-        peak_mem_kb: sampler.stop(),
-    });
+        peak_mem_kb: 0,
+    };
+    if target_step == 8 {
+        let (mut tx2, s2, r2) =
+            make_tx(2, bob.enc_sk, &bob.sk_p, &[bob_coin.clone()], &[(carol_coin.clone(), carol.enc_pk)]);
+        tx2.spend_proof = ark_serialize_bytes(&bob_spend_proof);
+        let bob_entry = cloakkchain_lib::encrypt_tx(&tx2, &r2, s2);
 
-    let (mut tx2, s2, r2) =
-        make_tx(2, bob.enc_sk, &bob.sk_p, &[bob_coin.clone()], &[(carol_coin.clone(), carol.enc_pk)]);
-    tx2.spend_proof = ark_serialize_bytes(&bob_spend_proof);
-    let bob_entry = cloakkchain_lib::encrypt_tx(&tx2, &r2, s2);
-    entries.push(bob_entry.clone());
+        println!("\n--- Carol scans slot 2 ---");
+        let carol_tx = scan_entry(&carol.enc_sk, &bob_entry).expect("Carol must be able to decrypt slot 2");
+        assert!(carol_tx.receives_coin(&carol_coin.commitment()));
+        println!("  [{}] discovered coin (value={}) at slot 2 — end of chain (no further receipt built)", carol.name, carol_coin.value);
 
-    println!("\n--- Carol scans slot 2 ---");
-    let carol_tx = scan_entry(&carol.enc_sk, &bob_entry).expect("Carol must be able to decrypt slot 2");
-    assert!(carol_tx.receives_coin(&carol_coin.commitment()));
-    println!("  [{}] discovered coin (value={}) at slot 2 — end of chain (no further receipt built)", carol.name, carol_coin.value);
+        return stat8;
+    }
 
-    print_prove_table(&stats);
+    unreachable!("target_step out of range: {target_step}");
 }
