@@ -1,0 +1,19 @@
+[package]
+name = "cloakkchain-circuit-coinproof"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cloakkchain-lib = { path = "../lib" }
+
+ark-ff = { workspace = true }
+ark-ec = { workspace = true }
+ark-std = { workspace = true }
+ark-relations = { workspace = true }
+ark-serialize = { workspace = true }
+ark-snark = { workspace = true }
+ark-groth16 = { workspace = true, features = ["r1cs"] }
+ark-r1cs-std = { workspace = true }
+ark-crypto-primitives = { workspace = true, features = ["r1cs", "sponge", "crh"] }
+ark-mnt4-753 = { workspace = true, features = ["r1cs", "curve"] }
+ark-mnt6-753 = { workspace = true, features = ["r1cs"] }

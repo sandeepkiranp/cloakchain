@@ -1,45 +1,151 @@
 use std::collections::{BTreeMap, HashMap};
 
+use ark_crypto_primitives::sponge::{
+    poseidon::PoseidonSponge, CryptographicSponge, FieldBasedCryptographicSponge,
+};
+use ark_ec::{AffineRepr, CurveGroup, PrimeGroup};
+use ark_ff::PrimeField;
+use ark_serialize::CanonicalSerialize;
 use serde::{Deserialize, Serialize};
+
+/// Bridges arkworks' `CanonicalSerialize`/`CanonicalDeserialize` (its own
+/// SNARK-friendly encoding) to `serde`, via `#[serde(with = "field_serde")]`
+/// on any field/point-typed struct field — arkworks types don't implement
+/// `serde::Serialize` directly (no serde feature exists for these crates).
+mod field_serde {
+    use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S, T>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        T: CanonicalSerialize,
+    {
+        let mut bytes = Vec::new();
+        value
+            .serialize_compressed(&mut bytes)
+            .map_err(serde::ser::Error::custom)?;
+        bytes.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: CanonicalDeserialize,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        T::deserialize_compressed(&bytes[..]).map_err(serde::de::Error::custom)
+    }
+}
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 
-pub const GENESIS_SK: [u8; 32] = [0u8; 32];
+pub mod poseidon_params;
 
-pub fn genesis_pk() -> [u8; 32] {
-    derive_pk(&GENESIS_SK)
+/// The canonical data-model field: MNT4-753's scalar field. Chosen to match
+/// the `SpendCircuit`'s constraint field (Phase 2/3) — Groth16 R1CS
+/// constraints for a circuit proved over curve E live over `E::ScalarField`.
+pub type Fr = ark_mnt4_753::Fr;
+
+/// The coin-ownership keypair lives on **MNT6-753's** G1 group, not
+/// MNT4-753's own. This is deliberate, not arbitrary: MNT6-753's base field
+/// equals MNT4-753's scalar field (`Fr`, above) — that's the defining
+/// property of the MNT4/6-753 curve cycle. So `OwnerPk`'s point coordinates
+/// are already native `Fr` elements, hashable into an `Fr`-Poseidon sponge
+/// with no foreign-field wrapping. The scalar `OwnerScalar` is naturally an
+/// element of MNT6-753's own scalar field (== MNT4-753's *base* field) —
+/// genuinely a different field from `Fr`, so it's folded through
+/// [`poseidon_hash_bytes`] (bit/byte decomposition) wherever it needs to
+/// enter an `Fr`-native hash, rather than absorbed as a native field element.
+/// This is the same non-native-scalar/native-point-coordinate split that
+/// `Groth16VerifierGadget`'s own recursive verification relies on for public
+/// inputs crossing the cycle (see the MNT-native port plan).
+pub type OwnerPk = ark_mnt6_753::G1Affine;
+pub type OwnerScalar = ark_mnt6_753::Fr;
+
+fn poseidon_sponge() -> PoseidonSponge<Fr> {
+    PoseidonSponge::new(&poseidon_params::mnt4_753_fr_poseidon_config())
 }
 
-/// Key derivation: pk = X25519(sk, basepoint).
-/// X25519 public keys are indistinguishable from random 32-byte strings —
-/// every 32-byte value is a valid Curve25519 u-coordinate.
-pub fn derive_pk(sk: &[u8; 32]) -> [u8; 32] {
-    let secret = X25519Secret::from(*sk);
-    *X25519PublicKey::from(&secret).as_bytes()
+/// General-purpose Poseidon hash of any number of native `Fr` elements.
+pub fn poseidon_hash(inputs: &[Fr]) -> Fr {
+    let mut sponge = poseidon_sponge();
+    sponge.absorb(&inputs.to_vec());
+    sponge.squeeze_native_field_elements(1)[0]
+}
+
+/// Fold arbitrary bytes into `Fr` elements, 31 bytes at a time (safely under
+/// any field modulus this codebase targets) via `from_le_bytes_mod_order`,
+/// then Poseidon-hash the resulting vector. Used for data that is inherently
+/// byte-oriented (ciphertexts, X25519 keys) or foreign-field (an
+/// `OwnerScalar`, serialized canonically) rather than a native `Fr` value.
+pub fn poseidon_hash_bytes(bytes: &[u8]) -> Fr {
+    if bytes.is_empty() {
+        return poseidon_hash(&[Fr::from(0u64)]);
+    }
+    let elems: Vec<Fr> = bytes
+        .chunks(31)
+        .map(Fr::from_le_bytes_mod_order)
+        .collect();
+    poseidon_hash(&elems)
+}
+
+fn owner_scalar_to_bytes(sk: &OwnerScalar) -> Vec<u8> {
+    let mut out = Vec::new();
+    sk.serialize_compressed(&mut out).expect("OwnerScalar always serializes");
+    out
+}
+
+fn owner_pk_to_field_pair(pk: &OwnerPk) -> (Fr, Fr) {
+    // `pk`'s coordinates live in MNT6-753's base field, i.e. MNT4-753's
+    // scalar field `Fr` — see the `OwnerPk` doc comment above. Extract them
+    // directly, no re-encoding needed. The point at infinity (only ever
+    // relevant for a malformed/zero key) maps to (0, 0), which is never a
+    // valid curve point's coordinates, so it can't collide with a real key.
+    match pk.xy() {
+        Some((x, y)) => (x, y),
+        None => (Fr::from(0u64), Fr::from(0u64)),
+    }
+}
+
+/// Genesis owner scalar. `0` would give the identity point (an invalid,
+/// non-hashable public key), unlike X25519 where clamping avoided that
+/// automatically — so genesis uses scalar `1` instead: `genesis_pk` is
+/// simply the group generator, a fixed and well-known point.
+pub fn genesis_sk() -> OwnerScalar {
+    OwnerScalar::from(1u64)
+}
+
+pub fn genesis_pk() -> OwnerPk {
+    derive_owner_pk(&genesis_sk())
+}
+
+/// Native coin-ownership key derivation: `pk = sk * G`, on MNT6-753's G1 —
+/// see the `OwnerPk`/`OwnerScalar` doc comments for why this curve.
+pub fn derive_owner_pk(sk: &OwnerScalar) -> OwnerPk {
+    (ark_mnt6_753::G1Projective::generator() * sk).into_affine()
 }
 
 /// A coin: tag `t`, value `v`, owner public key `pk`, plus masking randomness `r`.
-/// Commitment cn = H(t || v || r || pk) — binds the coin to its intended owner,
-/// so a coin created for Alice cannot be claimed by Bob even if he knows the
-/// tag/value/rand (analogous to how Zcash embeds the recipient address in cm).
+/// Commitment cn = Poseidon(t, v, r, pk.x, pk.y) — binds the coin to its
+/// intended owner, so a coin created for Alice cannot be claimed by Bob even
+/// if he knows the tag/value/rand (analogous to how Zcash embeds the
+/// recipient address in cm).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Coin {
-    pub tag: [u8; 32],
+    #[serde(with = "field_serde")]
+    pub tag: Fr,
     pub value: u64,
-    pub rand: [u8; 32],
-    pub owner_pk: [u8; 32],
+    #[serde(with = "field_serde")]
+    pub rand: Fr,
+    #[serde(with = "field_serde")]
+    pub owner_pk: OwnerPk,
 }
 
 impl Coin {
-    pub fn commitment(&self) -> [u8; 32] {
-        let mut h = Sha256::new();
-        h.update(self.tag);
-        h.update(self.value.to_le_bytes());
-        h.update(self.rand);
-        h.update(self.owner_pk);
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&h.finalize());
-        out
+    pub fn commitment(&self) -> Fr {
+        let (px, py) = owner_pk_to_field_pair(&self.owner_pk);
+        poseidon_hash(&[self.tag, Fr::from(self.value), self.rand, px, py])
     }
 }
 
@@ -48,39 +154,52 @@ impl Coin {
 ///
 /// Only **commitments** appear in the transaction body. Sender and recipient
 /// identities are NOT stored — the sender is proven via `input_nullifier` and
-/// recipient ownership is encoded inside each coin commitment (`H(tag||v||r||pk)`).
-/// Each output's coin data is encrypted in `note_encs[i]` per recipient.
+/// recipient ownership is encoded inside each coin commitment
+/// (`Poseidon(tag, v, r, pk)`). Each output's coin data is encrypted in
+/// `note_encs[i]` per recipient.
 ///
 /// `spend_proof` is attached after proving and the whole struct re-encrypted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     pub id: u64,
     /// Commitments to the coins being spent.
-    pub input_commitments: Vec<[u8; 32]>,
+    #[serde(with = "field_serde")]
+    pub input_commitments: Vec<Fr>,
     /// Commitments to the new coins (same index as note_encs).
-    pub output_commitments: Vec<[u8; 32]>,
+    #[serde(with = "field_serde")]
+    pub output_commitments: Vec<Fr>,
     /// `note_encs[i]` = `encrypt(output_coin_i, pair_key(sender, recipient_i))`.
     pub note_encs: Vec<Vec<u8>>,
-    /// `H(primary_input_commitment || sk_spender)` — proves sender identity
-    /// without storing sender_pk; also serves as the double-spend nullifier.
-    pub input_nullifier: [u8; 32],
+    /// `Poseidon(primary_input_commitment, sk_spender-folded)` — proves
+    /// sender identity without storing sender_pk; also serves as the
+    /// double-spend nullifier.
+    #[serde(with = "field_serde")]
+    pub input_nullifier: Fr,
     pub spend_proof: Vec<u8>,
 }
 
 impl Transaction {
     /// `cn` was received in this tx if it is among the output commitments.
     /// Recipient ownership is already encoded inside the commitment itself.
-    pub fn receives_coin(&self, cn: &[u8; 32]) -> bool {
+    pub fn receives_coin(&self, cn: &Fr) -> bool {
         self.output_commitments.contains(cn)
     }
 
     /// `cn` was spent as an input in this tx.
-    pub fn spends_coin(&self, cn: &[u8; 32]) -> bool {
+    pub fn spends_coin(&self, cn: &Fr) -> bool {
         self.input_commitments.contains(cn)
     }
 }
 
 // ---- X25519 sender-anonymous encryption ------------------------------------
+//
+// Unchanged from the SHA256/SP1 design and entirely off-circuit: this is
+// *wallet-side* bookkeeping (delivering a coin's opening — tag/value/rand —
+// to its recipient), not something any circuit needs to prove anymore. The
+// port's "move decryption off-circuit" decision made `BoardEntry`'s
+// `output_commitments` public instead (see below), so `check_coin_receipt`
+// no longer calls any of this. X25519 keys are now entirely separate from
+// coin-ownership keys (`OwnerScalar`/`OwnerPk`) — each party holds both.
 //
 // Each transaction is encrypted with a random session key. The session key is
 // wrapped separately for each recipient using X25519 ECDH — only the holder of
@@ -144,7 +263,16 @@ fn wrapping_key(shared: &[u8; 32]) -> [u8; 32] {
 
 /// A board entry: the transaction encrypted with a session key, plus one 32-byte
 /// `key_enc` per recipient (indistinguishable from random), plus one ephemeral
-/// X25519 public key `ek_pk` (also looks like 32 random bytes on Curve25519).
+/// X25519 public key `ek_pk` (also looks like 32 random bytes on Curve25519),
+/// plus the **public** commitments this entry's transaction creates.
+///
+/// `output_commitments` is public (not only inside `ciphertext`) so that
+/// `check_coin_receipt` can prove `coin_commitment ∈
+/// entry.output_commitments` directly, without decrypting anything
+/// in-circuit — see the MNT-native port plan's "move decryption off-circuit"
+/// decision. This leaks nothing beyond what a hiding commitment already
+/// leaks (nothing about tag/value/rand/owner), the same trade-off Zcash's
+/// public note-commitment tree makes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardEntry {
     /// `xor_with_keystream(session_key, MAGIC_TAG || bincode(tx))`.
@@ -155,12 +283,17 @@ pub struct BoardEntry {
     /// `key_encs[i] = XOR(H(X25519(ek_sk, recipient_pk_i) || DH_SALT), session_key)`.
     /// Each is exactly 32 bytes, looks random. One per recipient.
     pub key_encs: Vec<[u8; 32]>,
-    /// `tx.input_nullifier` — looks random, used by IVC for double-spend detection.
-    pub nullifier: [u8; 32],
+    /// `tx.input_nullifier` — looks random, used by the nullifier accumulator.
+    #[serde(with = "field_serde")]
+    pub nullifier: Fr,
+    /// `tx.output_commitments` — public, see the struct doc comment above.
+    #[serde(with = "field_serde")]
+    pub output_commitments: Vec<Fr>,
 }
 
-/// Encrypt `tx` for the given `recipient_pks` and `session_key`.
-/// Pass the same `session_key` when re-encrypting after attaching a spend proof —
+/// Encrypt `tx` for the given `recipient_pks` (X25519 encryption keys — a
+/// separate keyspace from coin-ownership `OwnerPk`s) and `session_key`. Pass
+/// the same `session_key` when re-encrypting after attaching a spend proof —
 /// the deterministic `ek_sk` ensures `ek_pk` and `key_encs` are unchanged.
 pub fn encrypt_tx(
     tx: &Transaction,
@@ -189,12 +322,20 @@ pub fn encrypt_tx(
         enc
     }).collect();
 
-    BoardEntry { ciphertext, ek_pk, key_encs, nullifier: tx.input_nullifier }
+    BoardEntry {
+        ciphertext,
+        ek_pk,
+        key_encs,
+        nullifier: tx.input_nullifier,
+        output_commitments: tx.output_commitments.clone(),
+    }
 }
 
-/// Decrypt a board entry using the recipient's private key.
+/// Decrypt a board entry using the recipient's X25519 private key.
 /// Tries each `key_enc` — the one that yields a valid session key will decrypt
 /// the ciphertext successfully. No sender identity is needed or revealed.
+/// Purely a wallet convenience now (see the module doc comment) — no circuit
+/// depends on this succeeding.
 pub fn scan_entry(
     owner_sk: &[u8; 32],
     entry: &BoardEntry,
@@ -273,53 +414,53 @@ pub fn decrypt_note(session_key: &[u8; 32], index: usize, note_enc: &[u8]) -> Op
 // ---- Fixed-depth Merkle tree over board entries ------------------------
 //
 // The tree has a fixed depth of TREE_DEPTH (supporting up to 2^TREE_DEPTH
-// entries). Unfilled leaf positions are treated as the zero byte array [0u8;32].
-// This lets each IVC coin-proof step update the root in O(TREE_DEPTH) = O(1)
+// entries). Unfilled leaf positions are treated as the zero field element.
+// This lets each spend/receipt proof update the root in O(TREE_DEPTH) = O(1)
 // time using a single Merkle inclusion (append) proof, rather than O(n) by
 // recomputing the root from all prior entries.
 //
 // Key property: if `append_path` is the inclusion proof for slot k in the
 // fixed-depth tree containing entries[0..=k], then:
 //
-//   compute_root_from_path([0u8;32], k, &append_path)  == root_{k-1}  (old root)
+//   compute_root_from_path(Fr::from(0), k, &append_path)  == root_{k-1}  (old root)
 //   compute_root_from_path(merkle_leaf(k, e_k), k, &append_path) == root_k (new root)
 //
 // Only the leaf value changes between the two computations; the path is the
-// same. This lets the IVC step verify consistency with the prior root AND
+// same. This lets a spend proof verify consistency with the prior root AND
 // compute the new root in a single O(TREE_DEPTH) pass.
 
 /// Maximum tree depth. Supports up to 2^32 ≈ 4 billion board entries.
 pub const TREE_DEPTH: usize = 32;
 
-/// Leaf hash = SHA256(slot_as_u64_le || ciphertext). Including the slot index
+/// Leaf hash = Poseidon(slot, fold(ciphertext), fold(ek_pk), fold(key_encs),
+/// nullifier, Poseidon(output_commitments)). Including the slot index
 /// prevents permuting entries while keeping a valid root.
-pub fn merkle_leaf(slot: usize, entry: &BoardEntry) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update((slot as u64).to_le_bytes());
-    h.update(&entry.ciphertext);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&h.finalize());
-    out
+pub fn merkle_leaf(slot: usize, entry: &BoardEntry) -> Fr {
+    let key_encs_bytes: Vec<u8> = entry.key_encs.iter().flatten().copied().collect();
+    poseidon_hash(&[
+        Fr::from(slot as u64),
+        poseidon_hash_bytes(&entry.ciphertext),
+        poseidon_hash_bytes(&entry.ek_pk),
+        poseidon_hash_bytes(&key_encs_bytes),
+        entry.nullifier,
+        poseidon_hash(&entry.output_commitments),
+    ])
 }
 
-fn merkle_combine(l: &[u8; 32], r: &[u8; 32]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(l);
-    h.update(r);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&h.finalize());
-    out
+fn merkle_combine(l: &Fr, r: &Fr) -> Fr {
+    poseidon_hash(&[*l, *r])
 }
 
 /// Precomputed hashes of empty subtrees at each depth.
 /// `zero_hashes()[d]` = root of a complete subtree of depth `d` with all
-/// leaves equal to [0u8;32]. Computed once and cached — `NullifierTree::insert`
-/// calls this on every leaf update, and recomputing 32 hashes from scratch
-/// each time (rather than once, ever) was the dominant cost at scale.
-fn zero_hashes() -> &'static [[u8; 32]] {
-    static ZERO_HASHES: std::sync::OnceLock<Vec<[u8; 32]>> = std::sync::OnceLock::new();
+/// leaves equal to the zero field element. Computed once and cached —
+/// `NullifierTree::insert` calls this on every leaf update, and recomputing
+/// 32 hashes from scratch each time (rather than once, ever) was the
+/// dominant cost at scale.
+fn zero_hashes() -> &'static [Fr] {
+    static ZERO_HASHES: std::sync::OnceLock<Vec<Fr>> = std::sync::OnceLock::new();
     ZERO_HASHES.get_or_init(|| {
-        let mut out = vec![[0u8; 32]]; // depth 0: the zero leaf itself
+        let mut out = vec![Fr::from(0u64)]; // depth 0: the zero leaf itself
         for _ in 0..TREE_DEPTH {
             let prev = *out.last().unwrap();
             out.push(merkle_combine(&prev, &prev));
@@ -328,14 +469,14 @@ fn zero_hashes() -> &'static [[u8; 32]] {
     })
 }
 
-/// Root of the empty fixed-depth tree (all leaves = [0u8;32]).
-pub fn empty_root() -> [u8; 32] {
+/// Root of the empty fixed-depth tree (all leaves = 0).
+pub fn empty_root() -> Fr {
     zero_hashes()[TREE_DEPTH]
 }
 
 /// Walk the path from `leaf` at `slot` to the root. Used by
 /// `merkle_root_of`, `check_coin_receipt`, and `check_spend`.
-pub fn compute_root_from_path(leaf: [u8; 32], slot: usize, path: &[[u8; 32]]) -> [u8; 32] {
+pub fn compute_root_from_path(leaf: Fr, slot: usize, path: &[Fr]) -> Fr {
     let mut current = leaf;
     let mut idx = slot;
     for sibling in path {
@@ -350,8 +491,8 @@ pub fn compute_root_from_path(leaf: [u8; 32], slot: usize, path: &[[u8; 32]]) ->
 }
 
 /// Compute the Merkle root of a fixed-depth tree containing `entries` at
-/// slots 0..T and [0u8;32] at all other leaf positions.
-pub fn merkle_root_of(entries: &[BoardEntry]) -> [u8; 32] {
+/// slots 0..T and the zero element at all other leaf positions.
+pub fn merkle_root_of(entries: &[BoardEntry]) -> Fr {
     if entries.is_empty() {
         return empty_root();
     }
@@ -365,10 +506,10 @@ pub fn merkle_root_of(entries: &[BoardEntry]) -> [u8; 32] {
 /// or beyond `leaf_hashes.len()` (including `target_idx` itself) is treated
 /// as unfilled and uses the zero-subtree hash — this works equally well for
 /// proving an *existing* leaf or for proving the next, as-yet-empty slot.
-fn merkle_path_for_index(leaf_hashes: &[[u8; 32]], target_idx: usize) -> Vec<[u8; 32]> {
+fn merkle_path_for_index(leaf_hashes: &[Fr], target_idx: usize) -> Vec<Fr> {
     let zeros = zero_hashes();
     let mut path = Vec::with_capacity(TREE_DEPTH);
-    let mut level: Vec<[u8; 32]> = leaf_hashes.to_vec();
+    let mut level: Vec<Fr> = leaf_hashes.to_vec();
     let mut idx = target_idx;
     for d in 0..TREE_DEPTH {
         let sibling_idx = idx ^ 1;
@@ -397,9 +538,9 @@ fn merkle_path_for_index(leaf_hashes: &[[u8; 32]], target_idx: usize) -> Vec<[u8
 /// Inclusion proof for `slot` in the fixed-depth tree over `entries`.
 /// At each level the sibling is either the real hash of the adjacent subtree
 /// (if it was already filled by prior entries) or the zero-subtree hash.
-pub fn append_proof_for(entries: &[BoardEntry]) -> Vec<[u8; 32]> {
+pub fn append_proof_for(entries: &[BoardEntry]) -> Vec<Fr> {
     let slot = entries.len() - 1;
-    let hashes: Vec<[u8; 32]> = entries.iter().enumerate().map(|(i, e)| merkle_leaf(i, e)).collect();
+    let hashes: Vec<Fr> = entries.iter().enumerate().map(|(i, e)| merkle_leaf(i, e)).collect();
     merkle_path_for_index(&hashes, slot)
 }
 
@@ -407,49 +548,57 @@ pub fn append_proof_for(entries: &[BoardEntry]) -> Vec<[u8; 32]> {
 /// `check_spend` to prove the board state immediately before `tx_star` is
 /// posted, without needing the entire prior board history as a witness (only
 /// its leaf hashes, derived here from the entries the caller already has).
-pub fn append_path_for_next(entries: &[BoardEntry]) -> Vec<[u8; 32]> {
-    let hashes: Vec<[u8; 32]> = entries.iter().enumerate().map(|(i, e)| merkle_leaf(i, e)).collect();
+pub fn append_path_for_next(entries: &[BoardEntry]) -> Vec<Fr> {
+    let hashes: Vec<Fr> = entries.iter().enumerate().map(|(i, e)| merkle_leaf(i, e)).collect();
     merkle_path_for_index(&hashes, entries.len())
 }
 
 /// Verify that `entry` is the genuine content of `slot` in a fixed-depth tree
 /// with the given `root`.
-pub fn merkle_verify(root: [u8; 32], slot: usize, entry: &BoardEntry, proof: &[[u8; 32]]) -> bool {
+pub fn merkle_verify(root: Fr, slot: usize, entry: &BoardEntry, proof: &[Fr]) -> bool {
     compute_root_from_path(merkle_leaf(slot, entry), slot, proof) == root
 }
 
 // ---- Nullifier accumulator (indexed Merkle tree) --------------------------
 //
-// Double-spend detection no longer requires walking every board slot in an
-// IVC chain. Every nullifier ever published (`BoardEntry.nullifier`, already
-// public) is inserted into a single indexed Merkle tree — a sorted linked
-// list of leaves, each storing `(value, next_value, next_index)`. A single
-// Merkle path to a leaf whose `value < target < next_value` proves `target`
-// is absent from the *entire* set the tree's root represents, in one
-// O(TREE_DEPTH) proof instead of an O(slots) scan. Reuses the same SHA256
+// Double-spend detection does not require walking every board slot. Every
+// nullifier ever published (`BoardEntry.nullifier`, already public) is
+// inserted into a single indexed Merkle tree — a sorted linked list of
+// leaves, each storing `(value, next_value, next_index)`. A single Merkle
+// path to a leaf whose `value < target < next_value` proves `target` is
+// absent from the *entire* set the tree's root represents, in one
+// O(TREE_DEPTH) proof instead of an O(slots) scan. Reuses the same Poseidon
 // combine/path primitives as the board tree above.
+//
+// Ordering is over `Fr`'s canonical integer representative (`Fr: Ord`,
+// comparing values in `0..p`) rather than byte-lexicographic order — any
+// consistent total order works for the accumulator's soundness, and
+// comparisons on `Fr` are confirmed safe to do in-circuit on this stack
+// (unlike gnark/Sunspot, which the `sunspot_groth16_experiment` finding
+// showed breaks on Field ordering comparisons — arkworks does not share that
+// bug).
 
 /// One leaf of the indexed nullifier tree.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexedLeaf {
-    pub value: [u8; 32],
-    pub next_value: [u8; 32],
+    #[serde(with = "field_serde")]
+    pub value: Fr,
+    #[serde(with = "field_serde")]
+    pub next_value: Fr,
     pub next_index: u64,
 }
 
-/// Sentinel "infinity" value: no real nullifier (a SHA256 output) will ever
-/// equal this, so it safely upper-bounds every real value.
-const MAX_NULLIFIER: [u8; 32] = [0xFF; 32];
+/// Sentinel "infinity" value: the field's largest canonical representative
+/// (`p - 1`). No real nullifier will ever equal this except by a
+/// negligible-probability Poseidon collision, so it safely upper-bounds
+/// every real value.
+fn max_nullifier() -> Fr {
+    -Fr::from(1u64)
+}
 
 impl IndexedLeaf {
-    fn hash(&self) -> [u8; 32] {
-        let mut h = Sha256::new();
-        h.update(self.value);
-        h.update(self.next_value);
-        h.update(self.next_index.to_le_bytes());
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&h.finalize());
-        out
+    fn hash(&self) -> Fr {
+        poseidon_hash(&[self.value, self.next_value, Fr::from(self.next_index)])
     }
 }
 
@@ -462,13 +611,14 @@ impl IndexedLeaf {
 pub struct NonMembershipWitness {
     pub low_leaf: IndexedLeaf,
     pub low_leaf_index: u64,
-    pub sibling_path: Vec<[u8; 32]>,
+    #[serde(with = "field_serde")]
+    pub sibling_path: Vec<Fr>,
 }
 
 /// Verify a non-membership witness against `root`: `target` cannot be a
 /// member if some leaf's `value < target < next_value` genuinely Merkle-opens
 /// to `root` — no member could exist strictly between two adjacent leaves.
-pub fn verify_nonmembership(root: [u8; 32], target: [u8; 32], witness: &NonMembershipWitness) -> bool {
+pub fn verify_nonmembership(root: Fr, target: Fr, witness: &NonMembershipWitness) -> bool {
     if !(witness.low_leaf.value < target && target < witness.low_leaf.next_value) {
         return false;
     }
@@ -493,18 +643,18 @@ pub struct NullifierTree {
     leaves: Vec<IndexedLeaf>,
     /// value → leaf index, sorted — gives the low leaf for any target via one
     /// `range(..target).next_back()` lookup instead of a linear scan.
-    index_of: BTreeMap<[u8; 32], usize>,
+    index_of: BTreeMap<Fr, usize>,
     /// `nodes[d]` holds the hash of every *filled* node at depth d (0 =
     /// leaves, `TREE_DEPTH` = root), keyed by its position at that depth.
     /// A missing entry means "unfilled" — use the precomputed zero-subtree
     /// hash for that depth instead (see `zero_hashes`).
-    nodes: Vec<HashMap<usize, [u8; 32]>>,
+    nodes: Vec<HashMap<usize, Fr>>,
 }
 
 impl NullifierTree {
     /// A fresh tree, seeded with the single "everything" sentinel leaf.
     pub fn new() -> Self {
-        let sentinel = IndexedLeaf { value: [0u8; 32], next_value: MAX_NULLIFIER, next_index: 0 };
+        let sentinel = IndexedLeaf { value: Fr::from(0u64), next_value: max_nullifier(), next_index: 0 };
         let mut tree = Self {
             leaves: vec![sentinel.clone()],
             index_of: BTreeMap::new(),
@@ -517,7 +667,7 @@ impl NullifierTree {
 
     /// Set leaf `idx`'s hash and propagate the change up to the root —
     /// O(TREE_DEPTH), independent of how many leaves currently exist.
-    fn set_leaf(&mut self, idx: usize, hash: [u8; 32]) {
+    fn set_leaf(&mut self, idx: usize, hash: Fr) {
         let zeros = zero_hashes();
         let mut cur_idx = idx;
         let mut cur_hash = hash;
@@ -531,11 +681,11 @@ impl NullifierTree {
         self.nodes[TREE_DEPTH].insert(cur_idx, cur_hash); // cur_idx == 0: the root
     }
 
-    pub fn root(&self) -> [u8; 32] {
+    pub fn root(&self) -> Fr {
         self.nodes[TREE_DEPTH].get(&0).copied().unwrap_or_else(|| zero_hashes()[TREE_DEPTH])
     }
 
-    pub fn contains(&self, value: [u8; 32]) -> bool {
+    pub fn contains(&self, value: Fr) -> bool {
         self.index_of.contains_key(&value)
     }
 
@@ -545,14 +695,14 @@ impl NullifierTree {
     /// (`next_value == target`), which correctly yields a witness that
     /// `verify_nonmembership` will reject rather than one that panics here.
     /// O(log n) via `index_of` instead of scanning every leaf.
-    fn find_low_leaf_index(&self, target: [u8; 32]) -> usize {
+    fn find_low_leaf_index(&self, target: Fr) -> usize {
         *self.index_of.range(..target).next_back().map(|(_, idx)| idx)
-            .expect("no matching leaf — target is [0u8;32] or tree invariant violated")
+            .expect("no matching leaf — target is 0 or tree invariant violated")
     }
 
     /// Insert `value` (a no-op if already present) and return the new root.
     /// O(log n): one BTreeMap lookup plus two O(TREE_DEPTH) path updates.
-    pub fn insert(&mut self, value: [u8; 32]) -> [u8; 32] {
+    pub fn insert(&mut self, value: Fr) -> Fr {
         if self.contains(value) {
             return self.root();
         }
@@ -573,7 +723,7 @@ impl NullifierTree {
 
     /// Sibling path for leaf `idx`, read directly from the maintained
     /// per-level node hashes — O(TREE_DEPTH), not a from-scratch rebuild.
-    fn path_for(&self, idx: usize) -> Vec<[u8; 32]> {
+    fn path_for(&self, idx: usize) -> Vec<Fr> {
         let zeros = zero_hashes();
         let mut path = Vec::with_capacity(TREE_DEPTH);
         let mut cur_idx = idx;
@@ -588,7 +738,7 @@ impl NullifierTree {
     /// Build a non-membership witness for `target` against the tree's current
     /// state. Safe to call even if `target` is already a member — the
     /// resulting witness simply won't pass `verify_nonmembership`.
-    pub fn prove_non_membership(&self, target: [u8; 32]) -> NonMembershipWitness {
+    pub fn prove_non_membership(&self, target: Fr) -> NonMembershipWitness {
         let low_idx = self.find_low_leaf_index(target);
         NonMembershipWitness {
             low_leaf: self.leaves[low_idx].clone(),
@@ -602,7 +752,7 @@ impl NullifierTree {
     /// absent as of slot S" for the historical parent-nullifier check below.
     /// O(count log count) given the incremental `insert` above — cheap,
     /// no SNARK cost, run entirely host-side.
-    pub fn replay(inserted: &[[u8; 32]], count: usize) -> Self {
+    pub fn replay(inserted: &[Fr], count: usize) -> Self {
         let mut tree = Self::new();
         for &n in &inserted[..count] {
             tree.insert(n);
@@ -628,10 +778,10 @@ impl Default for NullifierTree {
 /// self-reference.
 ///
 /// `output_commitments` are the coin commitments created by this spend. The
-/// recipient's IVC coin-proof verifies this proof at the receipt slot and checks
-/// that their `coin_commitment` is listed here — establishing a cryptographic
-/// chain of custody from the creating spend proof all the way to the final
-/// spend proof.
+/// recipient's coin-receipt proof verifies this proof recursively (Phase 3)
+/// and checks that their `coin_commitment` is listed here — establishing a
+/// cryptographic chain of custody from the creating spend proof all the way
+/// to the final spend proof.
 ///
 /// The spender's public key is intentionally NOT included — the proof proves
 /// "someone with the right key spent this coin" without revealing who.
@@ -640,15 +790,18 @@ impl Default for NullifierTree {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidPublicValues {
     pub vkey: [u32; 8],
-    pub board_root: [u8; 32],
+    #[serde(with = "field_serde")]
+    pub board_root: Fr,
     /// The output coin commitments created by this spend — used by recipients
     /// to chain-verify provenance in their receipt proof.
-    pub output_commitments: Vec<[u8; 32]>,
+    #[serde(with = "field_serde")]
+    pub output_commitments: Vec<Fr>,
     /// The nullifier-accumulator root as of just before this spend (i.e. not
     /// yet including this spend's own `input_nullifier`) — lets downstream
     /// verifiers independently confirm it against their own rebuilt tree, the
     /// same way `board_root` already lets them confirm board state.
-    pub nullifier_root: [u8; 32],
+    #[serde(with = "field_serde")]
+    pub nullifier_root: Fr,
 }
 
 impl ValidPublicValues {
@@ -660,31 +813,72 @@ impl ValidPublicValues {
 // ---- Coin receipt ----------------------------------------------------------
 //
 // A coin's receipt is a single proof, built once when the coin is first
-// discovered — not an IVC chain re-extended every board slot. It proves:
+// discovered. It proves:
 //
 //   - `entry_k` (the transaction that created this coin) really is included
 //     in the board at `received_at`, via one Merkle append-path.
-//   - that creating transaction's own Groth16 receipt is valid (the VFY-G16
-//     fold, unchanged from before).
+//   - `coin_commitment` is among `entry_k.output_commitments` — a direct,
+//     public equality/membership check now that `BoardEntry` publishes its
+//     output commitments (see the port's "move decryption off-circuit"
+//     decision) — no in-circuit decryption needed at all.
+//   - the creating transaction's spend proof really does commit to
+//     `coin_commitment` (`spend_pv.output_commitments` — Phase 3 replaces
+//     "take this as a witness" with "recursively verify the proof that
+//     produced it", via `Groth16VerifierGadget`; the check itself is
+//     unchanged).
 //   - the creating transaction's own nullifier had not already been used
 //     anywhere on the board as of its own slot — via one non-membership
-//     proof against the nullifier accumulator (see above), replacing the old
-//     per-slot byte-scan for "parent_nullifier_seen". This is enforced
-//     directly: a receipt simply cannot be constructed over a double-spending
-//     parent transaction (see `check_coin_receipt` below).
+//     proof against the nullifier accumulator (see above). This is enforced
+//     directly: a receipt simply cannot be constructed over a
+//     double-spending parent transaction.
 //
-// Whether the coin has since been *spent* is no longer tracked here at all —
+// Whether the coin has since been *spent* is not tracked here at all —
 // that's answered fresh, at spend time, with a single non-membership check
-// against the *current* nullifier root (see `check_spend`), not maintained
-// incrementally while the coin just sits held.
+// against the *current* nullifier root (see `check_spend`).
+pub fn check_coin_receipt(
+    vkey: [u32; 8],
+    owner_pk: OwnerPk,
+    coin_commitment: Fr,
+    entry_k: BoardEntry,
+    received_slot: usize,
+    append_path: Vec<Fr>,
+    parent_nonmembership: NonMembershipWitness,
+    nullifier_root_at_parent_slot: Fr,
+    spend_pv: ValidPublicValues,
+) -> Result<CoinReceiptPublicValues, &'static str> {
+    if !verify_nonmembership(nullifier_root_at_parent_slot, entry_k.nullifier, &parent_nonmembership) {
+        return Err("parent transaction's nullifier was already present on the board — it was a double-spend");
+    }
+
+    let leaf_k = merkle_leaf(received_slot, &entry_k);
+    let board_root = compute_root_from_path(leaf_k, received_slot, &append_path);
+
+    if !entry_k.output_commitments.contains(&coin_commitment) {
+        return Err("entry_k does not create coin_commitment");
+    }
+    if !spend_pv.output_commitments.contains(&coin_commitment) {
+        return Err("parent spend proof does not commit to this coin commitment");
+    }
+
+    Ok(CoinReceiptPublicValues {
+        vkey,
+        owner_pk,
+        coin_commitment,
+        board_root,
+        received_at: received_slot as u64,
+    })
+}
 
 /// The public values committed by a coin's receipt proof.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CoinReceiptPublicValues {
     pub vkey: [u32; 8],
-    pub owner_pk: [u8; 32],
-    pub coin_commitment: [u8; 32],
-    pub board_root: [u8; 32],
+    #[serde(with = "field_serde")]
+    pub owner_pk: OwnerPk,
+    #[serde(with = "field_serde")]
+    pub coin_commitment: Fr,
+    #[serde(with = "field_serde")]
+    pub board_root: Fr,
     pub received_at: u64,
 }
 
@@ -694,168 +888,63 @@ impl CoinReceiptPublicValues {
     }
 }
 
-/// The spend proof stored in `tx.spend_proof` for in-circuit chain verification.
-///
-/// Contains the Groth16 proof bytes from `proof.bytes()`, the spend proof public
-/// values, and the spend vkey hash — everything the coin-proof IVC needs to call
-/// `Groth16Verifier::verify` at the receipt slot.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SpendProofPackage {
-    /// `SP1ProofWithPublicValues::bytes()` of the Groth16 spend proof.
-    /// HOST passes this via `stdin.write_vec()`; program calls `Groth16Verifier::verify`.
-    /// Empty in execute/mock mode — logical output_commitments check is sufficient then.
-    pub proof_bytes: Vec<u8>,
-    /// `ValidPublicValues::encode()` — the spend proof's committed public values.
-    /// Checked in `check_coin_receipt` to verify the spend commits to this coin.
-    pub pv_encode: Vec<u8>,
-    /// Spend program vkey hash from `spend_pk.verifying_key().bytes32()`.
-    pub spend_vkey_hash: String,
-}
-
-/// What the program must verify at the receipt slot.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReceiptInfo {
-    /// `ValidPublicValues::encode()` from the spend proof package — used by the
-    /// program as `sp1_public_inputs` when calling `Groth16Verifier::verify`.
-    pub pv_encode: Vec<u8>,
-}
-
-/// What the receipt proof needs the guest program to additionally verify.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CoinReceiptJustification {
-    /// Present iff the creating transaction has a Groth16 spend proof to fold
-    /// (empty only in mock/execute mode — see `SpendProofPackage`).
-    pub receipt: Option<ReceiptInfo>,
-}
-
-/// Build a coin's one-shot receipt proof.
-///
-/// `entry_k` is the single board entry that transfers `coin_commitment` to
-/// `owner_sk`'s holder, at `received_slot`; `append_path` is its Merkle
-/// inclusion proof (`TREE_DEPTH` sibling hashes, leaf → root) — the same
-/// mechanism `merkle_root_of` uses, just proving one specific leaf instead of
-/// recomputing the whole tree, and used exactly once instead of per-slot.
-///
-/// The creating transaction's own nullifier (= `entry_k.nullifier`, since
-/// `BoardEntry.nullifier` is always set to `tx.input_nullifier`) must not
-/// already have been used anywhere on the board as of that transaction's own
-/// slot — `parent_nonmembership`/`nullifier_root_at_parent_slot` prove this.
-/// If that check fails, the creating transaction was itself a double-spend,
-/// and this function returns `Err` rather than a usable receipt (replacing
-/// the old per-slot `parent_nullifier_seen` scan, which was computed but
-/// never actually enforced).
-pub fn check_coin_receipt(
-    vkey: [u32; 8],
-    owner_sk: [u8; 32],
-    coin_commitment: [u8; 32],
-    entry_k: BoardEntry,
-    received_slot: usize,
-    append_path: Vec<[u8; 32]>,
-    parent_nonmembership: NonMembershipWitness,
-    nullifier_root_at_parent_slot: [u8; 32],
-) -> Result<(CoinReceiptPublicValues, CoinReceiptJustification), &'static str> {
-    let owner_pk = derive_pk(&owner_sk);
-
-    if !verify_nonmembership(nullifier_root_at_parent_slot, entry_k.nullifier, &parent_nonmembership) {
-        return Err("parent transaction's nullifier was already present on the board — it was a double-spend");
-    }
-
-    let leaf_k = merkle_leaf(received_slot, &entry_k);
-    let board_root = compute_root_from_path(leaf_k, received_slot, &append_path);
-
-    let tx = scan_entry(&owner_sk, &entry_k).ok_or("entry_k does not decrypt for this owner")?;
-    if !tx.receives_coin(&coin_commitment) {
-        return Err("entry_k's transaction does not transfer coin_commitment to this owner");
-    }
-
-    // Extract the spend proof package from the creating transaction and verify
-    // that it commits to this coin. The program will call verify_sp1_proof on
-    // it; here we only do the logical provenance check.
-    let mut receipt: Option<ReceiptInfo> = None;
-    if !tx.spend_proof.is_empty() {
-        let pkg = bincode::deserialize::<SpendProofPackage>(&tx.spend_proof)
-            .map_err(|_| "receipt tx.spend_proof is not a valid SpendProofPackage")?;
-        let pv = bincode::deserialize::<ValidPublicValues>(&pkg.pv_encode)
-            .map_err(|_| "SpendProofPackage has invalid pv_encode")?;
-        if !pv.output_commitments.contains(&coin_commitment) {
-            return Err("parent spend proof does not commit to this coin commitment");
-        }
-        // Non-empty proof_bytes → real Groth16 proof; program verifies it.
-        // Empty → mock/execute mode; output_commitments check is sufficient.
-        if !pkg.proof_bytes.is_empty() {
-            receipt = Some(ReceiptInfo { pv_encode: pkg.pv_encode });
-        }
-    }
-
-    Ok((
-        CoinReceiptPublicValues {
-            vkey,
-            owner_pk,
-            coin_commitment,
-            board_root,
-            received_at: received_slot as u64,
-        },
-        CoinReceiptJustification { receipt },
-    ))
-}
-
 // ---- Spend relation --------------------------------------------------------
 
-/// Checks every condition of the `Valid` (spend) relation except actually
-/// verifying the recursive receipt proof's ZK proof.
+/// Checks every condition of the `Valid` (spend) relation. In Phase 2/3 this
+/// same logic becomes `SpendCircuit`'s `ConstraintSynthesizer` body; here
+/// it's the plain-Rust reference implementation used both directly (tests
+/// below) and as the correctness oracle circuit tests are checked against.
 ///
 /// `entry_position` is the slot `tx_star` will land at (== current board
 /// size); `append_path` is its Merkle append proof, verified against the
-/// *old* root (`[0u8;32]` placeholder at that position) — the same technique
-/// `check_coin_receipt` uses for a receiving entry, just for an unfilled
-/// position. This replaces passing the entire prior board history and
-/// recomputing its root from scratch on every spend.
+/// *old* root (the zero-element placeholder at that position) — the same
+/// technique `check_coin_receipt` uses for a receiving entry, just for an
+/// unfilled position.
 ///
 /// `own_nullifier_nonmembership`/`current_nullifier_root` prove the coin has
 /// not already been spent: a single non-membership check against the
-/// nullifier accumulator's current state, replacing the old `cp.spent` field
-/// that had to be kept fresh via a per-slot IVC. This check is uniform for
-/// genesis and non-genesis spends — an empty/near-empty accumulator trivially
-/// proves non-membership, so no special-casing is needed for an empty board.
+/// nullifier accumulator's current state. This check is uniform for genesis
+/// and non-genesis spends — an empty/near-empty accumulator trivially proves
+/// non-membership, so no special-casing is needed for an empty board.
 ///
 /// `input_coins` and `output_coins` are the private witnesses: the actual coin
 /// data whose commitments are asserted to match `tx_star`'s commitment lists.
 /// This lets the circuit verify conservation (`Σ input values == Σ output values`)
-/// without revealing any values to parties outside the zkVM.
+/// without revealing any values to parties outside the proof.
+///
+/// **Phase 2/3 note**: `Coin.value` needs an explicit range-check gadget once
+/// this becomes a circuit (bounded to 64 bits) — `Fr` is a 753-bit field, so
+/// an unconstrained field-element "value" could wrap around and defeat this
+/// conservation check. Rust's own `u64` type makes that impossible here.
 pub fn check_spend(
     vkey: [u32; 8],
     coin_proof_vkey: [u32; 8],
-    sk_p: [u8; 32],
-    pk_p: [u8; 32],
-    coin_commitment: [u8; 32],
+    sk_p: OwnerScalar,
+    pk_p: OwnerPk,
+    coin_commitment: Fr,
     entry_position: usize,
-    append_path: Vec<[u8; 32]>,
+    append_path: Vec<Fr>,
     tx_star: Transaction,
     input_coins: Vec<Coin>,
     output_coins: Vec<Coin>,
     is_genesis: bool,
     coin_proof: Option<CoinReceiptPublicValues>,
     own_nullifier_nonmembership: NonMembershipWitness,
-    current_nullifier_root: [u8; 32],
+    current_nullifier_root: Fr,
 ) -> Result<ValidPublicValues, &'static str> {
-    if derive_pk(&sk_p) != pk_p {
+    if derive_owner_pk(&sk_p) != pk_p {
         return Err("pk_P must be the public key for sk_P");
     }
 
-    let board_root = compute_root_from_path([0u8; 32], entry_position, &append_path);
+    let board_root = compute_root_from_path(Fr::from(0u64), entry_position, &append_path);
 
-    // Compute and verify the spender's own nullifier.
-    // This replaces the old sender_pk check and also serves as the double-spend guard.
-    let own_nullifier = {
-        let mut h = Sha256::new();
-        h.update(coin_commitment);
-        h.update(sk_p);
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&h.finalize());
-        out
-    };
+    // Compute and verify the spender's own nullifier. `sk_p` is a foreign
+    // field element relative to `Fr` (see the `OwnerScalar` doc comment), so
+    // it's folded through `poseidon_hash_bytes` rather than absorbed as a
+    // native `Fr` value.
+    let own_nullifier = poseidon_hash(&[coin_commitment, poseidon_hash_bytes(&owner_scalar_to_bytes(&sk_p))]);
     if tx_star.input_nullifier != own_nullifier {
-        return Err("tx* input_nullifier does not match H(coin_commitment || sk_p)");
+        return Err("tx* input_nullifier does not match Poseidon(coin_commitment, sk_p)");
     }
 
     // Double-spend guard: own_nullifier must be absent from the nullifier
@@ -932,75 +1021,83 @@ mod tests {
     const TEST_VKEY: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
     const TEST_COIN_PROOF_VKEY: [u32; 8] = [9, 9, 9, 9, 9, 9, 9, 9];
 
-    fn party(seed: u8) -> ([u8; 32], [u8; 32]) {
+    /// X25519 encryption keypair for party `seed` — used only for board-entry
+    /// encryption, entirely separate from that party's coin-ownership keypair.
+    fn enc_party(seed: u8) -> ([u8; 32], [u8; 32]) {
         let mut sk = [0u8; 32];
         sk[1] = seed; // byte 0 is clamped by X25519 (sk[0] &= 248), so seeds 1-7 would
                       // all collapse to the same scalar as genesis. Use byte 1 instead.
-        (sk, derive_pk(&sk))
+        let secret = X25519Secret::from(sk);
+        let pk = *X25519PublicKey::from(&secret).as_bytes();
+        (sk, pk)
     }
 
-    fn coin(seed: u8, value: u64, owner_pk: [u8; 32]) -> Coin {
-        let mut tag = [0u8; 32];
-        tag[0] = seed;
-        let mut rand = [0u8; 32];
-        rand[1] = seed;
-        Coin { tag, value, rand, owner_pk }
+    /// Native coin-ownership keypair for party `seed`.
+    fn owner_party(seed: u8) -> (OwnerScalar, OwnerPk) {
+        let sk = OwnerScalar::from((seed as u64) + 100); // +100: keep well away from genesis_sk()==1
+        (sk, derive_owner_pk(&sk))
+    }
+
+    fn coin(seed: u8, value: u64, owner_pk: OwnerPk) -> Coin {
+        Coin { tag: Fr::from(seed as u64 + 1), value, rand: Fr::from(seed as u64 + 1000), owner_pk }
     }
 
     /// Build a Transaction using X25519 note encryption derived from session_key.
-    /// Returns (tx, session_key, recipient_pks) so callers can pass to `enc`.
+    /// Returns (tx, session_key, recipient_enc_pks) so callers can pass to `enc`.
     fn make_tx(
         id: u64,
-        sender_sk: [u8; 32],
+        sender_sk: OwnerScalar,
+        sender_enc_sk: [u8; 32],
         input_coins: &[Coin],
-        outputs: &[(Coin, [u8; 32])],
+        outputs: &[(Coin, OwnerPk, [u8; 32] /* recipient enc pk */)],
     ) -> (Transaction, [u8; 32], Vec<[u8; 32]>) {
-        let input_commitments: Vec<[u8; 32]> = input_coins.iter().map(|c| c.commitment()).collect();
-        let recipient_pks: Vec<[u8; 32]> = outputs.iter().map(|(_, rpk)| *rpk).collect();
-        let output_commitments: Vec<[u8; 32]> = outputs.iter().map(|(c, _)| c.commitment()).collect();
-        // Derive session key deterministically from sender_sk and id (test helper).
+        let input_commitments: Vec<Fr> = input_coins.iter().map(|c| c.commitment()).collect();
+        let recipient_enc_pks: Vec<[u8; 32]> = outputs.iter().map(|(_, _, rpk)| *rpk).collect();
+        let output_commitments: Vec<Fr> = outputs.iter().map(|(c, _, _)| c.commitment()).collect();
+        // Derive session key deterministically from sender's encryption sk and id (test helper).
         let session_key = {
             let mut h = Sha256::new();
-            h.update(sender_sk); h.update((id as u64).to_le_bytes()); h.update(EK_SALT);
+            h.update(sender_enc_sk); h.update(id.to_le_bytes()); h.update(EK_SALT);
             let mut out = [0u8; 32]; out.copy_from_slice(&h.finalize()); out
         };
         let note_encs: Vec<Vec<u8>> = outputs.iter().enumerate()
-            .map(|(i, (c, _))| build_note_enc(&session_key, i, c))
+            .map(|(i, (c, _, _))| build_note_enc(&session_key, i, c))
             .collect();
-        let input_nullifier = {
-            let mut h = Sha256::new();
-            h.update(input_commitments[0]); h.update(sender_sk);
-            let mut out = [0u8; 32]; out.copy_from_slice(&h.finalize()); out
-        };
+        let input_nullifier = poseidon_hash(&[
+            input_commitments[0],
+            poseidon_hash_bytes(&owner_scalar_to_bytes(&sender_sk)),
+        ]);
         let tx = Transaction { id, input_commitments, output_commitments, note_encs, input_nullifier, spend_proof: vec![] };
-        (tx, session_key, recipient_pks)
+        (tx, session_key, recipient_enc_pks)
     }
 
-    fn enc(tx: &Transaction, recipient_pks: &[[u8;32]], session_key: [u8;32]) -> BoardEntry {
-        encrypt_tx(tx, recipient_pks, session_key)
+    fn enc(tx: &Transaction, recipient_enc_pks: &[[u8; 32]], session_key: [u8; 32]) -> BoardEntry {
+        encrypt_tx(tx, recipient_enc_pks, session_key)
     }
 
     /// Build a coin's one-shot receipt: `entries[received_slot]` must be the
-    /// transaction that transfers `coin_commitment` to `owner_sk`'s holder.
-    /// The parent-nullifier non-membership witness/root are derived by
-    /// replaying all of `entries`' nullifiers up to (excluding)
-    /// `received_slot` — the board state as it stood just before the
-    /// creating transaction itself.
+    /// transaction that transfers `coin_commitment` to `owner_pk`. The
+    /// parent-nullifier non-membership witness/root are derived by replaying
+    /// all of `entries`' nullifiers up to (excluding) `received_slot` — the
+    /// board state as it stood just before the creating transaction itself.
+    /// `spend_pv` is the creating transaction's own spend public values
+    /// (stands in for Phase 3's recursively-verified parent proof).
     fn make_receipt(
-        owner_sk: [u8; 32],
-        coin_commitment: [u8; 32],
+        owner_pk: OwnerPk,
+        coin_commitment: Fr,
         entries: &[BoardEntry],
         received_slot: usize,
-    ) -> Result<(CoinReceiptPublicValues, CoinReceiptJustification), &'static str> {
+        spend_pv: ValidPublicValues,
+    ) -> Result<CoinReceiptPublicValues, &'static str> {
         let ap = append_proof_for(&entries[..=received_slot]);
-        let all_nullifiers: Vec<[u8; 32]> = entries.iter().map(|e| e.nullifier).collect();
+        let all_nullifiers: Vec<Fr> = entries.iter().map(|e| e.nullifier).collect();
         let tree = NullifierTree::replay(&all_nullifiers, received_slot);
         let parent_root = tree.root();
         let parent_witness = tree.prove_non_membership(entries[received_slot].nullifier);
         check_coin_receipt(
-            TEST_COIN_PROOF_VKEY, owner_sk, coin_commitment,
+            TEST_COIN_PROOF_VKEY, owner_pk, coin_commitment,
             entries[received_slot].clone(), received_slot, ap,
-            parent_witness, parent_root,
+            parent_witness, parent_root, spend_pv,
         )
     }
 
@@ -1010,9 +1107,9 @@ mod tests {
     /// nullifiers — the same accumulator state any external verifier could
     /// independently rebuild.
     fn spend(
-        sk: [u8; 32],
-        pk: [u8; 32],
-        coin_commitment: [u8; 32],
+        sk: OwnerScalar,
+        pk: OwnerPk,
+        coin_commitment: Fr,
         prior_entries: &[BoardEntry],
         tx_star: &Transaction,
         input_coins: &[Coin],
@@ -1021,13 +1118,9 @@ mod tests {
         coin_proof: Option<CoinReceiptPublicValues>,
     ) -> Result<ValidPublicValues, &'static str> {
         let ap = append_path_for_next(prior_entries);
-        let all_nullifiers: Vec<[u8; 32]> = prior_entries.iter().map(|e| e.nullifier).collect();
+        let all_nullifiers: Vec<Fr> = prior_entries.iter().map(|e| e.nullifier).collect();
         let tree = NullifierTree::replay(&all_nullifiers, prior_entries.len());
-        let own_nullifier = {
-            let mut h = Sha256::new();
-            h.update(coin_commitment); h.update(sk);
-            let mut out = [0u8; 32]; out.copy_from_slice(&h.finalize()); out
-        };
+        let own_nullifier = poseidon_hash(&[coin_commitment, poseidon_hash_bytes(&owner_scalar_to_bytes(&sk))]);
         let witness = tree.prove_non_membership(own_nullifier);
         let root = tree.root();
         check_spend(
@@ -1040,40 +1133,41 @@ mod tests {
 
     #[test]
     fn encrypt_decrypt_round_trips_for_participants_and_rejects_outsiders() {
-        let (alice_sk, alice_pk) = party(1);
-        let (bob_sk, bob_pk) = party(2);
-        let (carol_sk, carol_pk) = party(3);
+        let (alice_enc_sk, alice_enc_pk) = enc_party(1);
+        let (bob_enc_sk, _) = enc_party(2);
+        let (carol_enc_sk, _) = enc_party(3);
+        let (_, alice_pk) = owner_party(1);
 
         let alice_coin = coin(0xA2, 100, alice_pk);
-        let (tx0, sk0, r0) = make_tx(0, GENESIS_SK,
-            &[coin(0xA1, 100, genesis_pk())], &[(alice_coin.clone(), alice_pk)]);
+        let (tx0, sk0, r0) = make_tx(0, genesis_sk(), [0u8; 32],
+            &[coin(0xA1, 100, genesis_pk())], &[(alice_coin.clone(), alice_pk, alice_enc_pk)]);
         let entry = enc(&tx0, &r0, sk0);
 
         // Alice (recipient) can decrypt.
-        assert_eq!(scan_entry(&alice_sk, &entry), Some(tx0.clone()));
+        assert_eq!(scan_entry(&alice_enc_sk, &entry), Some(tx0.clone()));
         // Outsiders cannot.
-        assert_eq!(scan_entry(&bob_sk,   &entry), None);
-        assert_eq!(scan_entry(&carol_sk, &entry), None);
+        assert_eq!(scan_entry(&bob_enc_sk,   &entry), None);
+        assert_eq!(scan_entry(&carol_enc_sk, &entry), None);
 
         // Alice decrypts her note via session_key + index.
         assert_eq!(decrypt_note(&sk0, 0, &tx0.note_encs[0]), Some(alice_coin));
         // Wrong index gives None.
         assert_eq!(decrypt_note(&sk0, 1, &tx0.note_encs[0]), None);
-        let _ = (alice_pk, bob_pk, carol_pk);
     }
 
     #[test]
     fn multi_output_tx_each_recipient_sees_only_own_note() {
-        let (alice_sk, alice_pk) = party(1);
-        let (_, bob_pk) = party(2);
-        let (_, carol_pk) = party(3);
+        let (alice_sk, alice_pk) = owner_party(1);
+        let (_, bob_pk) = owner_party(2);
+        let (_, bob_enc_pk) = enc_party(2);
+        let (_, alice_enc_pk) = enc_party(1);
 
         let alice_coin   = coin(0xA1, 100, alice_pk);
         let bob_coin     = coin(0xB1,  40, bob_pk);
         let alice_change = coin(0xB2,  60, alice_pk);
 
-        let (tx1, sk1, _) = make_tx(1, alice_sk, &[alice_coin],
-            &[(bob_coin.clone(), bob_pk), (alice_change.clone(), alice_pk)]);
+        let (tx1, sk1, _) = make_tx(1, alice_sk, [0u8; 32], &[alice_coin],
+            &[(bob_coin.clone(), bob_pk, bob_enc_pk), (alice_change.clone(), alice_pk, alice_enc_pk)]);
 
         // Index 0 → bob_coin, index 1 → alice_change.
         assert_eq!(decrypt_note(&sk1, 0, &tx1.note_encs[0]), Some(bob_coin));
@@ -1081,111 +1175,118 @@ mod tests {
         // Wrong index gives None.
         assert_eq!(decrypt_note(&sk1, 1, &tx1.note_encs[0]), None);
         assert_eq!(decrypt_note(&sk1, 0, &tx1.note_encs[1]), None);
-        let _ = carol_pk;
     }
 
     #[test]
     fn scan_entry_finds_recipient_but_not_outsiders() {
-        let (alice_sk, alice_pk) = party(1);
-        let (bob_sk, _bob_pk) = party(2);
-        let (carol_sk, _carol_pk) = party(3);
+        let (alice_enc_sk, alice_enc_pk) = enc_party(1);
+        let (bob_enc_sk, _) = enc_party(2);
+        let (carol_enc_sk, _) = enc_party(3);
+        let (_, alice_pk) = owner_party(1);
 
-        let (tx0, sk0, r0) = make_tx(0, GENESIS_SK,
+        let (tx0, sk0, r0) = make_tx(0, genesis_sk(), [0u8; 32],
             &[coin(0xA1, 100, genesis_pk())],
-            &[(coin(0xA2, 100, alice_pk), alice_pk)]);
+            &[(coin(0xA2, 100, alice_pk), alice_pk, alice_enc_pk)]);
         let entry = enc(&tx0, &r0, sk0);
 
-        assert_eq!(scan_entry(&alice_sk, &entry), Some(tx0.clone()));
-        assert_eq!(scan_entry(&bob_sk,   &entry), None);
-        assert_eq!(scan_entry(&carol_sk, &entry), None);
+        assert_eq!(scan_entry(&alice_enc_sk, &entry), Some(tx0.clone()));
+        assert_eq!(scan_entry(&bob_enc_sk,   &entry), None);
+        assert_eq!(scan_entry(&carol_enc_sk, &entry), None);
+    }
+
+    struct Chain {
+        entries: Vec<BoardEntry>,
+        tx0: Transaction, tx1: Transaction, tx2: Transaction,
+        alice_coin: Coin, bob_coin: Coin, alice_change: Coin, carol_coin: Coin, genesis_coin: Coin,
+        alice_sk: OwnerScalar, alice_pk: OwnerPk,
+        bob_sk: OwnerScalar, bob_pk: OwnerPk,
+        carol_pk: OwnerPk,
+        pv0: ValidPublicValues,
+    }
+
+    /// Build the standard alice→bob→carol demo chain's board entries and
+    /// coins, and the genesis spend's public values (needed as `spend_pv`
+    /// for building Alice's receipt).
+    fn build_chain() -> Chain {
+        let (alice_sk, alice_pk) = owner_party(1);
+        let (bob_sk, bob_pk) = owner_party(2);
+        let (_, carol_pk) = owner_party(3);
+        let (_, alice_enc_pk) = enc_party(1);
+        let (_, bob_enc_pk) = enc_party(2);
+        let (_, carol_enc_pk) = enc_party(3);
+
+        let genesis_coin = coin(0xA1, 100, genesis_pk());
+        let alice_coin   = coin(0xA2, 100, alice_pk);
+        let bob_coin     = coin(0xB1,  40, bob_pk);
+        let alice_change = coin(0xB2,  60, alice_pk);
+        let carol_coin   = coin(0xC1,  40, carol_pk);
+
+        let (tx0, sk0, r0) = make_tx(0, genesis_sk(), [0u8; 32], &[genesis_coin.clone()], &[(alice_coin.clone(), alice_pk, alice_enc_pk)]);
+        let (tx1, sk1, r1) = make_tx(1, alice_sk, [0u8; 32], &[alice_coin.clone()], &[(bob_coin.clone(), bob_pk, bob_enc_pk), (alice_change.clone(), alice_pk, alice_enc_pk)]);
+        let (tx2, sk2, r2) = make_tx(2, bob_sk, [0u8; 32], &[bob_coin.clone()], &[(carol_coin.clone(), carol_pk, carol_enc_pk)]);
+        let entries = vec![enc(&tx0,&r0,sk0), enc(&tx1,&r1,sk1), enc(&tx2,&r2,sk2)];
+
+        let pv0 = spend(genesis_sk(), genesis_pk(), genesis_coin.commitment(), &[], &tx0,
+            &[genesis_coin.clone()], &[alice_coin.clone()], true, None).unwrap();
+
+        Chain { entries, tx0, tx1, tx2, alice_coin, bob_coin, alice_change, carol_coin, genesis_coin,
+            alice_sk, alice_pk, bob_sk, bob_pk, carol_pk, pv0 }
     }
 
     #[test]
     fn receipt_tracks_correct_received_slot() {
-        let (alice_sk, alice_pk) = party(1);
-        let (bob_sk, bob_pk) = party(2);
-        let (_, carol_pk) = party(3);
+        let c = build_chain();
+        let cn_alice = c.alice_coin.commitment();
+        let cn_bob = c.bob_coin.commitment();
 
-        let alice_coin   = coin(0xA2, 100, alice_pk);
-        let bob_coin     = coin(0xB1,  40, bob_pk);
-        let alice_change = coin(0xB2,  60, alice_pk);
-        let carol_coin   = coin(0xC1,  40, carol_pk);
-
-        let (tx0, sk0, r0) = make_tx(0, GENESIS_SK, &[coin(0xA1, 100, genesis_pk())], &[(alice_coin.clone(), alice_pk)]);
-        let (tx1, sk1, r1) = make_tx(1, alice_sk, &[alice_coin.clone()], &[(bob_coin.clone(), bob_pk), (alice_change, alice_pk)]);
-        let (tx2, sk2, r2) = make_tx(2, bob_sk, &[bob_coin.clone()], &[(carol_coin, carol_pk)]);
-        let entries = vec![enc(&tx0,&r0,sk0), enc(&tx1,&r1,sk1), enc(&tx2,&r2,sk2)];
-
-        let cn_alice = alice_coin.commitment();
-        let cn_bob   = bob_coin.commitment();
-
-        let (alice_receipt, _) = make_receipt(alice_sk, cn_alice, &entries, 0).unwrap();
+        let alice_receipt = make_receipt(c.alice_pk, cn_alice, &c.entries, 0, c.pv0.clone()).unwrap();
         assert_eq!(alice_receipt.received_at, 0);
 
-        let (bob_receipt, _) = make_receipt(bob_sk, cn_bob, &entries, 1).unwrap();
+        let alice_spend_pv = spend(c.alice_sk, c.alice_pk, cn_alice, &c.entries[..1], &c.tx1,
+            &[c.alice_coin.clone()], &[c.bob_coin.clone(), c.alice_change.clone()], false, Some(alice_receipt)).unwrap();
+
+        let bob_receipt = make_receipt(c.bob_pk, cn_bob, &c.entries, 1, alice_spend_pv).unwrap();
         assert_eq!(bob_receipt.received_at, 1);
+        let _ = c.tx2;
     }
 
     #[test]
     fn coin_proof_tracks_change_as_a_receipt() {
-        let (alice_sk, alice_pk) = party(1);
-        let (bob_sk, bob_pk) = party(2);
+        let c = build_chain();
+        let cn_change = c.alice_change.commitment();
 
-        let alice_coin   = coin(0xA2, 100, alice_pk);
-        let bob_coin     = coin(0xB1,  40, bob_pk);
-        let alice_change = coin(0xB2,  60, alice_pk);
+        let alice_receipt = make_receipt(c.alice_pk, c.alice_coin.commitment(), &c.entries, 0, c.pv0.clone()).unwrap();
+        let alice_spend_pv = spend(c.alice_sk, c.alice_pk, c.alice_coin.commitment(), &c.entries[..1], &c.tx1,
+            &[c.alice_coin.clone()], &[c.bob_coin.clone(), c.alice_change.clone()], false, Some(alice_receipt)).unwrap();
 
-        let (tx0, sk0, r0) = make_tx(0, GENESIS_SK, &[coin(0xA1, 100, genesis_pk())], &[(alice_coin.clone(), alice_pk)]);
-        let (tx1, sk1, r1) = make_tx(1, alice_sk, &[alice_coin], &[(bob_coin, bob_pk), (alice_change.clone(), alice_pk)]);
-        let entries = vec![enc(&tx0,&r0,sk0), enc(&tx1,&r1,sk1)];
-
-        let cn_change = alice_change.commitment();
-        let (receipt, _) = make_receipt(alice_sk, cn_change, &entries, 1).unwrap();
+        let receipt = make_receipt(c.alice_pk, cn_change, &c.entries, 1, alice_spend_pv).unwrap();
         assert_eq!(receipt.received_at, 1);
-        let _ = bob_sk;
     }
 
     #[test]
     fn demo_chain_is_valid_end_to_end() {
-        let (alice_sk, alice_pk) = party(1);
-        let (bob_sk, bob_pk) = party(2);
-        let (_, carol_pk) = party(3);
+        let c = build_chain();
+        let cn_alice = c.alice_coin.commitment();
+        let cn_bob = c.bob_coin.commitment();
 
-        let genesis_coin = coin(0xA1, 100, genesis_pk());
-        let alice_coin   = coin(0xA2, 100, alice_pk);
-        let bob_coin     = coin(0xB1,  40, bob_pk);
-        let alice_change = coin(0xB2,  60, alice_pk);
-        let carol_coin   = coin(0xC1,  40, carol_pk);
-
-        let (tx0, sk0, r0) = make_tx(0, GENESIS_SK, &[genesis_coin.clone()], &[(alice_coin.clone(), alice_pk)]);
-        let (tx1, sk1, r1) = make_tx(1, alice_sk, &[alice_coin.clone()], &[(bob_coin.clone(), bob_pk), (alice_change.clone(), alice_pk)]);
-        let (tx2, sk2, r2) = make_tx(2, bob_sk, &[bob_coin.clone()], &[(carol_coin.clone(), carol_pk)]);
-        let entries = vec![enc(&tx0,&r0,sk0), enc(&tx1,&r1,sk1), enc(&tx2,&r2,sk2)];
-
-        let cn_genesis = genesis_coin.commitment();
-        let cn_alice   = alice_coin.commitment();
-        let cn_bob     = bob_coin.commitment();
-
-        spend(GENESIS_SK, genesis_pk(), cn_genesis, &[], &tx0,
-            &[genesis_coin], &[alice_coin.clone()], true, None).unwrap();
-
-        let (alice_receipt, _) = make_receipt(alice_sk, cn_alice, &entries, 0).unwrap();
-        spend(alice_sk, alice_pk, cn_alice, &entries[..1], &tx1,
-            &[alice_coin.clone()], &[bob_coin.clone(), alice_change], false,
+        let alice_receipt = make_receipt(c.alice_pk, cn_alice, &c.entries, 0, c.pv0).unwrap();
+        let pv1 = spend(c.alice_sk, c.alice_pk, cn_alice, &c.entries[..1], &c.tx1,
+            &[c.alice_coin.clone()], &[c.bob_coin.clone(), c.alice_change.clone()], false,
             Some(alice_receipt)).unwrap();
 
-        let (bob_receipt, _) = make_receipt(bob_sk, cn_bob, &entries, 1).unwrap();
-        spend(bob_sk, bob_pk, cn_bob, &entries[..2], &tx2,
-            &[bob_coin.clone()], &[carol_coin], false,
+        let bob_receipt = make_receipt(c.bob_pk, cn_bob, &c.entries, 1, pv1).unwrap();
+        spend(c.bob_sk, c.bob_pk, cn_bob, &c.entries[..2], &c.tx2,
+            &[c.bob_coin.clone()], &[c.carol_coin.clone()], false,
             Some(bob_receipt)).unwrap();
+        let _ = (c.genesis_coin, c.tx0, c.carol_pk);
     }
 
     #[test]
     fn rejects_wrong_secret_key() {
-        let (alice_sk, alice_pk) = party(1);
+        let (alice_sk, _) = owner_party(1);
         let genesis_coin = coin(0xA1, 100, genesis_pk());
-        let alice_coin   = coin(0xA2, 100, alice_pk);
-        let (tx0, _, _) = make_tx(0, GENESIS_SK, &[genesis_coin.clone()], &[(alice_coin.clone(), alice_pk)]);
+        let alice_coin   = coin(0xA2, 100, derive_owner_pk(&alice_sk));
+        let (tx0, _, _) = make_tx(0, genesis_sk(), [0u8; 32], &[genesis_coin.clone()], &[(alice_coin.clone(), derive_owner_pk(&alice_sk), [0u8; 32])]);
 
         let err = spend(alice_sk, genesis_pk(), genesis_coin.commitment(), &[], &tx0,
             &[genesis_coin], &[alice_coin], true, None).unwrap_err();
@@ -1194,11 +1295,11 @@ mod tests {
 
     #[test]
     fn rejects_minting_without_the_genesis_key() {
-        let (alice_sk, alice_pk) = party(1);
-        let (_, bob_pk) = party(2);
+        let (alice_sk, alice_pk) = owner_party(1);
+        let (_, bob_pk) = owner_party(2);
         let alice_coin = coin(0xA1, 100, alice_pk);
         let bob_coin   = coin(0xB1, 100, bob_pk);
-        let (tx0, _, _) = make_tx(0, alice_sk, &[alice_coin.clone()], &[(bob_coin.clone(), bob_pk)]);
+        let (tx0, _, _) = make_tx(0, alice_sk, [0u8; 32], &[alice_coin.clone()], &[(bob_coin.clone(), bob_pk, [0u8; 32])]);
 
         let err = spend(alice_sk, alice_pk, alice_coin.commitment(), &[], &tx0,
             &[alice_coin], &[bob_coin], true, None).unwrap_err();
@@ -1206,53 +1307,58 @@ mod tests {
     }
 
     #[test]
-    fn rejects_building_a_receipt_for_a_coin_never_received() {
-        let (alice_sk, alice_pk) = party(1);
-        let (carol_sk, carol_pk) = party(3);
+    fn rejects_building_a_receipt_for_a_coin_never_created() {
+        let (_, alice_pk) = owner_party(1);
+        let (_, carol_pk) = owner_party(3);
 
         let genesis_coin     = coin(0xA1, 100, genesis_pk());
         let alice_coin       = coin(0xA2, 100, alice_pk);
         let carol_fake_input = coin(0xC1, 100, carol_pk);
 
-        let (tx0, sk0, r0) = make_tx(0, GENESIS_SK, &[genesis_coin], &[(alice_coin, alice_pk)]);
+        let (tx0, sk0, r0) = make_tx(0, genesis_sk(), [0u8; 32], &[genesis_coin.clone()], &[(alice_coin, alice_pk, [0u8; 32])]);
         let entries = vec![enc(&tx0,&r0,sk0)];
         let cn_carol = carol_fake_input.commitment();
 
-        // Carol never actually received this coin — tx0 doesn't even decrypt
-        // for her — so a receipt for it simply cannot be built.
-        let err = make_receipt(carol_sk, cn_carol, &entries, 0).unwrap_err();
-        assert_eq!(err, "entry_k does not decrypt for this owner");
+        let pv0 = spend(genesis_sk(), genesis_pk(), genesis_coin.commitment(), &[], &tx0,
+            &[genesis_coin], &[coin(0xA2, 100, alice_pk)], true, None).unwrap();
+
+        // Carol never actually received this coin — entries[0] doesn't create
+        // it — so a receipt for it simply cannot be built.
+        let err = make_receipt(carol_pk, cn_carol, &entries, 0, pv0).unwrap_err();
+        assert_eq!(err, "entry_k does not create coin_commitment");
     }
 
     #[test]
     fn rejects_receipt_when_creating_transaction_was_itself_a_double_spend() {
-        let (alice_sk, alice_pk) = party(1);
-        let (bob_sk, bob_pk) = party(2);
-        let (carol_sk, carol_pk) = party(3);
+        let (alice_sk, alice_pk) = owner_party(1);
+        let (_, bob_pk) = owner_party(2);
+        let (_, carol_pk) = owner_party(3);
 
         let genesis_coin = coin(0xA1, 100, genesis_pk());
         let alice_coin   = coin(0xA2, 100, alice_pk);
         let bob_coin     = coin(0xB1, 100, bob_pk);
         let carol_coin   = coin(0xC1, 100, carol_pk);
 
-        let (tx0, sk0, r0) = make_tx(0, GENESIS_SK, &[genesis_coin], &[(alice_coin.clone(), alice_pk)]);
+        let (tx0, sk0, r0) = make_tx(0, genesis_sk(), [0u8; 32], &[genesis_coin.clone()], &[(alice_coin.clone(), alice_pk, [0u8; 32])]);
         // Alice double-spends alice_coin: tx1 and tx2 both claim to spend it
         // (same coin, same key ⇒ identical input_nullifier for both).
-        let (tx1, sk1, r1) = make_tx(1, alice_sk, &[alice_coin.clone()], &[(bob_coin, bob_pk)]);
-        let (tx2, sk2, r2) = make_tx(2, alice_sk, &[alice_coin], &[(carol_coin.clone(), carol_pk)]);
+        let (tx1, sk1, r1) = make_tx(1, alice_sk, [0u8; 32], &[alice_coin.clone()], &[(bob_coin, bob_pk, [0u8; 32])]);
+        let (tx2, sk2, r2) = make_tx(2, alice_sk, [0u8; 32], &[alice_coin.clone()], &[(carol_coin.clone(), carol_pk, [0u8; 32])]);
         let entries = vec![enc(&tx0,&r0,sk0), enc(&tx1,&r1,sk1), enc(&tx2,&r2,sk2)];
 
+        let pv0 = spend(genesis_sk(), genesis_pk(), genesis_coin.commitment(), &[], &tx0,
+            &[genesis_coin], &[alice_coin], true, None).unwrap();
+
         let cn_carol = carol_coin.commitment();
-        let err = make_receipt(carol_sk, cn_carol, &entries, 2).unwrap_err();
+        let err = make_receipt(carol_pk, cn_carol, &entries, 2, pv0).unwrap_err();
         assert_eq!(err, "parent transaction's nullifier was already present on the board — it was a double-spend");
-        let _ = bob_sk;
     }
 
     #[test]
     fn rejects_double_spend() {
-        let (alice_sk, alice_pk) = party(1);
-        let (bob_sk, bob_pk) = party(2);
-        let (_, carol_pk) = party(3);
+        let (alice_sk, alice_pk) = owner_party(1);
+        let (bob_sk, bob_pk) = owner_party(2);
+        let (_, carol_pk) = owner_party(3);
 
         let genesis_coin = coin(0xA1, 100, genesis_pk());
         let alice_coin   = coin(0xA2, 100, alice_pk);
@@ -1260,21 +1366,17 @@ mod tests {
         let alice_change = coin(0xB2,  40, alice_pk);
         let carol_coin   = coin(0xC1, 100, carol_pk);
 
-        let cn_genesis = genesis_coin.commitment();
-        let cn_alice   = alice_coin.commitment();
+        let cn_alice = alice_coin.commitment();
 
-        let (tx0,  sk0, r0) = make_tx(0, GENESIS_SK, &[genesis_coin.clone()], &[(alice_coin.clone(), alice_pk)]);
-        let (tx1,  sk1, r1) = make_tx(1, alice_sk, &[alice_coin.clone()], &[(bob_coin.clone(), bob_pk), (alice_change.clone(), alice_pk)]);
-        let (tx1b, _,   _ ) = make_tx(2, alice_sk, &[alice_coin.clone()], &[(carol_coin.clone(), carol_pk)]);
+        let (tx0,  sk0, r0) = make_tx(0, genesis_sk(), [0u8; 32], &[genesis_coin.clone()], &[(alice_coin.clone(), alice_pk, [0u8; 32])]);
+        let (tx1,  sk1, r1) = make_tx(1, alice_sk, [0u8; 32], &[alice_coin.clone()], &[(bob_coin.clone(), bob_pk, [0u8; 32]), (alice_change.clone(), alice_pk, [0u8; 32])]);
+        let (tx1b, _,   _ ) = make_tx(2, alice_sk, [0u8; 32], &[alice_coin.clone()], &[(carol_coin.clone(), carol_pk, [0u8; 32])]);
         let entries = vec![enc(&tx0,&r0,sk0), enc(&tx1,&r1,sk1)];
 
-        spend(GENESIS_SK, genesis_pk(), cn_genesis, &[], &tx0,
+        let pv0 = spend(genesis_sk(), genesis_pk(), genesis_coin.commitment(), &[], &tx0,
             &[genesis_coin], &[alice_coin.clone()], true, None).unwrap();
 
-        // The receipt is built once — no per-slot re-extension needed before
-        // either spend attempt below; freshness comes from the live
-        // nullifier-accumulator check inside `spend`/`check_spend` instead.
-        let (alice_receipt, _) = make_receipt(alice_sk, cn_alice, &entries, 0).unwrap();
+        let alice_receipt = make_receipt(alice_pk, cn_alice, &entries, 0, pv0).unwrap();
         assert_eq!(alice_receipt.received_at, 0);
 
         spend(alice_sk, alice_pk, cn_alice, &entries[..1], &tx1,
@@ -1290,44 +1392,46 @@ mod tests {
 
     #[test]
     fn rejects_spend_using_a_receipt_for_a_different_coin() {
-        let (alice_sk, alice_pk) = party(1);
-        let (bob_sk, bob_pk) = party(2);
+        let (alice_sk, alice_pk) = owner_party(1);
+        let (_, bob_pk) = owner_party(2);
 
         let genesis_coin = coin(0xA1, 100, genesis_pk());
         let alice_coin   = coin(0xA2, 100, alice_pk);
         let bob_coin     = coin(0xB1,  40, bob_pk);
         let alice_change = coin(0xB2,  60, alice_pk);
 
-        let (tx0, sk0, r0) = make_tx(0, GENESIS_SK, &[genesis_coin], &[(alice_coin.clone(), alice_pk)]);
-        let (tx1, sk1, r1) = make_tx(1, alice_sk, &[alice_coin.clone()], &[(bob_coin.clone(), bob_pk), (alice_change.clone(), alice_pk)]);
+        let (tx0, sk0, r0) = make_tx(0, genesis_sk(), [0u8; 32], &[genesis_coin.clone()], &[(alice_coin.clone(), alice_pk, [0u8; 32])]);
+        let (tx1, sk1, r1) = make_tx(1, alice_sk, [0u8; 32], &[alice_coin.clone()], &[(bob_coin.clone(), bob_pk, [0u8; 32]), (alice_change.clone(), alice_pk, [0u8; 32])]);
         let entries = vec![enc(&tx0,&r0,sk0), enc(&tx1,&r1,sk1)];
 
         let cn_alice  = alice_coin.commitment();
         let cn_change = alice_change.commitment();
 
-        let (alice_receipt, _) = make_receipt(alice_sk, cn_alice, &entries, 0).unwrap();
+        let pv0 = spend(genesis_sk(), genesis_pk(), genesis_coin.commitment(), &[], &tx0,
+            &[genesis_coin], &[alice_coin.clone()], true, None).unwrap();
+        let alice_receipt = make_receipt(alice_pk, cn_alice, &entries, 0, pv0).unwrap();
 
         // tx2 legitimately spends alice_change, but we supply the receipt for
         // alice_coin — a different (and already-spent) commitment — instead.
         let payout = coin(0xC1, 60, bob_pk);
-        let (tx2, _, _) = make_tx(2, alice_sk, &[alice_change.clone()], &[(payout.clone(), bob_pk)]);
+        let (tx2, _, _) = make_tx(2, alice_sk, [0u8; 32], &[alice_change.clone()], &[(payout.clone(), bob_pk, [0u8; 32])]);
         let err = spend(alice_sk, alice_pk, cn_change, &entries, &tx2,
             &[alice_change], &[payout], false, Some(alice_receipt)).unwrap_err();
         assert_eq!(err, "coin-proof tracks a different coin");
-        let _ = (bob_sk, sk1, r1);
+        let _ = (sk1, r1);
     }
 
     #[test]
     fn rejects_value_conservation_violation() {
-        let (_, alice_pk) = party(1);
+        let (_, alice_pk) = owner_party(1);
         let genesis_coin = coin(0xA1, 100, genesis_pk());
         let alice_coin   = coin(0xA2, 100, alice_pk);
         let extra_coin   = coin(0xA3,   1, alice_pk);
 
-        let (tx0, _, _) = make_tx(0, GENESIS_SK, &[genesis_coin.clone()],
-            &[(alice_coin.clone(), alice_pk), (extra_coin.clone(), alice_pk)]);
+        let (tx0, _, _) = make_tx(0, genesis_sk(), [0u8; 32], &[genesis_coin.clone()],
+            &[(alice_coin.clone(), alice_pk, [0u8; 32]), (extra_coin.clone(), alice_pk, [0u8; 32])]);
 
-        let err = spend(GENESIS_SK, genesis_pk(), genesis_coin.commitment(), &[], &tx0,
+        let err = spend(genesis_sk(), genesis_pk(), genesis_coin.commitment(), &[], &tx0,
             &[genesis_coin], &[alice_coin, extra_coin], true, None).unwrap_err();
         assert_eq!(err, "transaction violates value conservation: sum(inputs) must equal sum(outputs)");
     }
@@ -1346,11 +1450,8 @@ mod tests {
         // asserting an absolute wall-clock budget, so it isn't flaky across
         // debug/release builds or slower CI hardware — only relative growth
         // matters here.
-        fn value(i: u32) -> [u8; 32] {
-            let mut v = [0u8; 32];
-            v[..4].copy_from_slice(&i.to_be_bytes());
-            v[31] = 1; // keep every value > [0u8;32], avoiding the sentinel edge case
-            v
+        fn value(i: u32) -> Fr {
+            Fr::from(i as u64 + 1) // keep every value > 0, avoiding the sentinel edge case
         }
 
         let mut tree = NullifierTree::new();
@@ -1379,8 +1480,7 @@ mod tests {
 
         // Correctness alongside the scale check: a never-inserted value still
         // verifies as absent, and an inserted one no longer does.
-        let mut absent = [0xAAu8; 32];
-        absent[0] = 0xFF;
+        let absent = Fr::from(u64::MAX);
         let witness = tree.prove_non_membership(absent);
         assert!(verify_nonmembership(tree.root(), absent, &witness));
 
