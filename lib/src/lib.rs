@@ -467,14 +467,40 @@ pub const TREE_DEPTH: usize = 32;
 /// nullifier, Poseidon(output_commitments)). Including the slot index
 /// prevents permuting entries while keeping a valid root.
 pub fn merkle_leaf(slot: usize, entry: &BoardEntry) -> Fr {
+    merkle_leaf_from_commitment(slot, entry.nullifier, &entry.output_commitments, entry_ciphertext_commitment(entry))
+}
+
+/// Fold a board entry's off-circuit-only fields (`ciphertext`, `ek_pk`,
+/// `key_encs` — all variable-length, X25519/wallet-scanning data with no
+/// cryptographic role in any circuit's checks, see the `BoardEntry` doc
+/// comment) into a single opaque `Fr` value, host-side only. No circuit ever
+/// re-derives this from the raw bytes — R1CS circuit shape is fixed, and
+/// these fields are unbounded-length — it only needs to be *some* value
+/// bound into the leaf hash for board integrity, auditable off-circuit by
+/// anyone checking the raw posted bytes against a board root.
+pub fn entry_ciphertext_commitment(entry: &BoardEntry) -> Fr {
     let key_encs_bytes: Vec<u8> = entry.key_encs.iter().flatten().copied().collect();
     poseidon_hash(&[
-        Fr::from(slot as u64),
         poseidon_hash_bytes(&entry.ciphertext),
         poseidon_hash_bytes(&entry.ek_pk),
         poseidon_hash_bytes(&key_encs_bytes),
-        entry.nullifier,
-        poseidon_hash(&entry.output_commitments),
+    ])
+}
+
+/// The fixed-size core of `merkle_leaf` — mirrorable in-circuit, since every
+/// input is either a native `Fr` value or (for `ciphertext_commitment`) an
+/// opaque witness the circuit never expands.
+pub fn merkle_leaf_from_commitment(
+    slot: usize,
+    nullifier: Fr,
+    output_commitments: &[Fr],
+    ciphertext_commitment: Fr,
+) -> Fr {
+    poseidon_hash(&[
+        Fr::from(slot as u64),
+        ciphertext_commitment,
+        nullifier,
+        poseidon_hash(output_commitments),
     ])
 }
 

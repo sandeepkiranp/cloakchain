@@ -2,7 +2,7 @@
 # `script` (the SP1 host driver) is intentionally left out of the active
 # member list until Phase 4 of the MNT-native port rewrites it — it still
 # references the now-deleted SP1 guest ELFs and would fail to build.
-members = ["lib", "circuit-spend", "circuit-coinproof"]
+members = ["lib", "circuit-spend", "circuit-coinproof", "circuit-wrap"]
 resolver = "2"
 
 [workspace.dependencies]

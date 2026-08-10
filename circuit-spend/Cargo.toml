@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 cloakkchain-lib = { path = "../lib" }
+cloakkchain-circuit-wrap = { path = "../circuit-wrap" }
 
 ark-ff = { workspace = true }
 ark-ec = { workspace = true }

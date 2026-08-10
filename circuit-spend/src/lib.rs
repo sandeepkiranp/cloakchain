@@ -9,17 +9,23 @@
 //! are a mechanical extension (padding + a count witness) once this core
 //! shape is validated, not a new mechanism.
 
+use ark_crypto_primitives::snark::{constraints::SNARKGadget, BooleanInputVar};
 use ark_crypto_primitives::sponge::{
     constraints::CryptographicSpongeVar, poseidon::constraints::PoseidonSpongeVar,
 };
 use ark_ec::PrimeGroup;
 use ark_ff::{BigInteger, PrimeField};
-use ark_groth16::{Groth16, Proof, ProvingKey, VerifyingKey};
+use ark_groth16::{
+    constraints::{Groth16VerifierGadget, ProofVar, VerifyingKeyVar},
+    Groth16, Proof, ProvingKey, VerifyingKey,
+};
 use ark_mnt4_753::MNT4_753;
+use ark_mnt6_753::MNT6_753;
 use ark_r1cs_std::{cmp::CmpGadget, fields::fp::FpVar, prelude::*};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 use ark_snark::SNARK;
 use ark_std::rand::{CryptoRng, RngCore};
+use cloakkchain_circuit_wrap::{chunks_per_value, combine_chunks_var, public_input_chunks, Fr6};
 use cloakkchain_lib::{
     genesis_pk, owner_pk_to_field_pair, poseidon_params, Coin, Fr, NonMembershipWitness, OwnerPk,
     OwnerScalar, TREE_DEPTH,
@@ -27,6 +33,17 @@ use cloakkchain_lib::{
 
 type Fp = FpVar<Fr>;
 type G1Var = ark_mnt6_753::constraints::G1Var;
+type MNT6PairingVar = ark_mnt6_753::constraints::PairingVar;
+
+/// `ReceiptStepCircuit`'s public-input count/order (mirrors
+/// `circuit_coinproof::ReceiptStepCircuit::public_inputs`, duplicated as a
+/// plain constant rather than a crate dependency, to avoid a
+/// circuit-spend <-> circuit-coinproof cycle — both sides must keep this in
+/// sync by construction, not by the type system).
+const RECEIPT_PUBLIC_INPUT_COUNT: usize = 5;
+const RECEIPT_OWNER_PK_X: usize = 0;
+const RECEIPT_OWNER_PK_Y: usize = 1;
+const RECEIPT_COIN_COMMITMENT: usize = 2;
 
 // ---- gadget helpers (mirror cloakkchain_lib's native functions exactly) --
 
@@ -293,6 +310,233 @@ impl GenesisSpendCircuit {
         let (x, y) = owner_pk_to_field_pair(&pk_p);
         vec![x, y, coin_commitment, board_root, output_commitment, current_nullifier_root]
     }
+}
+
+/// The non-genesis variant of the spend relation (`check_spend` with
+/// `is_genesis = false`): everything `GenesisSpendCircuit` checks, minus the
+/// fixed-genesis-key constraint, plus a recursive verification of the
+/// wrapped parent coin-receipt proof
+/// (`circuit_coinproof::ReceiptStepCircuit`, wrapped via `circuit-wrap`) in
+/// its place — mirrors `check_spend`'s `coin_proof.owner_pk == pk_p` /
+/// `coin_proof.coin_commitment == coin_commitment` checks, except the
+/// receipt's claims are now backed by an actual verified proof rather than
+/// a plain witness. Public values, in the same order as
+/// `GenesisSpendCircuit`: `pk_p.x, pk_p.y, coin_commitment, board_root,
+/// output_commitment, current_nullifier_root` (see [`SpendStepCircuit::public_inputs`]).
+///
+/// Currently fixed to recursively verify a wrapped `ReceiptStepCircuit`
+/// proof specifically — see `circuit_coinproof`'s module doc comment for why
+/// (the same "one VK per wrapped inner circuit" simplification
+/// `GenesisSpendCircuit`'s own port-plan design note flagged).
+#[derive(Clone)]
+pub struct SpendStepCircuit {
+    // Public values.
+    pub pk_p: Option<OwnerPk>,
+    pub coin_commitment: Option<Fr>,
+    pub board_root: Option<Fr>,
+    pub output_commitment: Option<Fr>,
+    pub current_nullifier_root: Option<Fr>,
+
+    // Private witnesses (same shape as `GenesisSpendCircuit`).
+    pub sk_p: Option<OwnerScalar>,
+    pub input_coin: Option<Coin>,
+    pub output_coin: Option<Coin>,
+    pub entry_position: Option<u64>,
+    /// Length `TREE_DEPTH`.
+    pub append_path: Option<Vec<Fr>>,
+    pub own_nullifier_nonmembership: Option<NonMembershipWitness>,
+
+    // Private witnesses: the wrapped parent coin-receipt proof (a Wrap<5>
+    // proof over `ReceiptStepCircuit`'s public inputs).
+    /// Fixed per deployment — not `Option`, a verifying key isn't secret.
+    pub wrap_vk: VerifyingKey<MNT6_753>,
+    pub wrap_proof: Option<Proof<MNT6_753>>,
+    /// `ReceiptStepCircuit`'s original 5 `Fr4` public values (pre-chunking).
+    pub wrap_public_inputs: Option<[Fr; RECEIPT_PUBLIC_INPUT_COUNT]>,
+}
+
+impl ConstraintSynthesizer<Fr> for SpendStepCircuit {
+    fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        // --- public inputs, in the fixed order `public_inputs` matches ---
+        let (pk_x_native, pk_y_native) = match &self.pk_p {
+            Some(pk) => {
+                let (x, y) = owner_pk_to_field_pair(pk);
+                (Some(x), Some(y))
+            }
+            None => (None, None),
+        };
+        let pk_p_x = Fp::new_input(cs.clone(), || opt(&pk_x_native))?;
+        let pk_p_y = Fp::new_input(cs.clone(), || opt(&pk_y_native))?;
+        let coin_commitment = Fp::new_input(cs.clone(), || opt(&self.coin_commitment))?;
+        let board_root = Fp::new_input(cs.clone(), || opt(&self.board_root))?;
+        let output_commitment = Fp::new_input(cs.clone(), || opt(&self.output_commitment))?;
+        let current_nullifier_root = Fp::new_input(cs.clone(), || opt(&self.current_nullifier_root))?;
+
+        // --- private witnesses (shared with GenesisSpendCircuit) ---
+        let sk_bit_values: Option<Vec<bool>> = self.sk_p.map(|sk| sk.into_bigint().to_bits_le());
+        let sk_bit_len = OwnerScalar::MODULUS_BIT_SIZE as usize;
+        let sk_bits: Vec<Boolean<Fr>> = (0..sk_bit_len)
+            .map(|i| Boolean::new_witness(cs.clone(), || opt(&sk_bit_values.as_ref().map(|b| b[i]))))
+            .collect::<Result<_, _>>()?;
+        let mut modulus_minus_one = OwnerScalar::MODULUS.0.to_vec();
+        modulus_minus_one[0] -= 1;
+        Boolean::enforce_smaller_or_equal_than_le(&sk_bits, modulus_minus_one)?;
+
+        let input_coin = CoinVar::new_witness(cs.clone(), &self.input_coin)?;
+        let output_coin = CoinVar::new_witness(cs.clone(), &self.output_coin)?;
+
+        let entry_position_fp = Fp::new_witness(cs.clone(), || opt(&self.entry_position.map(Fr::from)))?;
+        let entry_position_bits = entry_position_fp.to_bits_le()?;
+        let append_path = alloc_fp_vec(cs.clone(), &self.append_path, TREE_DEPTH)?;
+
+        let w = &self.own_nullifier_nonmembership;
+        let low_leaf = IndexedLeafVar {
+            value: Fp::new_witness(cs.clone(), || opt(&w.as_ref().map(|w| w.low_leaf.value)))?,
+            next_value: Fp::new_witness(cs.clone(), || opt(&w.as_ref().map(|w| w.low_leaf.next_value)))?,
+            next_index: Fp::new_witness(cs.clone(), || opt(&w.as_ref().map(|w| Fr::from(w.low_leaf.next_index))))?,
+        };
+        let low_leaf_index_fp = Fp::new_witness(cs.clone(), || opt(&w.as_ref().map(|w| Fr::from(w.low_leaf_index))))?;
+        let low_leaf_index_bits = low_leaf_index_fp.to_bits_le()?;
+        let sibling_path = alloc_fp_vec(cs.clone(), &w.as_ref().map(|w| w.sibling_path.clone()), TREE_DEPTH)?;
+
+        // --- pk_p = sk_p * G ---
+        let generator = G1Var::new_constant(cs.clone(), ark_mnt6_753::G1Projective::generator())?;
+        let pk_p_computed = generator.scalar_mul_le(sk_bits.iter())?.to_affine()?;
+        pk_p_computed.x.enforce_equal(&pk_p_x)?;
+        pk_p_computed.y.enforce_equal(&pk_p_y)?;
+
+        // --- board_root = compute_root_from_path(0, entry_position, append_path) ---
+        let board_root_computed =
+            compute_root_from_path_var(cs.clone(), &Fp::zero(), &entry_position_bits[..TREE_DEPTH], &append_path)?;
+        board_root_computed.enforce_equal(&board_root)?;
+
+        // --- own_nullifier = Poseidon(coin_commitment, fold(sk_p bits)) ---
+        let sk_folded = fold_bits_le_var(cs.clone(), &sk_bits)?;
+        let own_nullifier = poseidon_hash_var(cs.clone(), &[coin_commitment.clone(), sk_folded])?;
+
+        // --- double-spend guard ---
+        let nonmembership_ok = verify_nonmembership_var(
+            cs.clone(),
+            &current_nullifier_root,
+            &own_nullifier,
+            &low_leaf,
+            &low_leaf_index_bits[..TREE_DEPTH],
+            &sibling_path,
+        )?;
+        nonmembership_ok.enforce_equal(&Boolean::TRUE)?;
+
+        // --- input coin: commitment matches, owner is the spender ---
+        input_coin.commitment(cs.clone())?.enforce_equal(&coin_commitment)?;
+        input_coin.owner_pk_x.enforce_equal(&pk_p_x)?;
+        input_coin.owner_pk_y.enforce_equal(&pk_p_y)?;
+
+        // --- output coin: commitment matches the public output_commitment ---
+        output_coin.commitment(cs.clone())?.enforce_equal(&output_commitment)?;
+
+        // --- value conservation (single input/output — see the module doc comment) ---
+        input_coin.value.enforce_equal(&output_coin.value)?;
+
+        // --- non-genesis: recursively verify the wrapped parent coin-receipt
+        // proof, then bind its claims to this spend ---
+        let wrap_public_len = RECEIPT_PUBLIC_INPUT_COUNT * chunks_per_value();
+        let bit_len = Fr6::MODULUS_BIT_SIZE as usize;
+        let wrap_native_chunks: Option<Vec<Fr6>> =
+            self.wrap_public_inputs.as_ref().map(|v| public_input_chunks(v));
+        let mut per_chunk_bits: Vec<Vec<Boolean<Fr>>> = Vec::with_capacity(wrap_public_len);
+        for i in 0..wrap_public_len {
+            let value_bits: Option<Vec<bool>> =
+                wrap_native_chunks.as_ref().map(|v| v[i].into_bigint().to_bits_le());
+            let bits: Vec<Boolean<Fr>> = (0..bit_len)
+                .map(|j| Boolean::new_witness(cs.clone(), || opt(&value_bits.as_ref().map(|b| b[j]))))
+                .collect::<Result<_, _>>()?;
+            per_chunk_bits.push(bits);
+        }
+        let input_var = BooleanInputVar::<Fr6, Fr>::new(per_chunk_bits.clone());
+
+        let wrap_vk_var = VerifyingKeyVar::<MNT6_753, MNT6PairingVar>::new_constant(cs.clone(), &self.wrap_vk)?;
+        let wrap_proof_var =
+            ProofVar::<MNT6_753, MNT6PairingVar>::new_witness(cs.clone(), || opt(&self.wrap_proof))?;
+        let pvk = wrap_vk_var.prepare()?;
+        let ok = Groth16VerifierGadget::<MNT6_753, MNT6PairingVar>::verify_with_processed_vk(
+            &pvk,
+            &input_var,
+            &wrap_proof_var,
+        )?;
+        ok.enforce_equal(&Boolean::TRUE)?;
+
+        let cpv = chunks_per_value();
+        let group = |idx: usize| -> &[Vec<Boolean<Fr>>] { &per_chunk_bits[idx * cpv..(idx + 1) * cpv] };
+        let receipt_owner_pk_x = combine_chunks_var(group(RECEIPT_OWNER_PK_X))?;
+        let receipt_owner_pk_y = combine_chunks_var(group(RECEIPT_OWNER_PK_Y))?;
+        let receipt_coin_commitment = combine_chunks_var(group(RECEIPT_COIN_COMMITMENT))?;
+
+        // mirrors check_spend's `cp.owner_pk == pk_p` / `cp.coin_commitment == coin_commitment`
+        receipt_owner_pk_x.enforce_equal(&pk_p_x)?;
+        receipt_owner_pk_y.enforce_equal(&pk_p_y)?;
+        receipt_coin_commitment.enforce_equal(&coin_commitment)?;
+
+        Ok(())
+    }
+}
+
+impl SpendStepCircuit {
+    /// Build the Groth16 public-input vector for this circuit's public
+    /// values — same order as `GenesisSpendCircuit::public_inputs`.
+    pub fn public_inputs(
+        pk_p: OwnerPk,
+        coin_commitment: Fr,
+        board_root: Fr,
+        output_commitment: Fr,
+        current_nullifier_root: Fr,
+    ) -> Vec<Fr> {
+        GenesisSpendCircuit::public_inputs(pk_p, coin_commitment, board_root, output_commitment, current_nullifier_root)
+    }
+}
+
+pub fn setup_non_genesis<R: RngCore + CryptoRng>(
+    wrap_vk: VerifyingKey<MNT6_753>,
+    rng: &mut R,
+) -> Result<(ProvingKey<MNT4_753>, VerifyingKey<MNT4_753>), SynthesisError> {
+    // See circuit-wrap's `setup` for why `wrap_proof` needs a structurally
+    // valid dummy rather than `None`.
+    let dummy_proof = Proof::<MNT6_753> {
+        a: ark_mnt6_753::G1Affine::identity(),
+        b: ark_mnt6_753::G2Affine::identity(),
+        c: ark_mnt6_753::G1Affine::identity(),
+    };
+    let circuit = SpendStepCircuit {
+        pk_p: None,
+        coin_commitment: None,
+        board_root: None,
+        output_commitment: None,
+        current_nullifier_root: None,
+        sk_p: None,
+        input_coin: None,
+        output_coin: None,
+        entry_position: None,
+        append_path: None,
+        own_nullifier_nonmembership: None,
+        wrap_vk,
+        wrap_proof: Some(dummy_proof),
+        wrap_public_inputs: None,
+    };
+    Groth16::<MNT4_753>::circuit_specific_setup(circuit, rng)
+}
+
+pub fn prove_non_genesis<R: RngCore + CryptoRng>(
+    pk: &ProvingKey<MNT4_753>,
+    circuit: SpendStepCircuit,
+    rng: &mut R,
+) -> Result<Proof<MNT4_753>, SynthesisError> {
+    Groth16::<MNT4_753>::prove(pk, circuit, rng)
+}
+
+pub fn verify_non_genesis(
+    vk: &VerifyingKey<MNT4_753>,
+    public_inputs: &[Fr],
+    proof: &Proof<MNT4_753>,
+) -> Result<bool, SynthesisError> {
+    Groth16::<MNT4_753>::verify(vk, public_inputs, proof)
 }
 
 pub fn setup<R: RngCore + CryptoRng>(
