@@ -4,8 +4,7 @@ use ark_crypto_primitives::sponge::{
     poseidon::PoseidonSponge, CryptographicSponge, FieldBasedCryptographicSponge,
 };
 use ark_ec::{AffineRepr, CurveGroup, PrimeGroup};
-use ark_ff::PrimeField;
-use ark_serialize::CanonicalSerialize;
+use ark_ff::{BigInteger, PrimeField};
 use serde::{Deserialize, Serialize};
 
 /// Bridges arkworks' `CanonicalSerialize`/`CanonicalDeserialize` (its own
@@ -55,8 +54,8 @@ pub type Fr = ark_mnt4_753::Fr;
 /// with no foreign-field wrapping. The scalar `OwnerScalar` is naturally an
 /// element of MNT6-753's own scalar field (== MNT4-753's *base* field) —
 /// genuinely a different field from `Fr`, so it's folded through
-/// [`poseidon_hash_bytes`] (bit/byte decomposition) wherever it needs to
-/// enter an `Fr`-native hash, rather than absorbed as a native field element.
+/// [`fold_owner_scalar`] (bit decomposition) wherever it needs to enter an
+/// `Fr`-native hash, rather than absorbed as a native field element.
 /// This is the same non-native-scalar/native-point-coordinate split that
 /// `Groth16VerifierGadget`'s own recursive verification relies on for public
 /// inputs crossing the cycle (see the MNT-native port plan).
@@ -90,13 +89,45 @@ pub fn poseidon_hash_bytes(bytes: &[u8]) -> Fr {
     poseidon_hash(&elems)
 }
 
-fn owner_scalar_to_bytes(sk: &OwnerScalar) -> Vec<u8> {
-    let mut out = Vec::new();
-    sk.serialize_compressed(&mut out).expect("OwnerScalar always serializes");
-    out
+/// Fold a foreign-field scalar (an `OwnerScalar`, genuinely a different
+/// field from `Fr` — see the `OwnerScalar` doc comment) into a native `Fr`
+/// value for Poseidon hashing: split the scalar's canonical little-endian
+/// bit decomposition into 248-bit chunks (safely below `Fr`'s capacity),
+/// interpret each chunk as a little-endian integer, then Poseidon-hash the
+/// resulting `Fr` chunks.
+///
+/// Deliberately defined directly in terms of *bits*, not a byte-serialization
+/// format (`ark_serialize`'s or otherwise) — the in-circuit gadget needs to
+/// reproduce this exactly, and it already has to witness `sk_p` as bits for
+/// the native scalar-mult gadget (`pk_p = sk_p · G`); reusing that same bit
+/// vector for folding avoids depending on a serialization library's byte
+/// layout matching a hand-written circuit gadget bit-for-bit.
+pub fn fold_owner_scalar(sk: &OwnerScalar) -> Fr {
+    fold_bits_le(&sk.into_bigint().to_bits_le())
 }
 
-fn owner_pk_to_field_pair(pk: &OwnerPk) -> (Fr, Fr) {
+fn fold_bits_le(bits: &[bool]) -> Fr {
+    let chunks: Vec<Fr> = bits
+        .chunks(248)
+        .map(|chunk| {
+            let mut acc = Fr::from(0u64);
+            let mut place = Fr::from(1u64);
+            for &b in chunk {
+                if b {
+                    acc += place;
+                }
+                place *= Fr::from(2u64);
+            }
+            acc
+        })
+        .collect();
+    poseidon_hash(&chunks)
+}
+
+/// Extract `pk`'s two coordinates as `Fr` elements — exposed (not just used
+/// internally by [`Coin::commitment`]) so circuit crates can build the exact
+/// same public-input layout without duplicating this logic.
+pub fn owner_pk_to_field_pair(pk: &OwnerPk) -> (Fr, Fr) {
     // `pk`'s coordinates live in MNT6-753's base field, i.e. MNT4-753's
     // scalar field `Fr` — see the `OwnerPk` doc comment above. Extract them
     // directly, no re-encoding needed. The point at infinity (only ever
@@ -940,9 +971,9 @@ pub fn check_spend(
 
     // Compute and verify the spender's own nullifier. `sk_p` is a foreign
     // field element relative to `Fr` (see the `OwnerScalar` doc comment), so
-    // it's folded through `poseidon_hash_bytes` rather than absorbed as a
+    // it's folded through `fold_owner_scalar` rather than absorbed as a
     // native `Fr` value.
-    let own_nullifier = poseidon_hash(&[coin_commitment, poseidon_hash_bytes(&owner_scalar_to_bytes(&sk_p))]);
+    let own_nullifier = poseidon_hash(&[coin_commitment, fold_owner_scalar(&sk_p)]);
     if tx_star.input_nullifier != own_nullifier {
         return Err("tx* input_nullifier does not match Poseidon(coin_commitment, sk_p)");
     }
@@ -1065,7 +1096,7 @@ mod tests {
             .collect();
         let input_nullifier = poseidon_hash(&[
             input_commitments[0],
-            poseidon_hash_bytes(&owner_scalar_to_bytes(&sender_sk)),
+            fold_owner_scalar(&sender_sk),
         ]);
         let tx = Transaction { id, input_commitments, output_commitments, note_encs, input_nullifier, spend_proof: vec![] };
         (tx, session_key, recipient_enc_pks)
@@ -1120,7 +1151,7 @@ mod tests {
         let ap = append_path_for_next(prior_entries);
         let all_nullifiers: Vec<Fr> = prior_entries.iter().map(|e| e.nullifier).collect();
         let tree = NullifierTree::replay(&all_nullifiers, prior_entries.len());
-        let own_nullifier = poseidon_hash(&[coin_commitment, poseidon_hash_bytes(&owner_scalar_to_bytes(&sk))]);
+        let own_nullifier = poseidon_hash(&[coin_commitment, fold_owner_scalar(&sk)]);
         let witness = tree.prove_non_membership(own_nullifier);
         let root = tree.root();
         check_spend(
