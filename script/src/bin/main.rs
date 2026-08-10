@@ -1,45 +1,41 @@
-//! Host driver for the `cloakkchain` coin-receipt + `Valid` (spend) relations.
+//! Host driver for the MNT-native cloakkchain relations (Phase 4 of the
+//! MNT-native port).
 //!
-//! Models a realistic wallet per party. Transactions now support multiple inputs
-//! and outputs; only commitments appear in the transaction body. Each output's
-//! coin data is encrypted separately for its recipient (`note_encs`), so no
-//! recipient can see another's coin value. A session key allows all authorised
-//! parties (sender + all recipients) to decrypt the transaction itself.
-//!
-//! Double-spend detection uses a public, deterministically-rebuildable nullifier
-//! accumulator (`NullifierTree`) instead of a per-slot IVC: a coin's receipt is
-//! a single proof built once when discovered, and spending checks a fresh
-//! non-membership proof against the accumulator's current state.
+//! Demo chain: genesis mints to Alice, Alice's receipt is built
+//! (recursively verifying the *wrapped* genesis proof), then Alice spends to
+//! Bob (recursively verifying the *wrapped* receipt). This is the full
+//! extent of what the current circuits support end to end:
+//! `ReceiptStepCircuit` and the non-genesis `SpendStepCircuit` are each
+//! fixed to recursively verify one specific wrapped VK (see
+//! circuit-coinproof's and circuit-spend's module doc comments) rather than
+//! accepting either spend variant, so a further Bob -> Carol hop — which
+//! would need Bob's receipt to verify Alice's *spend* proof, not genesis's —
+//! needs that generalization first. Also `MAX_INPUTS = MAX_OUTPUTS = 1`
+//! throughout, so there is no "change" output: each transfer moves the full
+//! coin value.
 //!
 //! ```shell
-//! RUST_LOG=info cargo run --release -- --execute   # mock execution, no ZK proofs
-//! RUST_LOG=info cargo run --release -- --prove     # full recursive chain (expensive)
+//! RUST_LOG=info cargo run --release -- --execute   # genesis circuit's constraint check only, no proving
+//! RUST_LOG=info cargo run --release -- --prove     # full chain, five real Groth16 proofs
 //! ```
 
-use std::collections::HashMap;
 use std::time::Instant;
 
+use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
+use ark_std::rand::{rngs::StdRng, SeedableRng};
 use clap::Parser;
+use cloakkchain_circuit_coinproof::ReceiptStepCircuit;
+use cloakkchain_circuit_spend::{GenesisSpendCircuit, SpendStepCircuit};
+use cloakkchain_circuit_wrap::WrapCircuit;
 use cloakkchain_lib::{
-    append_path_for_next, append_proof_for, build_note_enc, decrypt_note, derive_pk, encrypt_tx,
-    genesis_pk, merkle_root_of, recover_session_key, scan_entry as lib_scan_entry,
-    BoardEntry, Coin, CoinReceiptPublicValues, NonMembershipWitness, NullifierTree,
-    SpendProofPackage, Transaction, ValidPublicValues, EK_SALT, GENESIS_SK,
-};
-use sp1_sdk::{
-    blocking::{MockProver, ProveRequest, Prover, ProverClient},
-    include_elf, Elf, HashableKey, ProvingKey, SP1Proof, SP1ProofWithPublicValues, SP1Stdin,
+    append_path_for_next, compute_root_from_path, derive_enc_pk, derive_owner_pk,
+    entry_ciphertext_commitment, fold_owner_scalar, genesis_pk, genesis_sk, merkle_leaf,
+    owner_pk_to_field_pair, poseidon_hash, scan_entry, BoardEntry, Coin, Fr, NullifierTree,
+    OwnerPk, OwnerScalar, Transaction, EK_SALT,
 };
 
-const CLOAKKCHAIN_SPEND_ELF: Elf     = include_elf!("cloakkchain-program-spend");
-const CLOAKKCHAIN_COINPROOF_ELF: Elf = include_elf!("cloakkchain-program-coinproof");
-const VFY_G16_ELF: Elf               = include_elf!("cloakkchain-program-vfy-g16");
-// Experimental: verifies an MNT4-753 Groth16 proof instead of BN254, to
-// measure whether SP1 proving this is cheaper or more expensive than
-// VFY_G16_ELF — testing the hypothesis that no MNT precompile + larger
-// 753-bit fields makes it worse, not better. See memory:
-// native_gnark_vfy_g16_proposal.md and the MNT-curve discussion in chat.
-const MNT_TEST_ELF: Elf              = include_elf!("cloakkchain-program-mnt-test");
+const GENESIS_PUBLIC_INPUTS: usize = 6;
+const RECEIPT_PUBLIC_INPUTS: usize = 5;
 
 // ---- CLI args ---------------------------------------------------------------
 
@@ -50,954 +46,413 @@ struct Args {
     execute: bool,
     #[arg(long)]
     prove: bool,
-    #[arg(long, help = "Generate one Groth16 spend proof then execute VFY_G16_ELF to measure cycles — no full proving")]
-    bench_vfy_g16: bool,
-    #[arg(long, help = "Full execute+prove of MNT_TEST_ELF against the fixed MNT4-753 test fixtures — measures real cycles and peak memory, comparable to vfy-g16's numbers")]
-    bench_mnt_test: bool,
-    // Hidden flags used when this binary re-invokes itself as a proving subprocess.
-    // Each proof runs in its own process so the Go/gnark circuit memory is fully
-    // returned to the OS between proofs (prevents OOM on machines with ≤64 GB RAM).
-    #[arg(long, hide = true)]
-    internal_prove_elf: Option<String>,
-    #[arg(long, hide = true)]
-    internal_prove_stdin: Option<std::path::PathBuf>,
-    #[arg(long, hide = true)]
-    internal_prove_output: Option<std::path::PathBuf>,
 }
 
-// ---- Party ------------------------------------------------------------------
+// ---- Party / coin helpers ---------------------------------------------------
 
+/// Each party holds two independent keypairs: an X25519 pair for
+/// encryption (unchanged from the pre-port design) and a native MNT6-753
+/// pair for coin ownership (see `cloakkchain_lib::OwnerPk`'s doc comment for
+/// why they're on separate curves/fields).
 struct Party {
     name: &'static str,
-    sk: [u8; 32],
-    pk: [u8; 32],
+    enc_sk: [u8; 32],
+    enc_pk: [u8; 32],
+    sk_p: OwnerScalar,
+    pk_p: OwnerPk,
 }
 
 impl Party {
     fn new(name: &'static str, seed: u8) -> Self {
-        let mut sk = [0u8; 32];
-        sk[1] = seed; // byte 0 is clamped by X25519 (sk[0] &= 248); seeds 1-7 all
-                      // collapse to the same scalar as genesis. Use byte 1 instead.
-        Self { name, sk, pk: derive_pk(&sk) }
+        let mut enc_sk = [0u8; 32];
+        enc_sk[1] = seed; // byte 0 is X25519-clamped; seeds 1-7 in byte 0 would collapse together
+        let enc_pk = derive_enc_pk(&enc_sk);
+        let sk_p = OwnerScalar::from(seed as u64 + 100); // +100: stay well clear of genesis_sk()==1
+        let pk_p = derive_owner_pk(&sk_p);
+        Self { name, enc_sk, enc_pk, sk_p, pk_p }
+    }
+
+    fn genesis() -> Self {
+        Self { name: "Genesis", enc_sk: [0u8; 32], enc_pk: [0u8; 32], sk_p: genesis_sk(), pk_p: genesis_pk() }
     }
 }
 
-// ---- Wallet -----------------------------------------------------------------
-
-struct CoinRecord {
-    pv: CoinReceiptPublicValues,
-    proof: SP1ProofWithPublicValues,   // compressed STARK receipt proof
+fn coin(seed: u8, value: u64, owner_pk: OwnerPk) -> Coin {
+    Coin { tag: Fr::from(seed as u64 + 1), value, rand: Fr::from(seed as u64 + 1000), owner_pk }
 }
 
-struct Wallet<'a> {
-    party: &'a Party,
-    coins: HashMap<[u8; 32], CoinRecord>,
-}
-
-impl<'a> Wallet<'a> {
-    fn new(party: &'a Party) -> Self {
-        Self { party, coins: HashMap::new() }
-    }
-
-    /// Scan the newest board entry for coins this wallet just received. A
-    /// coin's receipt is a single proof built once here — never re-proven or
-    /// re-extended on later slots, since "still unspent" is answered fresh
-    /// (via the nullifier accumulator) at spend time instead.
-    /// `nullifier_tree` must reflect exactly the state *before* this slot's
-    /// own entry — i.e. call this before inserting `all_entries[slot]`'s
-    /// nullifier into it. That's what lets any coin discovered here (created
-    /// by this very entry) correctly check its parent wasn't a double-spend.
-    #[allow(clippy::too_many_arguments)]
-    fn process_slot<C: Prover>(
-        &mut self,
-        slot: usize,
-        all_entries: &[BoardEntry],
-        nullifier_tree: &NullifierTree,
-        coinproof_pk: &C::ProvingKey,
-        coinproof_vkey: &[u32; 8],
-        vfy_g16_pk: &C::ProvingKey,
-        vfy_g16_vkey: &[u32; 8],
-        client: &C,
-        stats: &mut Vec<ProveStats>,
-        nullifier_ops: &mut Vec<(String, std::time::Duration)>,
-    ) {
-        assert_eq!(all_entries.len(), slot + 1);
-        let entry = &all_entries[slot];
-
-        // Discover new coins: decrypt transaction and try each note by index.
-        if let Some(tx) = lib_scan_entry(&self.party.sk, entry) {
-            if let Some(session_key) = recover_session_key(&self.party.sk, entry) {
-                for (i, note_enc) in tx.note_encs.iter().enumerate() {
-                    if let Some(note_coin) = decrypt_note(&session_key, i, note_enc) {
-                        if note_coin.owner_pk != self.party.pk { continue; }
-                        let cn = note_coin.commitment();
-                        if !self.coins.contains_key(&cn) {
-                            println!("  [{}] discovered coin (value={}) at slot {} — bootstrapping",
-                                self.party.name, note_coin.value, slot);
-                            self.bootstrap(cn, slot, all_entries, nullifier_tree,
-                                coinproof_pk, coinproof_vkey,
-                                vfy_g16_pk, vfy_g16_vkey,
-                                client, stats, nullifier_ops);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Build a coin's one-shot receipt: `all_entries[received_slot]` is the
-    /// transaction that transferred it to this wallet. `nullifier_tree` must
-    /// reflect the state *before* `received_slot`'s own entry (see
-    /// `process_slot`) — the parent-nullifier check needs exactly that.
-    #[allow(clippy::too_many_arguments)]
-    fn bootstrap<C: Prover>(
-        &mut self,
-        cn: [u8; 32],
-        received_slot: usize,
-        all_entries: &[BoardEntry],
-        nullifier_tree: &NullifierTree,
-        coinproof_pk: &C::ProvingKey,
-        coinproof_vkey: &[u32; 8],
-        vfy_g16_pk: &C::ProvingKey,
-        vfy_g16_vkey: &[u32; 8],
-        client: &C,
-        stats: &mut Vec<ProveStats>,
-        nullifier_ops: &mut Vec<(String, std::time::Duration)>,
-    ) {
-        let entry = &all_entries[received_slot];
-
-        // Prove VFY_G16_ELF on the receipt entry's spend proof.
-        let validation_proof: SP1ProofWithPublicValues = {
-            let tx = lib_scan_entry(&self.party.sk, entry)
-                .expect("bootstrap: cannot decrypt receipt entry");
-            let pkg: SpendProofPackage = bincode::deserialize(&tx.spend_proof)
-                .expect("bootstrap: tx.spend_proof is not a SpendProofPackage");
-            let vfy_stdin = build_vfy_g16_stdin(&pkg.proof_bytes, &pkg.pv_encode, &pkg.spend_vkey_hash);
-            let vfy_label = format!("{} VFY-G16 slot {}", self.party.name, received_slot);
-            println!("  [{}] proving VFY-G16 …", vfy_label);
-            let t = Instant::now();
-            let (proof, peak_mem_kb) = prove_subprocess("vfy-g16", &vfy_stdin);
-            let prove_secs = t.elapsed().as_secs_f64();
-            println!("  [{}]  ({:.1}s)", vfy_label, prove_secs);
-            stats.push(ProveStats { name: vfy_label, board_size: received_slot + 1,
-                prove_secs, verify_ms: 0.0, proof_bytes: None, entry_bytes: None, peak_mem_kb });
-            proof
-        };
-
-        let ap = append_proof_for(&all_entries[..=received_slot]);
-        let parent_label = format!("parent-nullifier witness ({} receipt slot {})", self.party.name, received_slot);
-        let (parent_root, parent_witness) = timed(&parent_label, nullifier_ops, || {
-            (nullifier_tree.root(), nullifier_tree.prove_non_membership(entry.nullifier))
-        });
-        let mut stdin = build_coinproof_stdin(
-            coinproof_vkey, vfy_g16_vkey,
-            self.party.sk, cn, entry, received_slot, &ap,
-            parent_witness, parent_root,
-        );
-        let SP1Proof::Compressed(vc) = validation_proof.proof.clone() else { panic!("expected compressed vfy-g16") };
-        stdin.write_proof(*vc, vfy_g16_pk.verifying_key().vk.clone());
-        let label = format!("{} coin-receipt slot {}", self.party.name, received_slot);
-        let rec = self.run_coin_receipt(stdin, &label, received_slot + 1, coinproof_pk, client, stats);
-        self.coins.insert(cn, rec);
-    }
-
-    fn run_coin_receipt<C: Prover>(
-        &self,
-        stdin: SP1Stdin,
-        label: &str,
-        board_size: usize,
-        coinproof_pk: &C::ProvingKey,
-        client: &C,
-        stats: &mut Vec<ProveStats>,
-    ) -> CoinRecord {
-        let t = Instant::now();
-        let (proof, peak_mem_kb) = prove_subprocess("coinproof", &stdin);   // compressed STARK
-        let prove_secs = t.elapsed().as_secs_f64();
-        let t = Instant::now();
-        client.verify(&proof, coinproof_pk.verifying_key(), None).expect("coin-receipt verify failed");
-        let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-        let pv: CoinReceiptPublicValues = bincode::deserialize(proof.public_values.as_slice())
-            .expect("decode coin-receipt pv");
-        let proof_bytes = bincode::serialize(&proof).map(|v| v.len()).ok();
-        println!("  [{}]  received_at={}  ({:.1}s)", label, pv.received_at, prove_secs);
-        stats.push(ProveStats { name: label.to_string(), board_size, prove_secs, verify_ms, proof_bytes, entry_bytes: None, peak_mem_kb });
-        CoinRecord { pv, proof }
-    }
-
-    fn get(&self, cn: &[u8; 32]) -> Option<&CoinRecord> { self.coins.get(cn) }
-
-    fn print_state(&self) {
-        println!("  {}:", self.party.name);
-        if self.coins.is_empty() { println!("    (no coins tracked)"); return; }
-        for (cn, rec) in &self.coins {
-            println!("    cn={}..{}  received_at={}",
-                hex(&cn[..2]), hex(&cn[30..]), rec.pv.received_at);
-        }
-    }
-}
-
-fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{:02x}", x)).collect() }
-
-// ---- Nullifier accumulator helpers ------------------------------------------
-//
-// `main()` maintains a single `NullifierTree`, inserting each slot's own
-// (already-public) nullifier into it exactly once, right after that slot's
-// spend proof and all wallets' receipt processing are done — never rebuilt
-// from scratch per coin. Anyone could independently reconstruct the same
-// tree from the public `BoardEntry.nullifier` history, the same way
-// `merkle_root_of` lets anyone reconstruct the board's root.
-
-/// Run `f`, recording its wall-clock time under `label` — used to separate
-/// the nullifier accumulator's host-side cost (microseconds) from actual
-/// SNARK proving time (minutes) in the final report.
-fn timed<T>(label: &str, ops: &mut Vec<(String, std::time::Duration)>, f: impl FnOnce() -> T) -> T {
-    let t = Instant::now();
-    let result = f();
-    ops.push((label.to_string(), t.elapsed()));
-    result
-}
-
-fn print_nullifier_tree_stats(ops: &[(String, std::time::Duration)]) {
-    println!("\n{}", "=".repeat(64));
-    println!("  Nullifier Accumulator — host-side timing (not SNARK proving)");
-    println!("{}", "=".repeat(64));
-    for (label, d) in ops {
-        println!("{:<44} {:>15}", label, format!("{:?}", d));
-    }
-    println!("{}", "=".repeat(64));
-}
-
-/// Non-membership witness + root for `H(coin_commitment || sk)` against
-/// `tree`'s current state.
-fn own_nullifier_witness(tree: &NullifierTree, coin_commitment: [u8; 32], sk: [u8; 32]) -> (NonMembershipWitness, [u8; 32]) {
-    let own_null = nullifier(coin_commitment, sk);
-    (tree.prove_non_membership(own_null), tree.root())
-}
-
-// ---- Statistics -------------------------------------------------------------
-
-struct ProveStats {
-    name: String,
-    board_size: usize,
-    prove_secs: f64,
-    verify_ms: f64,
-    proof_bytes: Option<usize>,   // serialized proof size
-    entry_bytes: Option<usize>,   // full serialized BoardEntry size (on-board cost)
-    peak_mem_kb: Option<u64>,     // peak RSS (VmHWM) of the proving subprocess
-}
-struct ExecStats  { name: String, board_size: usize, exec_ms: u128, cycles: u64 }
-
-fn fmt_bytes(b: usize) -> String {
-    if b >= 1_048_576 { format!("{:.2} MB", b as f64 / 1_048_576.0) }
-    else if b >= 1024  { format!("{:.1} KB", b as f64 / 1024.0) }
-    else               { format!("{} B", b) }
-}
-
-fn fmt_mem_kb(kb: Option<u64>) -> String {
-    match kb {
-        Some(kb) => fmt_bytes(kb as usize * 1024),
-        None => "—".to_string(),
-    }
-}
-
-fn print_prove_table(stats: &[ProveStats]) {
-    let w = 112;
-    println!("\n{}", "=".repeat(w));
-    println!("  Proof Statistics");
-    println!("{}", "=".repeat(w));
-    println!("{:<44} {:>5}  {:>9}  {:>10}  {:>11}  {:>11}  {:>11}",
-             "Step", "Board", "Prove", "Verify", "Proof", "Entry", "Peak Mem");
-    println!("{}", "-".repeat(w));
-    let (mut tp, mut tv) = (0f64, 0f64);
-    for s in stats {
-        let proof_col = s.proof_bytes.map_or("          —".into(), |b| format!("{:>11}", fmt_bytes(b)));
-        let entry_col = s.entry_bytes.map_or("          —".into(), |b| format!("{:>11}", fmt_bytes(b)));
-        let mem_col = format!("{:>11}", fmt_mem_kb(s.peak_mem_kb));
-        println!("{:<44} {:>5}  {:>7.1} s  {:>8.1} ms  {}  {}  {}",
-                 s.name, s.board_size, s.prove_secs, s.verify_ms, proof_col, entry_col, mem_col);
-        tp += s.prove_secs; tv += s.verify_ms;
-    }
-    println!("{}", "-".repeat(w));
-    println!("{:<44} {:>5}  {:>7.1} s  {:>8.1} ms", "TOTAL", "", tp, tv);
-    println!("{}", "=".repeat(w));
-}
-
-fn print_exec_table(stats: &[ExecStats]) {
-    println!("\n{}", "=".repeat(70));
-    println!("  Execution Statistics  (mock prover — no ZK proofs)");
-    println!("{}", "=".repeat(70));
-    println!("{:<44} {:>5}  {:>14}  {:>8}", "Step", "Board", "Cycles", "Time");
-    println!("{}", "-".repeat(70));
-    for s in stats {
-        println!("{:<44} {:>5}  {:>14}  {:>6} ms", s.name, s.board_size, fmt_cycles(s.cycles), s.exec_ms);
-    }
-    println!("{}", "=".repeat(70));
-}
-
-fn fmt_cycles(c: u64) -> String {
-    let s = c.to_string();
-    let mut out = String::new();
-    for (i, ch) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 { out.push(','); }
-        out.push(ch);
-    }
-    out.chars().rev().collect()
-}
-
-// ---- Coin / chain helpers ---------------------------------------------------
-
-fn coin(seed: u8, value: u64, owner_pk: [u8; 32]) -> Coin {
-    let mut tag = [0u8; 32];  tag[0] = seed;
-    let mut rand = [0u8; 32]; rand[1] = seed;
-    Coin { tag, value, rand, owner_pk }
-}
-
-/// Compute `H(coin_commitment || sk)` — the spending nullifier.
-fn nullifier(cn: [u8; 32], sk: [u8; 32]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new(); h.update(cn); h.update(sk);
-    let mut out = [0u8; 32]; out.copy_from_slice(&h.finalize()); out
-}
-
-/// Run a proof (Groth16 or compressed STARK) in a fresh child process.
-///
-/// The elf_id controls what proof type the subprocess generates:
-///   "spend"     → Groth16  (gnark, ~28-29 GB peak, needs isolation)
-///   "coinproof" → compressed STARK  (tiny STARK trace, ~23 GB peak)
-///   "vfy-g16"   → compressed STARK, ~56-59 GB peak — the single most
-///                 memory-hungry step. Not from running Groth16Verifier
-///                 itself (that finishes in milliseconds); the cost is
-///                 SP1's own recursive STARK-folding stage afterward
-///                 (mode=Compressed), driven by how many BN254 precompile
-///                 chips VFY-G16's trace activates.
-///
-/// Subprocess isolation means the OS fully reclaims all Go/gnark pages when
-/// the child exits, so every proof starts with a clean slate.
-/// Poll `/proc/<pid>/status` for `VmHWM` (the kernel's own running peak
-/// resident-set-size tracker) while `child` runs, returning the highest
-/// value observed (in KB) alongside its exit status. Linux-only — silently
-/// yields `None` for the memory reading anywhere `/proc` isn't available.
-fn wait_tracking_peak_memory(mut child: std::process::Child) -> (std::process::ExitStatus, Option<u64>) {
-    let pid = child.id();
-    let mut peak_kb: Option<u64> = None;
-    loop {
-        if let Ok(status_text) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
-            for line in status_text.lines() {
-                if let Some(rest) = line.strip_prefix("VmHWM:") {
-                    if let Some(kb) = rest.split_whitespace().next().and_then(|s| s.parse::<u64>().ok()) {
-                        peak_kb = Some(peak_kb.map_or(kb, |p: u64| p.max(kb)));
-                    }
-                }
-            }
-        }
-        match child.try_wait().expect("poll proving subprocess") {
-            Some(status) => return (status, peak_kb),
-            None => std::thread::sleep(std::time::Duration::from_millis(500)),
-        }
-    }
-}
-
-fn prove_subprocess(elf_id: &str, stdin: &SP1Stdin) -> (SP1ProofWithPublicValues, Option<u64>) {
-    let tmp = std::env::temp_dir();
-    let stdin_path  = tmp.join(format!("cloakchain_{elf_id}_stdin.bin"));
-    let proof_path  = tmp.join(format!("cloakchain_{elf_id}_proof.bin"));
-
-    let stdin_bytes = bincode::serialize(stdin).expect("serialize SP1Stdin");
-    std::fs::write(&stdin_path, stdin_bytes).expect("write stdin file");
-
-    println!("  [subprocess] proving {} in child process …", elf_id);
-    let exe = std::env::current_exe().expect("current_exe");
-    // For vfy-g16 (636K cycles with BN254 precompiles) and coinproof (1.5-3.4M
-    // cycles), the default 16M shard size puts everything in one shard, which
-    // triggers a BaseAlu padding DivF bug in SP1 6.2.3's recursion circuit when
-    // the resulting proof is used as an inner (deferred/compressed) proof. Force
-    // a smaller shard size so both span multiple shards (≥2) and avoid the bug.
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.args([
-        "--internal-prove-elf",    elf_id,
-        "--internal-prove-stdin",  stdin_path.to_str().unwrap(),
-        "--internal-prove-output", proof_path.to_str().unwrap(),
-    ]).envs(std::env::vars());
-    match elf_id {
-        "vfy-g16" => {
-            // Overridable via VFY_G16_SHARD_SIZE for experimenting with peak
-            // memory (SP1's recursive compress stage) without a rebuild -
-            // e.g. `VFY_G16_SHARD_SIZE=1048576 cargo run --release -- --prove`.
-            // Must stay ≥2 shards' worth (default 16M puts everything in 1
-            // shard, which triggers the BaseAlu padding DivF bug) and safely
-            // below 16M.
-            let shard_size = std::env::var("VFY_G16_SHARD_SIZE").unwrap_or_else(|_| "262144".into());
-            eprintln!("[main] vfy-g16 SHARD_SIZE={shard_size}");
-            cmd.env("SHARD_SIZE", shard_size);  // default 1<<18; ~3.5M cycles ≈ 14 shards
-        }
-        "coinproof" => {
-            cmd.env("SHARD_SIZE", "262144");  // 1<<18; ~3M cycles ≈ 12 shards
-        }
-        "mnt-test" => {
-            // Same guard as vfy-g16/coinproof against the single-shard
-            // BaseAlu padding DivF bug — unknown cycle count for MNT4-753
-            // verification ahead of time, so default to the same safe size.
-            cmd.env("SHARD_SIZE", "262144");
-        }
-        _ => {}
-    }
-    let child = cmd.spawn().expect("spawn proving subprocess");
-    let (status, peak_mem_kb) = wait_tracking_peak_memory(child);
-    assert!(status.success(), "proving subprocess for {elf_id} exited with {status}");
-
-    let proof_bytes = std::fs::read(&proof_path).expect("read proof file");
-    let proof: SP1ProofWithPublicValues =
-        bincode::deserialize(&proof_bytes).expect("deserialize SP1ProofWithPublicValues");
-    let _ = std::fs::remove_file(&stdin_path);
-    let _ = std::fs::remove_file(&proof_path);
-    (proof, peak_mem_kb)
-}
-
-/// Entry point when this binary is re-invoked as a proving subprocess.
-fn run_internal_prove(elf_id: &str, stdin_path: &std::path::Path, output_path: &std::path::Path) {
-    let stdin_bytes = std::fs::read(stdin_path).expect("read stdin file");
-    let stdin: SP1Stdin = bincode::deserialize(&stdin_bytes).expect("deserialize SP1Stdin");
-    let client = ProverClient::from_env();
-    let proof = match elf_id {
-        "spend" => {
-            let pk = client.setup(CLOAKKCHAIN_SPEND_ELF).expect("setup spend");
-            client.prove(&pk, stdin).groth16().run().expect("groth16 prove")
-        }
-        "coinproof" => {
-            // ── Diagnostics ────────────────────────────────────────────────────────
-            let shard_size = std::env::var("SHARD_SIZE").unwrap_or_else(|_| "(unset)".into());
-            // CRC-32 of the embedded ELF — changes whenever the ELF is rebuilt.
-            let elf_crc: u32 = CLOAKKCHAIN_COINPROOF_ELF
-                .iter()
-                .fold(0u32, |acc, &b| acc.wrapping_add(b as u32));
-            eprintln!(
-                "[COINPROOF-DIAG] SHARD_SIZE={shard_size}  ELF_bytes={}  ELF_crc={elf_crc:#010x}",
-                CLOAKKCHAIN_COINPROOF_ELF.len()
-            );
-            // Execute (no proof) to get the exact cycle count and confirm the loop
-            // output appears.  This also surfaces any execution errors before the
-            // (slow) proving step.
-            match client.execute(CLOAKKCHAIN_COINPROOF_ELF, stdin.clone()).run() {
-                Ok((_, report)) => {
-                    let cycles = report.total_instruction_count();
-                    eprintln!(
-                        "[COINPROOF-DIAG] execute OK: cycles={cycles}  \
-                         shards@262144={}",
-                        cycles.div_ceil(262144)
-                    );
-                    // Full opcode + syscall breakdown — shows which precompile chips fired.
-                    eprintln!("[COINPROOF-DIAG] full execution report:\n{report}");
-                }
-                Err(e) => eprintln!("[COINPROOF-DIAG] execute FAILED: {e}"),
-            }
-            // ── Proof ──────────────────────────────────────────────────────────────
-            let pk = client.setup(CLOAKKCHAIN_COINPROOF_ELF).expect("setup coinproof");
-            client.prove(&pk, stdin).compressed().run().expect("compressed prove")
-        }
-        "vfy-g16" => {
-            // ── Diagnostics ────────────────────────────────────────────────────────
-            // A panic inside the guest (e.g. verify_sp1_spend_proof(...).expect(...))
-            // converts to a clean halt(1) rather than a host-visible error, so proving
-            // succeeds silently with exit_code=1 - only surfacing much later when
-            // coinproof's deferred verifier asserts exit_code==0. Run execute() first
-            // (mirroring the coinproof branch above) so any guest panic is visible here.
-            match client.execute(VFY_G16_ELF, stdin.clone()).run() {
-                Ok((output, report)) => {
-                    // execute() returns Ok even when the guest panics (SP1 converts a
-                    // panic to a clean halt(1)) - report.exit_code is the only way to
-                    // actually see this; cycle count alone doesn't reveal it.
-                    eprintln!(
-                        "[VFY-G16-DIAG] execute OK: cycles={} exit_code={}",
-                        report.total_instruction_count(),
-                        report.exit_code
-                    );
-                    // On exit_code!=0 the guest commits, in order: a length-prefixed dump
-                    // of (proof_bytes, pv_encode, spend_vkey_hash) - the exact inputs that
-                    // failed verification - followed by the panic hook's own debug message.
-                    // Save the dumped fields to disk so they can be pulled off-machine and
-                    // replayed against both verifiers locally.
-                    if report.exit_code != 0 {
-                        let bytes = output.as_slice();
-                        let mut offset = 0usize;
-                        let mut fields = Vec::new();
-                        while offset + 4 <= bytes.len() {
-                            let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
-                            offset += 4;
-                            if offset + len > bytes.len() {
-                                offset -= 4; // roll back so the tail print below starts at the right spot
-                                break;
-                            }
-                            fields.push(&bytes[offset..offset + len]);
-                            offset += len;
-                        }
-                        if fields.len() == 3 {
-                            let tmp = std::env::temp_dir();
-                            std::fs::write(tmp.join("vfy_g16_fail_proof_bytes.bin"), fields[0]).ok();
-                            std::fs::write(tmp.join("vfy_g16_fail_pv_encode.bin"), fields[1]).ok();
-                            std::fs::write(tmp.join("vfy_g16_fail_vkey_hash.txt"), fields[2]).ok();
-                            eprintln!(
-                                "[VFY-G16-DIAG] dumped failing inputs to {}/vfy_g16_fail_*",
-                                tmp.display()
-                            );
-                        }
-                        eprintln!(
-                            "[VFY-G16-DIAG] committed output (exit_code!=0): {}",
-                            String::from_utf8_lossy(&bytes[offset..])
-                        );
-                    }
-                }
-                Err(e) => eprintln!("[VFY-G16-DIAG] execute FAILED: {e}"),
-            }
-            // ── Proof ──────────────────────────────────────────────────────────────
-            let pk = client.setup(VFY_G16_ELF).expect("setup vfy-g16");
-            client.prove(&pk, stdin).compressed().run().expect("compressed prove")
-        }
-        "mnt-test" => {
-            // ── Diagnostics ────────────────────────────────────────────────────────
-            match client.execute(MNT_TEST_ELF, stdin.clone()).run() {
-                Ok((_, report)) => {
-                    eprintln!(
-                        "[MNT-TEST-DIAG] execute OK: cycles={} exit_code={}",
-                        report.total_instruction_count(),
-                        report.exit_code
-                    );
-                    eprintln!("[MNT-TEST-DIAG] full execution report:\n{report}");
-                }
-                Err(e) => eprintln!("[MNT-TEST-DIAG] execute FAILED: {e}"),
-            }
-            // ── Proof ──────────────────────────────────────────────────────────────
-            let pk = client.setup(MNT_TEST_ELF).expect("setup mnt-test");
-            client.prove(&pk, stdin).compressed().run().expect("compressed prove")
-        }
-        other => panic!("unknown elf id: {other}"),
-    };
-    let proof_bytes = bincode::serialize(&proof).expect("serialize proof");
-    std::fs::write(output_path, proof_bytes).expect("write proof file");
-}
-
-/// Build the `SpendProofPackage` stored in `tx.spend_proof`.
-fn build_spend_proof_package(
-    proof: &SP1ProofWithPublicValues,
-    spend_vkey_hash: String,
-) -> SpendProofPackage {
-    let proof_bytes = proof.bytes();
-    let pv_encode = proof.public_values.as_slice().to_vec();
-    SpendProofPackage { proof_bytes, pv_encode, spend_vkey_hash }
-}
-
-/// Build a Transaction using X25519 note encryption via session_key.
-/// Returns `(tx, session_key, recipient_pks)` — pass to `encrypt_tx` as
-/// `encrypt_tx(&tx, &recipient_pks, session_key)`.
+/// Build a Transaction using X25519 note encryption derived from a
+/// per-transaction session key. Returns `(tx, session_key, recipient_enc_pks)`
+/// — pass to `encrypt_tx` as `encrypt_tx(&tx, &recipient_enc_pks, session_key)`.
 fn make_tx(
     id: u64,
-    sender_sk: [u8; 32],
+    sender_enc_sk: [u8; 32],
+    sender_sk_p: &OwnerScalar,
     input_coins: &[Coin],
-    outputs: &[(Coin, [u8; 32])],
+    outputs: &[(Coin, [u8; 32])], // (coin, recipient's X25519 enc_pk)
 ) -> (Transaction, [u8; 32], Vec<[u8; 32]>) {
     use sha2::{Digest, Sha256};
     let session_key: [u8; 32] = {
         let mut h = Sha256::new();
-        h.update(sender_sk); h.update((id as u64).to_le_bytes()); h.update(EK_SALT);
-        let mut out = [0u8; 32]; out.copy_from_slice(&h.finalize()); out
+        h.update(sender_enc_sk);
+        h.update(id.to_le_bytes());
+        h.update(EK_SALT);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&h.finalize());
+        out
     };
-    let input_commitments: Vec<[u8; 32]>  = input_coins.iter().map(|c| c.commitment()).collect();
-    let recipient_pks: Vec<[u8; 32]>      = outputs.iter().map(|(_, rpk)| *rpk).collect();
-    let output_commitments: Vec<[u8; 32]> = outputs.iter().map(|(c, _)| c.commitment()).collect();
-    let note_encs: Vec<Vec<u8>>           = outputs.iter().enumerate()
-        .map(|(i, (c, _))| build_note_enc(&session_key, i, c)).collect();
-    let input_nullifier = nullifier(input_commitments[0], sender_sk);
+    let input_commitments: Vec<Fr> = input_coins.iter().map(|c| c.commitment()).collect();
+    let recipient_enc_pks: Vec<[u8; 32]> = outputs.iter().map(|(_, rpk)| *rpk).collect();
+    let output_commitments: Vec<Fr> = outputs.iter().map(|(c, _)| c.commitment()).collect();
+    let note_encs: Vec<Vec<u8>> = outputs
+        .iter()
+        .enumerate()
+        .map(|(i, (c, _))| cloakkchain_lib::build_note_enc(&session_key, i, c))
+        .collect();
+    let input_nullifier = poseidon_hash(&[input_commitments[0], fold_owner_scalar(sender_sk_p)]);
     let tx = Transaction { id, input_commitments, output_commitments, note_encs, input_nullifier, spend_proof: vec![] };
-    (tx, session_key, recipient_pks)
+    (tx, session_key, recipient_enc_pks)
 }
 
-/// Build stdin for a VFY_G16_ELF proving run.
-fn build_vfy_g16_stdin(spend_proof_bytes: &[u8], pv_encode: &[u8], spend_vkey_hash: &str) -> SP1Stdin {
-    let mut stdin = SP1Stdin::new();
-    stdin.write_vec(spend_proof_bytes.to_vec());
-    stdin.write_vec(pv_encode.to_vec());
-    stdin.write(&spend_vkey_hash.to_string());
-    stdin
+// ---- Statistics --------------------------------------------------------------
+
+struct ProveStats {
+    name: String,
+    prove_secs: f64,
+    verify_ms: f64,
+    proof_bytes: usize,
 }
 
-// ---- stdin builders ---------------------------------------------------------
-
-/// Build the stdin for a coin's one-shot receipt proof (compressed STARK).
-/// The VFY-G16 validation proof must be added by the caller via write_proof.
-fn build_coinproof_stdin(
-    coinproof_vkey: &[u32; 8],
-    vfy_g16_vkey: &[u32; 8],
-    owner_sk: [u8; 32], coin_commitment: [u8; 32],
-    entry_k: &BoardEntry, received_slot: usize, append_path: &[[u8; 32]],
-    parent_nonmembership: NonMembershipWitness,
-    nullifier_root_at_parent_slot: [u8; 32],
-) -> SP1Stdin {
-    let mut stdin = SP1Stdin::new();
-    stdin.write(coinproof_vkey);
-    stdin.write(vfy_g16_vkey);
-    stdin.write(&owner_sk);
-    stdin.write(&coin_commitment);
-    stdin.write(entry_k);
-    stdin.write(&received_slot);
-    stdin.write(&append_path.to_vec());
-    stdin.write(&parent_nonmembership);
-    stdin.write(&nullifier_root_at_parent_slot);
-    stdin
-}
-
-/// Build the stdin for a spend proof (Groth16).
-/// The receipt (compressed STARK) must be added by the caller via write_proof
-/// after this call (for non-genesis spends).
-#[allow(clippy::too_many_arguments)]
-fn build_spend_stdin(
-    spend_vkey: &[u32; 8], coinproof_vkey: &[u32; 8],
-    sender: &Party, coin_commitment: [u8; 32],
-    entry_position: usize, append_path: &[[u8; 32]], tx_star: &Transaction,
-    input_coins: &[Coin], output_coins: &[Coin],
-    is_genesis: bool, coin_proof: Option<&CoinReceiptPublicValues>,
-    own_nullifier_nonmembership: &NonMembershipWitness, current_nullifier_root: [u8; 32],
-) -> SP1Stdin {
-    let mut stdin = SP1Stdin::new();
-    stdin.write(spend_vkey);
-    stdin.write(coinproof_vkey);
-    stdin.write(&sender.sk);
-    stdin.write(&sender.pk);
-    stdin.write(&coin_commitment);
-    stdin.write(&entry_position);
-    stdin.write(&append_path.to_vec());
-    stdin.write(tx_star);
-    stdin.write(&input_coins.to_vec());
-    stdin.write(&output_coins.to_vec());
-    stdin.write(&is_genesis);
-    if let Some(cp) = coin_proof {
-        stdin.write(cp);
+fn fmt_bytes(b: usize) -> String {
+    if b >= 1_048_576 {
+        format!("{:.2} MB", b as f64 / 1_048_576.0)
+    } else if b >= 1024 {
+        format!("{:.1} KB", b as f64 / 1024.0)
+    } else {
+        format!("{b} B")
     }
-    stdin.write(own_nullifier_nonmembership);
-    stdin.write(&current_nullifier_root);
-    stdin
 }
 
+fn print_prove_table(stats: &[ProveStats]) {
+    let w = 80;
+    println!("\n{}", "=".repeat(w));
+    println!("  Proof Statistics");
+    println!("{}", "=".repeat(w));
+    println!("{:<32} {:>10}  {:>10}  {:>11}", "Step", "Prove", "Verify", "Proof");
+    println!("{}", "-".repeat(w));
+    let (mut tp, mut tv) = (0f64, 0f64);
+    for s in stats {
+        println!(
+            "{:<32} {:>7.1} s  {:>8.1} ms  {:>11}",
+            s.name,
+            s.prove_secs,
+            s.verify_ms,
+            fmt_bytes(s.proof_bytes)
+        );
+        tp += s.prove_secs;
+        tv += s.verify_ms;
+    }
+    println!("{}", "-".repeat(w));
+    println!("{:<32} {:>7.1} s  {:>8.1} ms", "TOTAL", tp, tv);
+    println!("{}", "=".repeat(w));
+}
 
-// ---- main -------------------------------------------------------------------
+// ---- main ---------------------------------------------------------------
 
 fn main() {
-    sp1_sdk::utils::setup_logger();
-    dotenv::dotenv().ok();
-
     let args = Args::parse();
-
-    // Subprocess mode: prove one program and exit.  Memory is fully freed when
-    // this process exits, so the parent can start the next proof with clean RAM.
-    if let (Some(elf_id), Some(stdin_path), Some(output_path)) = (
-        &args.internal_prove_elf,
-        &args.internal_prove_stdin,
-        &args.internal_prove_output,
-    ) {
-        run_internal_prove(elf_id, stdin_path, output_path);
-        return;
-    }
-
-    let mode_count = [args.execute, args.prove, args.bench_vfy_g16, args.bench_mnt_test].iter().filter(|&&b| b).count();
+    let mode_count = [args.execute, args.prove].iter().filter(|&&b| b).count();
     if mode_count != 1 {
-        eprintln!("Error: specify exactly one of --execute, --prove, --bench-vfy-g16, --bench-mnt-test");
+        eprintln!("Error: specify exactly one of --execute, --prove");
         std::process::exit(1);
     }
 
-    // ---- --bench-mnt-test -------------------------------------------------------
-    // Full execute+prove (not just execute) against fixed fixtures generated
-    // offline (program-mnt-test/test-fixtures/, via a standalone arkworks
-    // program — see native_gnark_vfy_g16_proposal.md memory for context).
-    // Uses prove_subprocess so peak memory is tracked via VmHWM exactly like
-    // spend/coinproof/vfy-g16, giving a directly comparable number.
-    if args.bench_mnt_test {
-        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../program-mnt-test/test-fixtures");
-        let proof_bytes = std::fs::read(base.join("proof.bin")).expect("read proof.bin fixture");
-        let vk_bytes = std::fs::read(base.join("vk.bin")).expect("read vk.bin fixture");
-        let public_input_bytes = std::fs::read(base.join("public_input.bin")).expect("read public_input.bin fixture");
-        println!("--- MNT4-753 test fixtures ---");
-        println!("  proof.bin={} bytes  vk.bin={} bytes  public_input.bin={} bytes",
-            proof_bytes.len(), vk_bytes.len(), public_input_bytes.len());
+    let genesis = Party::genesis();
+    let alice = Party::new("Alice", 1);
+    let bob = Party::new("Bob", 2);
 
-        let mut stdin = SP1Stdin::new();
-        stdin.write_vec(proof_bytes);
-        stdin.write_vec(vk_bytes);
-        stdin.write_vec(public_input_bytes);
+    let genesis_coin = coin(0xA1, 100, genesis.pk_p);
+    let alice_coin = coin(0xA2, 100, alice.pk_p);
 
-        println!("--- Proving MNT_TEST_ELF (execute for cycles, then compressed prove for peak memory) ---");
-        let t = Instant::now();
-        let (_proof, peak_mem_kb) = prove_subprocess("mnt-test", &stdin);
-        println!("  done in {:.1}s, peak mem = {}",
-            t.elapsed().as_secs_f64(),
-            peak_mem_kb.map_or("unavailable".to_string(), |kb| format!("{:.2} MB", kb as f64 / 1024.0)));
-        return;
-    }
-
-    // ---- --bench-vfy-g16 -------------------------------------------------------
-    if args.bench_vfy_g16 {
-        let client       = ProverClient::from_env();
-        let spend_pk     = client.setup(CLOAKKCHAIN_SPEND_ELF).expect("setup spend elf");
-        let coinproof_pk = client.setup(CLOAKKCHAIN_COINPROOF_ELF).expect("setup coinproof elf");
-        let spend_vkey   = spend_pk.verifying_key().hash_u32();
-        let coinproof_vkey = coinproof_pk.verifying_key().hash_u32();
-
-        let genesis_b = Party { name: "Genesis", sk: GENESIS_SK, pk: genesis_pk() };
-        let alice_b   = Party::new("Alice", 1);
-        let genesis_coin_b = coin(0xA1, 100, genesis_b.pk);
-        let alice_coin_b   = coin(0xA2, 100, alice_b.pk);
-        let cn_genesis_b   = genesis_coin_b.commitment();
-        let entries_b: Vec<BoardEntry> = vec![];
-        let nullifier_tree_b = NullifierTree::new();
-
-        println!("--- Step 1: generating genesis spend proof (Groth16) ---");
-        let (tx0_b, _, _) = make_tx(0, GENESIS_SK,
-            &[genesis_coin_b.clone()], &[(alice_coin_b.clone(), alice_b.pk)]);
-        let ap_b = append_path_for_next(&entries_b);
-        let (witness_b, root_b) = own_nullifier_witness(&nullifier_tree_b, cn_genesis_b, genesis_b.sk);
-        let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis_b, cn_genesis_b,
-            entries_b.len(), &ap_b, &tx0_b, &[genesis_coin_b.clone()], &[alice_coin_b.clone()],
-            true, None, &witness_b, root_b);
-        let t = Instant::now();
-        let (spend_proof, _) = prove_subprocess("spend", &stdin);
-        println!("  generated in {:.1}s ({} bytes)", t.elapsed().as_secs_f64(), spend_proof.bytes().len());
-
-        println!("--- Step 2: executing VFY_G16_ELF to measure cycles ---");
-        let proof_bytes    = spend_proof.bytes();
-        let pv_encode      = spend_proof.public_values.as_slice().to_vec();
-        let spend_vkey_hash = spend_pk.verifying_key().bytes32();
-        let vfy_stdin = build_vfy_g16_stdin(&proof_bytes, &pv_encode, &spend_vkey_hash);
-        let t = Instant::now();
-        let (_, report) = client.execute(VFY_G16_ELF, vfy_stdin).run()
-            .expect("VFY_G16_ELF execute failed");
-        let exec_ms = t.elapsed().as_millis();
-        println!("\n  VFY_G16 cycles : {}", fmt_cycles(report.total_instruction_count()));
-        println!("  execute time   : {} ms", exec_ms);
-        println!("{}", report);
-        return;
-    }
-
-    let alice   = Party::new("Alice",   1);
-    let bob     = Party::new("Bob",     2);
-    let carol   = Party::new("Carol",   3);
-    let genesis = Party { name: "Genesis", sk: GENESIS_SK, pk: genesis_pk() };
-
-    // Demo chain coins.
-    let genesis_coin  = coin(0xA1, 100, genesis.pk);
-    let alice_coin    = coin(0xA2, 100, alice.pk);
-    let bob_coin      = coin(0xB1,  40, bob.pk);
-    let alice_change  = coin(0xB2,  60, alice.pk);
-    let carol_coin    = coin(0xC1,  40, carol.pk);
-
-    // Coin commitments derived directly from coin data — no transactions needed yet.
-    let cn_genesis = genesis_coin.commitment();
-    let cn_alice   = alice_coin.commitment();
-    let cn_bob     = bob_coin.commitment();
-
-    let mut entries: Vec<BoardEntry> = vec![];
-
-    // ---- --execute ----------------------------------------------------------
     if args.execute {
-        let client       = MockProver::new();
-        let spend_pk     = client.setup(CLOAKKCHAIN_SPEND_ELF).expect("setup spend elf");
-        let coinproof_pk = client.setup(CLOAKKCHAIN_COINPROOF_ELF).expect("setup coinproof elf");
-        let vfy_g16_pk   = client.setup(VFY_G16_ELF).expect("setup vfy_g16 elf");
-        let spend_vkey      = spend_pk.verifying_key().hash_u32();
-        let coinproof_vkey  = coinproof_pk.verifying_key().hash_u32();
-        let vfy_g16_vkey    = vfy_g16_pk.verifying_key().hash_u32();
-        println!("spend vkey:     {}", spend_pk.verifying_key().bytes32());
-        println!("coinproof vkey: {}", coinproof_pk.verifying_key().bytes32());
-        println!("vfy_g16 vkey:   {}", vfy_g16_pk.verifying_key().bytes32());
-
-        let mut stats: Vec<ExecStats> = Vec::new();
-        let nullifier_tree = NullifierTree::new();
-
-        // Slot 0: genesis mint.
-        let (mut tx0, s0, r0) = make_tx(0, GENESIS_SK, &[genesis_coin.clone()], &[(alice_coin.clone(), alice.pk)]);
-        let ap0_spend = append_path_for_next(&entries);
-        let (witness0, root0) = own_nullifier_witness(&nullifier_tree, cn_genesis, genesis.sk);
-        let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn_genesis,
-            entries.len(), &ap0_spend, &tx0, &[genesis_coin.clone()], &[alice_coin.clone()],
-            true, None, &witness0, root0);
-        let t = Instant::now();
-        let (output, report) = client.execute(CLOAKKCHAIN_SPEND_ELF, stdin).run().unwrap();
-        let exec_ms = t.elapsed().as_millis();
-        let pv: ValidPublicValues = bincode::deserialize(output.as_slice()).expect("decode");
-        assert_eq!(pv.board_root, merkle_root_of(&entries));
-        let mock_pkg = SpendProofPackage {
-            proof_bytes: vec![],
-            pv_encode: pv.encode(),
-            spend_vkey_hash: String::new(),
-        };
-        tx0.spend_proof = bincode::serialize(&mock_pkg).expect("serialize mock pkg");
-        entries.push(encrypt_tx(&tx0, &r0, s0));
-        stats.push(ExecStats { name: "Slot 0: genesis mint (spend)".into(), board_size: 1, exec_ms, cycles: report.total_instruction_count() });
-
-        // Only Alice actually received cn_alice — a receipt can only ever be
-        // built for a coin genuinely transferred to its holder. `nullifier_tree`
-        // still reflects the pre-slot-0 (empty) state, exactly what the
-        // parent-nullifier check needs.
-        let ap0 = append_proof_for(&entries[..1]);
-        let parent_witness = nullifier_tree.prove_non_membership(entries[0].nullifier);
-        let parent_root = nullifier_tree.root();
-        let stdin = build_coinproof_stdin(
-            &coinproof_vkey, &vfy_g16_vkey,
-            alice.sk, cn_alice,
-            &entries[0], 0, &ap0, parent_witness, parent_root,
-        );
-        // No write_proof in execute mode — verify_sp1_proof is a no-op in native.
-        let t = Instant::now();
-        let (output, report) = client.execute(CLOAKKCHAIN_COINPROOF_ELF, stdin).run().unwrap();
-        let exec_ms = t.elapsed().as_millis();
-        let cp: CoinReceiptPublicValues = bincode::deserialize(output.as_slice()).expect("decode");
-        stats.push(ExecStats { name: "Alice coin-receipt slot 0".into(), board_size: 1, exec_ms, cycles: report.total_instruction_count() });
-        println!("  [Alice slot 0] received_at={}", cp.received_at);
-
-        print_exec_table(&stats);
-        println!("\nRun --prove for the full recursive chain.");
+        run_execute(&genesis, &genesis_coin, &alice_coin);
         return;
     }
 
-    // ---- --prove ------------------------------------------------------------
-    let client       = ProverClient::from_env();
-    let spend_pk     = client.setup(CLOAKKCHAIN_SPEND_ELF).expect("setup spend elf");
-    let coinproof_pk = client.setup(CLOAKKCHAIN_COINPROOF_ELF).expect("setup coinproof elf");
-    let vfy_g16_pk   = client.setup(VFY_G16_ELF).expect("setup vfy_g16 elf");
+    run_prove(&genesis, &alice, &bob, genesis_coin, alice_coin);
+}
 
-    let spend_vkey     = spend_pk.verifying_key().hash_u32();
-    let coinproof_vkey = coinproof_pk.verifying_key().hash_u32();
-    let vfy_g16_vkey   = vfy_g16_pk.verifying_key().hash_u32();
-    println!("spend vkey:     {}", spend_pk.verifying_key().bytes32());
-    println!("coinproof vkey: {}", coinproof_pk.verifying_key().bytes32());
-    println!("vfy_g16 vkey:   {}", vfy_g16_pk.verifying_key().bytes32());
+/// Cheap sanity check: build the genesis-mint witness and confirm it
+/// satisfies `GenesisSpendCircuit`'s constraints, with no Groth16 setup or
+/// proving. This is the only circuit in the chain that doesn't recursively
+/// verify another proof, so it's the only one a "no real proving" mode can
+/// meaningfully check in isolation — `ReceiptStepCircuit`/`SpendStepCircuit`
+/// need a genuine inner proof to exist as a witness regardless (there's no
+/// zkVM-style mock-mode equivalent for a Groth16 recursive-verification
+/// gadget), so exercising them for real is what `--prove` is for.
+fn run_execute(genesis: &Party, genesis_coin: &Coin, alice_coin: &Coin) {
+    println!("--execute: checking GenesisSpendCircuit's constraints only (no proving)");
 
-    let mut alice_wallet = Wallet::new(&alice);
-    let mut bob_wallet   = Wallet::new(&bob);
-    let mut carol_wallet = Wallet::new(&carol);
+    let coin_commitment = genesis_coin.commitment();
+    let output_commitment = alice_coin.commitment();
+    let append_path = append_path_for_next(&[]);
+    let board_root = compute_root_from_path(Fr::from(0u64), 0, &append_path);
+    let own_nullifier = poseidon_hash(&[coin_commitment, fold_owner_scalar(&genesis.sk_p)]);
+    let tree = NullifierTree::new();
+
+    let circuit = GenesisSpendCircuit {
+        pk_p: Some(genesis.pk_p),
+        coin_commitment: Some(coin_commitment),
+        board_root: Some(board_root),
+        output_commitment: Some(output_commitment),
+        current_nullifier_root: Some(tree.root()),
+        sk_p: Some(genesis.sk_p),
+        input_coin: Some(genesis_coin.clone()),
+        output_coin: Some(alice_coin.clone()),
+        entry_position: Some(0),
+        append_path: Some(append_path),
+        own_nullifier_nonmembership: Some(tree.prove_non_membership(own_nullifier)),
+    };
+
+    let cs = ConstraintSystem::<Fr>::new_ref();
+    circuit.generate_constraints(cs.clone()).expect("synthesize constraints");
+    let satisfied = cs.is_satisfied().expect("check satisfiability");
+    println!("  constraints: {}", cs.num_constraints());
+    println!("  satisfied:   {satisfied}");
+    assert!(satisfied);
+    println!("\nRun --prove for the full chain (five real Groth16 proofs).");
+}
+
+fn run_prove(genesis: &Party, alice: &Party, bob: &Party, genesis_coin: Coin, alice_coin: Coin) {
+    let mut rng = StdRng::seed_from_u64(0x636c6f616b); // "cloak" — deterministic demo, not a security-relevant seed
     let mut stats: Vec<ProveStats> = Vec::new();
-    // Maintained across the whole run: inserted into exactly once per slot,
-    // right after that slot's spend + all wallets' receipt processing are
-    // done (never rebuilt from scratch per coin - see the module comment
-    // above `own_nullifier_witness`).
+    let mut entries: Vec<BoardEntry> = vec![];
     let mut nullifier_tree = NullifierTree::new();
-    // Host-side timing for the nullifier tree itself (microseconds), kept
-    // separate from `stats`'s SNARK prove/verify times (minutes).
-    let mut nullifier_ops: Vec<(String, std::time::Duration)> = Vec::new();
+
+    println!("--- Setting up Groth16 keys for all five circuit shapes ---");
+    let t = Instant::now();
+    let (genesis_pk_data, genesis_vk) = cloakkchain_circuit_spend::setup(&mut rng).unwrap();
+    let (wrap_genesis_pk, wrap_genesis_vk) =
+        cloakkchain_circuit_wrap::setup::<GENESIS_PUBLIC_INPUTS, _>(genesis_vk.clone(), &mut rng).unwrap();
+    let (receipt_pk_data, receipt_vk) = cloakkchain_circuit_coinproof::setup(wrap_genesis_vk.clone(), &mut rng).unwrap();
+    let (wrap_receipt_pk, wrap_receipt_vk) =
+        cloakkchain_circuit_wrap::setup::<RECEIPT_PUBLIC_INPUTS, _>(receipt_vk.clone(), &mut rng).unwrap();
+    let (spend_pk_data, spend_vk) =
+        cloakkchain_circuit_spend::setup_non_genesis(wrap_receipt_vk.clone(), &mut rng).unwrap();
+    println!("  done in {:.1}s (dev-mode/toy setup — see the MNT-native port memory)", t.elapsed().as_secs_f64());
 
     // =========================================================================
     // Slot 0: genesis mints 100 units to Alice
     // =========================================================================
-    println!("\n--- Slot 0: genesis mint (1 input → 1 output) ---");
-    let (mut tx0, s0, r0) = make_tx(0, GENESIS_SK, &[genesis_coin.clone()], &[(alice_coin.clone(), alice.pk)]);
-    let ap0_spend = append_path_for_next(&entries);
-    let (witness0, root0) = timed("own-nullifier witness (Genesis spend slot 0)", &mut nullifier_ops,
-        || own_nullifier_witness(&nullifier_tree, cn_genesis, genesis.sk));
-    let stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &genesis, cn_genesis,
-        entries.len(), &ap0_spend, &tx0, &[genesis_coin.clone()], &[alice_coin.clone()],
-        true, None, &witness0, root0);
-    // Genesis is_genesis=true → no coin-proof write_proof needed.
+    println!("\n--- Slot 0: genesis mint ---");
+    let genesis_coin_commitment = genesis_coin.commitment();
+    let alice_coin_commitment = alice_coin.commitment();
+    let genesis_append_path = append_path_for_next(&entries);
+    let genesis_board_root = compute_root_from_path(Fr::from(0u64), entries.len(), &genesis_append_path);
+    let genesis_own_nullifier = poseidon_hash(&[genesis_coin_commitment, fold_owner_scalar(&genesis.sk_p)]);
+    let genesis_nonmembership = nullifier_tree.prove_non_membership(genesis_own_nullifier);
+    let genesis_nullifier_root = nullifier_tree.root();
+
+    let genesis_circuit = GenesisSpendCircuit {
+        pk_p: Some(genesis.pk_p),
+        coin_commitment: Some(genesis_coin_commitment),
+        board_root: Some(genesis_board_root),
+        output_commitment: Some(alice_coin_commitment),
+        current_nullifier_root: Some(genesis_nullifier_root),
+        sk_p: Some(genesis.sk_p),
+        input_coin: Some(genesis_coin.clone()),
+        output_coin: Some(alice_coin.clone()),
+        entry_position: Some(entries.len() as u64),
+        append_path: Some(genesis_append_path.clone()),
+        own_nullifier_nonmembership: Some(genesis_nonmembership),
+    };
+    let genesis_public_inputs: [Fr; GENESIS_PUBLIC_INPUTS] = GenesisSpendCircuit::public_inputs(
+        genesis.pk_p,
+        genesis_coin_commitment,
+        genesis_board_root,
+        alice_coin_commitment,
+        genesis_nullifier_root,
+    )
+    .try_into()
+    .unwrap();
+
     let t = Instant::now();
-    let (genesis_proof, peak_mem_kb) = prove_subprocess("spend", &stdin);
+    let genesis_proof = cloakkchain_circuit_spend::prove(&genesis_pk_data, genesis_circuit, &mut rng).unwrap();
     let prove_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
-    client.verify(&genesis_proof, spend_pk.verifying_key(), None).expect("genesis verify");
+    assert!(cloakkchain_circuit_spend::verify(&genesis_vk, &genesis_public_inputs, &genesis_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let pv: ValidPublicValues = bincode::deserialize(genesis_proof.public_values.as_slice()).expect("decode");
-    assert_eq!(pv.board_root, merkle_root_of(&entries));
-    let genesis_pkg = build_spend_proof_package(&genesis_proof, spend_pk.verifying_key().bytes32());
-    let genesis_proof_size = bincode::serialize(&genesis_pkg).map(|v| v.len()).unwrap_or(0);
-    tx0.spend_proof = bincode::serialize(&genesis_pkg).expect("serialize spend proof package");
-    entries.push(encrypt_tx(&tx0, &r0, s0));
-    let e0_bytes = bincode::serialize(&entries[0]).map(|v| v.len()).unwrap_or(0);
-    stats.push(ProveStats { name: "Slot 0: genesis mint".into(), board_size: 1, prove_secs, verify_ms, proof_bytes: Some(genesis_proof_size), entry_bytes: Some(e0_bytes), peak_mem_kb });
-    println!("  Proved & verified ({prove_secs:.1} s) — proof {} — entry {}", fmt_bytes(genesis_proof_size), fmt_bytes(e0_bytes));
+    let proof_bytes = ark_serialize_len(&genesis_proof);
+    println!("  proved & verified ({prove_secs:.1}s) — proof {}", fmt_bytes(proof_bytes));
+    stats.push(ProveStats { name: "Genesis mint".into(), prove_secs, verify_ms, proof_bytes });
 
-    println!("--- Wallets scanning slot 0 ---");
-    alice_wallet.process_slot(0, &entries, &nullifier_tree, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats, &mut nullifier_ops);
-    bob_wallet  .process_slot(0, &entries, &nullifier_tree, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats, &mut nullifier_ops);
-    carol_wallet.process_slot(0, &entries, &nullifier_tree, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats, &mut nullifier_ops);
-    timed("insert nullifier (slot 0)", &mut nullifier_ops, || nullifier_tree.insert(entries[0].nullifier));
+    // Post the board entry. tx0.spend_proof carries the serialized proof so
+    // a real chain could pass it along; the recursion here works entirely
+    // off proof values already in hand, so this is informational.
+    let (mut tx0, s0, r0) =
+        make_tx(0, genesis.enc_sk, &genesis.sk_p, &[genesis_coin.clone()], &[(alice_coin.clone(), alice.enc_pk)]);
+    tx0.spend_proof = ark_serialize_bytes(&genesis_proof);
+    let genesis_entry = cloakkchain_lib::encrypt_tx(&tx0, &r0, s0);
+    entries.push(genesis_entry.clone());
+    nullifier_tree.insert(genesis_own_nullifier);
 
-    // =========================================================================
-    // Slot 1: Alice sends 40 to Bob + 60 change
-    // =========================================================================
-    println!("\n--- Slot 1: Alice spends to Bob + change (1 input → 2 outputs) ---");
-    let (mut tx1, s1, r1) = make_tx(1, alice.sk, &[alice_coin.clone()],
-        &[(bob_coin.clone(), bob.pk), (alice_change.clone(), alice.pk)]);
-    let alice_record = alice_wallet.get(&cn_alice).expect("Alice must have cn_alice receipt");
-    let alice_cp     = alice_record.proof.clone();
-    let ap1_spend = append_path_for_next(&entries);
-    let (witness1, root1) = timed("own-nullifier witness (Alice spend slot 1)", &mut nullifier_ops,
-        || own_nullifier_witness(&nullifier_tree, cn_alice, alice.sk));
-    let mut stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &alice, cn_alice,
-        entries.len(), &ap1_spend, &tx1,
-        &[alice_coin.clone()], &[bob_coin.clone(), alice_change.clone()],
-        false, Some(&alice_record.pv), &witness1, root1);
-    // Alice's receipt is a compressed STARK — extract inner proof for write_proof.
-    let SP1Proof::Compressed(ac) = alice_cp.proof else { panic!("expected compressed coin-receipt") };
-    stdin.write_proof(*ac, coinproof_pk.verifying_key().vk.clone());
+    // --- wrap the genesis proof so Alice's receipt circuit can verify it ---
     let t = Instant::now();
-    let (alice_spend_proof, peak_mem_kb) = prove_subprocess("spend", &stdin);
+    let wrap1_proof = cloakkchain_circuit_wrap::prove::<GENESIS_PUBLIC_INPUTS, _>(
+        &wrap_genesis_pk,
+        WrapCircuit::<GENESIS_PUBLIC_INPUTS> {
+            inner_vk: genesis_vk,
+            inner_proof: Some(genesis_proof),
+            inner_public_inputs: Some(genesis_public_inputs),
+        },
+        &mut rng,
+    )
+    .unwrap();
+    let prove_secs = t.elapsed().as_secs_f64();
+    let wrap1_public_inputs = cloakkchain_circuit_wrap::public_input_chunks(&genesis_public_inputs);
+    let t = Instant::now();
+    assert!(cloakkchain_circuit_wrap::verify(&wrap_genesis_vk, &wrap1_public_inputs, &wrap1_proof).unwrap());
+    let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let proof_bytes = ark_serialize_len(&wrap1_proof);
+    println!("  wrapped genesis proof ({prove_secs:.1}s) — proof {}", fmt_bytes(proof_bytes));
+    stats.push(ProveStats { name: "Wrap genesis proof".into(), prove_secs, verify_ms, proof_bytes });
+
+    // =========================================================================
+    // Alice discovers her coin and builds her receipt
+    // =========================================================================
+    println!("\n--- Alice scans slot 0, builds her receipt ---");
+    let alice_tx = scan_entry(&alice.enc_sk, &genesis_entry).expect("Alice must be able to decrypt slot 0");
+    assert!(alice_tx.receives_coin(&alice_coin_commitment), "Alice's tx must transfer her coin");
+    println!("  [{}] discovered coin (value={}) at slot 0", alice.name, alice_coin.value);
+
+    let receipt_append_path = genesis_append_path.clone();
+    let receipt_board_root =
+        compute_root_from_path(merkle_leaf(0, &genesis_entry), 0, &receipt_append_path);
+    let (apx, apy) = owner_pk_to_field_pair(&alice.pk_p);
+
+    let receipt_circuit = ReceiptStepCircuit {
+        owner_pk_x: Some(apx),
+        owner_pk_y: Some(apy),
+        coin_commitment: Some(alice_coin_commitment),
+        board_root: Some(receipt_board_root),
+        received_at: Some(0),
+        wrap_vk: wrap_genesis_vk,
+        wrap_proof: Some(wrap1_proof),
+        wrap_public_inputs: Some(genesis_public_inputs),
+        entry_nullifier: Some(genesis_entry.nullifier),
+        entry_output_commitment: Some(alice_coin_commitment),
+        entry_ciphertext_commitment: Some(entry_ciphertext_commitment(&genesis_entry)),
+        received_slot: Some(0),
+        append_path: Some(receipt_append_path),
+        parent_nonmembership: Some(NullifierTree::new().prove_non_membership(genesis_entry.nullifier)),
+        nullifier_root_at_parent_slot: Some(NullifierTree::new().root()),
+    };
+    let receipt_public_inputs: [Fr; RECEIPT_PUBLIC_INPUTS] =
+        ReceiptStepCircuit::public_inputs(apx, apy, alice_coin_commitment, receipt_board_root, 0)
+            .try_into()
+            .unwrap();
+
+    let t = Instant::now();
+    let receipt_proof = cloakkchain_circuit_coinproof::prove(&receipt_pk_data, receipt_circuit, &mut rng).unwrap();
     let prove_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
-    client.verify(&alice_spend_proof, spend_pk.verifying_key(), None).expect("alice spend verify");
+    assert!(cloakkchain_circuit_coinproof::verify(&receipt_vk, &receipt_public_inputs, &receipt_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let pv: ValidPublicValues = bincode::deserialize(alice_spend_proof.public_values.as_slice()).expect("decode");
-    assert_eq!(pv.board_root, merkle_root_of(&entries));
-    let alice_pkg = build_spend_proof_package(&alice_spend_proof, spend_pk.verifying_key().bytes32());
-    let alice_proof_size = bincode::serialize(&alice_pkg).map(|v| v.len()).unwrap_or(0);
-    tx1.spend_proof = bincode::serialize(&alice_pkg).expect("serialize spend proof package");
-    entries.push(encrypt_tx(&tx1, &r1, s1));
-    let e1_bytes = bincode::serialize(&entries[1]).map(|v| v.len()).unwrap_or(0);
-    stats.push(ProveStats { name: "Slot 1: Alice's spend (groth16)".into(), board_size: 2, prove_secs, verify_ms, proof_bytes: Some(alice_proof_size), entry_bytes: Some(e1_bytes), peak_mem_kb });
-    println!("  Proved & verified ({prove_secs:.1} s) — proof {} — entry {}", fmt_bytes(alice_proof_size), fmt_bytes(e1_bytes));
+    let proof_bytes = ark_serialize_len(&receipt_proof);
+    println!("  proved & verified Alice's receipt ({prove_secs:.1}s) — proof {}", fmt_bytes(proof_bytes));
+    stats.push(ProveStats { name: "Alice's receipt".into(), prove_secs, verify_ms, proof_bytes });
 
-    println!("--- Wallets scanning slot 1 ---");
-    alice_wallet.process_slot(1, &entries, &nullifier_tree, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats, &mut nullifier_ops);
-    bob_wallet  .process_slot(1, &entries, &nullifier_tree, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats, &mut nullifier_ops);
-    carol_wallet.process_slot(1, &entries, &nullifier_tree, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats, &mut nullifier_ops);
-    timed("insert nullifier (slot 1)", &mut nullifier_ops, || nullifier_tree.insert(entries[1].nullifier));
-
-    // =========================================================================
-    // Slot 2: Bob sends 40 to Carol
-    // =========================================================================
-    println!("\n--- Slot 2: Bob spends to Carol (1 input → 1 output) ---");
-    let (mut tx2, s2, r2) = make_tx(2, bob.sk, &[bob_coin.clone()], &[(carol_coin.clone(), carol.pk)]);
-    let bob_record = bob_wallet.get(&cn_bob).expect("Bob must have cn_bob receipt");
-    let bob_cp     = bob_record.proof.clone();
-    let ap2_spend = append_path_for_next(&entries);
-    let (witness2, root2) = timed("own-nullifier witness (Bob spend slot 2)", &mut nullifier_ops,
-        || own_nullifier_witness(&nullifier_tree, cn_bob, bob.sk));
-    let mut stdin = build_spend_stdin(&spend_vkey, &coinproof_vkey, &bob, cn_bob,
-        entries.len(), &ap2_spend, &tx2,
-        &[bob_coin.clone()], &[carol_coin.clone()],
-        false, Some(&bob_record.pv), &witness2, root2);
-    let SP1Proof::Compressed(bc) = bob_cp.proof else { panic!("expected compressed coin-receipt") };
-    stdin.write_proof(*bc, coinproof_pk.verifying_key().vk.clone());
+    // --- wrap Alice's receipt so her spend circuit can verify it ---
     let t = Instant::now();
-    let (bob_spend_proof, peak_mem_kb) = prove_subprocess("spend", &stdin);
+    let wrap2_proof = cloakkchain_circuit_wrap::prove::<RECEIPT_PUBLIC_INPUTS, _>(
+        &wrap_receipt_pk,
+        WrapCircuit::<RECEIPT_PUBLIC_INPUTS> {
+            inner_vk: receipt_vk,
+            inner_proof: Some(receipt_proof),
+            inner_public_inputs: Some(receipt_public_inputs),
+        },
+        &mut rng,
+    )
+    .unwrap();
+    let prove_secs = t.elapsed().as_secs_f64();
+    let wrap2_public_inputs = cloakkchain_circuit_wrap::public_input_chunks(&receipt_public_inputs);
+    let t = Instant::now();
+    assert!(cloakkchain_circuit_wrap::verify(&wrap_receipt_vk, &wrap2_public_inputs, &wrap2_proof).unwrap());
+    let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let proof_bytes = ark_serialize_len(&wrap2_proof);
+    println!("  wrapped Alice's receipt ({prove_secs:.1}s) — proof {}", fmt_bytes(proof_bytes));
+    stats.push(ProveStats { name: "Wrap Alice's receipt".into(), prove_secs, verify_ms, proof_bytes });
+
+    // =========================================================================
+    // Slot 1: Alice spends her full 100 units to Bob
+    // =========================================================================
+    println!("\n--- Slot 1: Alice spends to Bob ---");
+    let bob_coin = coin(0xB1, 100, bob.pk_p);
+    let bob_coin_commitment = bob_coin.commitment();
+
+    let spend_append_path = append_path_for_next(&entries);
+    let spend_board_root = compute_root_from_path(Fr::from(0u64), entries.len(), &spend_append_path);
+    let alice_own_nullifier = poseidon_hash(&[alice_coin_commitment, fold_owner_scalar(&alice.sk_p)]);
+
+    let spend_circuit = SpendStepCircuit {
+        pk_p: Some(alice.pk_p),
+        coin_commitment: Some(alice_coin_commitment),
+        board_root: Some(spend_board_root),
+        output_commitment: Some(bob_coin_commitment),
+        current_nullifier_root: Some(nullifier_tree.root()),
+        sk_p: Some(alice.sk_p),
+        input_coin: Some(alice_coin.clone()),
+        output_coin: Some(bob_coin.clone()),
+        entry_position: Some(entries.len() as u64),
+        append_path: Some(spend_append_path),
+        own_nullifier_nonmembership: Some(nullifier_tree.prove_non_membership(alice_own_nullifier)),
+        wrap_vk: wrap_receipt_vk,
+        wrap_proof: Some(wrap2_proof),
+        wrap_public_inputs: Some(receipt_public_inputs),
+    };
+    let spend_public_inputs = SpendStepCircuit::public_inputs(
+        alice.pk_p,
+        alice_coin_commitment,
+        spend_board_root,
+        bob_coin_commitment,
+        nullifier_tree.root(),
+    );
+
+    let t = Instant::now();
+    let spend_proof = cloakkchain_circuit_spend::prove_non_genesis(&spend_pk_data, spend_circuit, &mut rng).unwrap();
     let prove_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
-    client.verify(&bob_spend_proof, spend_pk.verifying_key(), None).expect("bob spend verify");
+    assert!(cloakkchain_circuit_spend::verify_non_genesis(&spend_vk, &spend_public_inputs, &spend_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let pv: ValidPublicValues = bincode::deserialize(bob_spend_proof.public_values.as_slice()).expect("decode");
-    assert_eq!(pv.board_root, merkle_root_of(&entries));
-    let bob_pkg = build_spend_proof_package(&bob_spend_proof, spend_pk.verifying_key().bytes32());
-    let bob_proof_size = bincode::serialize(&bob_pkg).map(|v| v.len()).unwrap_or(0);
-    tx2.spend_proof = bincode::serialize(&bob_pkg).expect("serialize spend proof package");
-    entries.push(encrypt_tx(&tx2, &r2, s2));
-    let e2_bytes = bincode::serialize(&entries[2]).map(|v| v.len()).unwrap_or(0);
-    stats.push(ProveStats { name: "Slot 2: Bob's spend (groth16)".into(), board_size: 3, prove_secs, verify_ms, proof_bytes: Some(bob_proof_size), entry_bytes: Some(e2_bytes), peak_mem_kb });
-    println!("  Proved & verified ({prove_secs:.1} s) — proof {} — entry {}", fmt_bytes(bob_proof_size), fmt_bytes(e2_bytes));
+    let proof_bytes = ark_serialize_len(&spend_proof);
+    println!("  proved & verified Alice -> Bob spend ({prove_secs:.1}s) — proof {}", fmt_bytes(proof_bytes));
+    stats.push(ProveStats { name: "Alice -> Bob spend".into(), prove_secs, verify_ms, proof_bytes });
 
-    println!("--- Wallets scanning slot 2 ---");
-    alice_wallet.process_slot(2, &entries, &nullifier_tree, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats, &mut nullifier_ops);
-    bob_wallet  .process_slot(2, &entries, &nullifier_tree, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats, &mut nullifier_ops);
-    carol_wallet.process_slot(2, &entries, &nullifier_tree, &coinproof_pk, &coinproof_vkey, &vfy_g16_pk, &vfy_g16_vkey, &client, &mut stats, &mut nullifier_ops);
-    timed("insert nullifier (slot 2)", &mut nullifier_ops, || nullifier_tree.insert(entries[2].nullifier));
+    let (mut tx1, s1, r1) =
+        make_tx(1, alice.enc_sk, &alice.sk_p, &[alice_coin.clone()], &[(bob_coin.clone(), bob.enc_pk)]);
+    tx1.spend_proof = ark_serialize_bytes(&spend_proof);
+    let alice_entry = cloakkchain_lib::encrypt_tx(&tx1, &r1, s1);
+    entries.push(alice_entry.clone());
+    nullifier_tree.insert(alice_own_nullifier);
 
-    println!("\n=== Wallet States ===");
-    alice_wallet.print_state();
-    bob_wallet.print_state();
-    carol_wallet.print_state();
+    // Bob can discover his coin (off-circuit wallet scanning — no proof
+    // needed for this); building *his* receipt would need to recursively
+    // verify Alice's spend proof, which isn't supported yet (see the module
+    // doc comment).
+    println!("\n--- Bob scans slot 1 ---");
+    let bob_tx = scan_entry(&bob.enc_sk, &alice_entry).expect("Bob must be able to decrypt slot 1");
+    assert!(bob_tx.receives_coin(&bob_coin_commitment));
+    println!("  [{}] discovered coin (value={}) at slot 1 — no receipt built (see module doc comment)", bob.name, bob_coin.value);
 
     print_prove_table(&stats);
-    print_nullifier_tree_stats(&nullifier_ops);
+}
+
+fn ark_serialize_bytes<T: ark_serialize::CanonicalSerialize>(v: &T) -> Vec<u8> {
+    let mut out = Vec::new();
+    v.serialize_compressed(&mut out).expect("serialize proof");
+    out
+}
+
+fn ark_serialize_len<T: ark_serialize::CanonicalSerialize>(v: &T) -> usize {
+    v.compressed_size()
 }

@@ -1,8 +1,0 @@
-use sp1_build::build_program_with_args;
-
-fn main() {
-    build_program_with_args("../program-spend", Default::default());
-    build_program_with_args("../program-coinproof", Default::default());
-    build_program_with_args("../program-vfy-g16", Default::default());
-    build_program_with_args("../program-mnt-test", Default::default());
-}

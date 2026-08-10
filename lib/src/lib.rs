@@ -253,6 +253,13 @@ const DH_SALT: [u8; 8] = *b"CLOAKDH1";
 /// Salt for per-index note key derivation.
 const NOTE_SALT: [u8; 8] = *b"CLOAKNT2";
 
+/// Derive a party's X25519 encryption public key from their encryption
+/// secret key — a separate keyspace from coin ownership (`OwnerScalar`/
+/// `OwnerPk`), see the `OwnerPk` doc comment above.
+pub fn derive_enc_pk(enc_sk: &[u8; 32]) -> [u8; 32] {
+    *X25519PublicKey::from(&X25519Secret::from(*enc_sk)).as_bytes()
+}
+
 /// XOR-with-hash-keystream. Encryption and decryption are the same operation.
 fn xor_with_keystream(key: &[u8; 32], data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
