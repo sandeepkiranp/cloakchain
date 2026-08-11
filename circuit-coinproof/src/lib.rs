@@ -400,11 +400,11 @@ mod tests {
             board_root: Some(genesis_board_root),
             current_nullifier_root: Some(empty_tree.root()),
             sk_p: Some(sk_genesis),
-            input_coins: [Some(genesis_input), None],
+            input_coins: [Some(genesis_input)],
             output_coins: [Some(alice_coin.clone()), None],
             entry_position: Some(genesis_slot),
             append_path: Some(genesis_append_path.clone()),
-            own_nullifier_nonmembership: [Some(empty_tree.prove_non_membership(genesis_own_nullifier)), None],
+            own_nullifier_nonmembership: [Some(empty_tree.prove_non_membership(genesis_own_nullifier))],
         };
         let (genesis_pk_data, genesis_vk) = cloakkchain_circuit_spend::setup(&mut rng).unwrap();
         let genesis_public_inputs: [Fr; 6] =
@@ -503,14 +503,14 @@ mod tests {
             board_root: Some(alice_spend_board_root),
             current_nullifier_root: Some(tree_after_genesis.root()),
             sk_p: Some(alice_sk),
-            input_coins: [Some(alice_coin), None],
+            input_coins: [Some(alice_coin)],
             output_coins: [Some(bob_coin.clone()), Some(change_coin.clone())],
             entry_position: Some(alice_spend_slot),
             append_path: Some(alice_spend_append_path.clone()),
-            own_nullifier_nonmembership: [Some(tree_after_genesis.prove_non_membership(alice_own_nullifier)), None],
+            own_nullifier_nonmembership: [Some(tree_after_genesis.prove_non_membership(alice_own_nullifier))],
             wrap_vk: wrap_alice_receipt_vk.clone(),
-            input_receipt_proofs: [Some(wrap_alice_receipt_proof), None],
-            input_receipt_public_inputs: [Some(alice_receipt_public_inputs), None],
+            input_receipt_proofs: [Some(wrap_alice_receipt_proof)],
+            input_receipt_public_inputs: [Some(alice_receipt_public_inputs)],
         };
         let (alice_spend_pk, alice_spend_vk) =
             cloakkchain_circuit_spend::setup_non_genesis(wrap_alice_receipt_vk, &mut rng).unwrap();
@@ -617,14 +617,14 @@ mod tests {
             board_root: Some(bob_spend_board_root),
             current_nullifier_root: Some(tree_after_alice_spend.root()),
             sk_p: Some(bob_sk),
-            input_coins: [Some(bob_coin), None],
+            input_coins: [Some(bob_coin)],
             output_coins: [Some(carol_coin), None],
             entry_position: Some(bob_spend_slot),
             append_path: Some(bob_spend_append_path),
-            own_nullifier_nonmembership: [Some(tree_after_alice_spend.prove_non_membership(bob_own_nullifier)), None],
+            own_nullifier_nonmembership: [Some(tree_after_alice_spend.prove_non_membership(bob_own_nullifier))],
             wrap_vk: wrap_bob_receipt_vk.clone(),
-            input_receipt_proofs: [Some(wrap_bob_receipt_proof), None],
-            input_receipt_public_inputs: [Some(bob_receipt_public_inputs), None],
+            input_receipt_proofs: [Some(wrap_bob_receipt_proof)],
+            input_receipt_public_inputs: [Some(bob_receipt_public_inputs)],
         };
         let (bob_spend_pk, bob_spend_vk) =
             cloakkchain_circuit_spend::setup_non_genesis(wrap_bob_receipt_vk, &mut rng).unwrap();

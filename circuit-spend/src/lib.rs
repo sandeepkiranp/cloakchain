@@ -54,7 +54,13 @@ type MNT6PairingVar = ark_mnt6_753::constraints::PairingVar;
 
 /// Up to this many real input coins per spend (slot 0 mandatory, the rest
 /// optional — see the module doc comment for the padding scheme).
-pub const MAX_INPUTS: usize = 2;
+///
+/// Temporarily reduced to 1 (from 2) to measure/reduce spend-step proving
+/// cost — each input slot needs its own full recursive `Groth16VerifierGadget`
+/// verification (~250-300K constraints), by far the dominant cost driver.
+/// Revisit raising this back to 2+ if/when multi-input spends are needed;
+/// nothing else about the padding/`is_active` design changes with `N`.
+pub const MAX_INPUTS: usize = 1;
 /// Up to this many real output coins per spend.
 pub const MAX_OUTPUTS: usize = 2;
 
@@ -728,11 +734,11 @@ mod tests {
             board_root: Some(board_root),
             current_nullifier_root: Some(current_nullifier_root),
             sk_p: Some(sk_p),
-            input_coins: [Some(input_coin), None],
+            input_coins: [Some(input_coin)],
             output_coins: [Some(output_coin), None],
             entry_position: Some(entry_position),
             append_path: Some(append_path),
-            own_nullifier_nonmembership: [Some(own_nullifier_nonmembership), None],
+            own_nullifier_nonmembership: [Some(own_nullifier_nonmembership)],
         }
     }
 
@@ -767,11 +773,11 @@ mod tests {
             board_root: Some(board_root),
             current_nullifier_root: Some(tree.root()),
             sk_p: Some(sk_p),
-            input_coins: [Some(input_coin), None],
+            input_coins: [Some(input_coin)],
             output_coins: [Some(bob_coin), Some(change_coin)],
             entry_position: Some(entry_position),
             append_path: Some(append_path),
-            own_nullifier_nonmembership: [Some(tree.prove_non_membership(own_nullifier)), None],
+            own_nullifier_nonmembership: [Some(tree.prove_non_membership(own_nullifier))],
         };
         let cs = ConstraintSystem::<Fr>::new_ref();
         c.generate_constraints(cs.clone()).unwrap();
@@ -855,7 +861,7 @@ mod tests {
         let mut tree = NullifierTree::new();
         tree.insert(own_nullifier);
         c.current_nullifier_root = Some(tree.root());
-        c.own_nullifier_nonmembership = [Some(tree.prove_non_membership(own_nullifier)), None];
+        c.own_nullifier_nonmembership = [Some(tree.prove_non_membership(own_nullifier))];
         c.generate_constraints(cs.clone()).unwrap();
         assert!(!cs.is_satisfied().unwrap(), "a nullifier already in the accumulator must fail non-membership");
     }
