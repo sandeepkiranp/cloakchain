@@ -850,6 +850,11 @@ fn run_prove() {
     tx2.spend_proof = ark_serialize_bytes(&bob_spend_proof);
     let bob_entry = cloakkchain_lib::encrypt_tx(&tx2, &r2, s2);
     entries.push(bob_entry.clone());
+    // No further wrap step exists in this demo chain (Carol never builds a
+    // receipt), so — unlike genesis/Alice's spend, whose entry size rides
+    // along on the *next* row — attach Bob's entry size directly to his own
+    // spend row instead of leaving it blank.
+    stats.last_mut().unwrap().entry_bytes = bincode::serialize(&bob_entry).map(|v| v.len()).ok();
 
     println!("\n--- Carol scans slot 2 ---");
     let carol_tx = scan_entry(&carol.enc_sk, &bob_entry).expect("Carol must be able to decrypt slot 2");
