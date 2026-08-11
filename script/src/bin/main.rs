@@ -441,7 +441,8 @@ fn run_prove() {
     // =========================================================================
     // Slot 0: genesis mints 100 units to Alice
     // =========================================================================
-    println!("--- Slot 0: genesis mint ---");
+    println!("--- Slot 0: Genesis mints 100 units to Alice ---");
+    println!("  Proving: pk_p is the fixed genesis key, the mint's nullifier isn't already spent, and the board root updates correctly for the new coin.");
     let genesis_coin = coin(0xA1, 100, genesis.pk_p);
     let alice_coin = coin(0xA2, 100, alice.pk_p);
     let genesis_outputs = pad_outputs(&[alice_coin.commitment()]);
@@ -472,7 +473,7 @@ fn run_prove() {
     let t = Instant::now();
     assert!(cloakkchain_circuit_spend::verify(&genesis_vk, &genesis_public_inputs, &genesis_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  proved & verified ({prove_secs:.1}s)");
+    println!("  Proved in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
     stats.push(ProveStats {
         name: "Genesis mint".into(),
         board_size: entries.len() + 1,
@@ -491,6 +492,7 @@ fn run_prove() {
     let entry0_bytes = bincode::serialize(&genesis_entry).map(|v| v.len()).ok();
 
     // --- wrap the genesis proof so Alice's receipt circuit can verify it ---
+    println!("  Wrapping the genesis proof: re-verifies it on the other curve (MNT6-753) and re-exposes its public inputs as small chunks, so Alice's receipt circuit (back on MNT4-753) can recursively check it.");
     let wrap_genesis_circuit = WrapCircuit::<GENESIS_SPEND_PUBLIC_INPUTS> {
         inner_vk: genesis_vk.clone(),
         inner_proof: Some(genesis_proof),
@@ -502,7 +504,7 @@ fn run_prove() {
     let t = Instant::now();
     assert!(cloakkchain_circuit_wrap::verify(&wrap_genesis_vk, &wrap_genesis_public_inputs, &wrap_genesis_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  wrapped genesis proof ({prove_secs:.1}s)");
+    println!("  Wrapped in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
     stats.push(ProveStats {
         name: "Wrap genesis proof".into(),
         board_size: entries.len(),
@@ -520,6 +522,7 @@ fn run_prove() {
     let alice_tx = scan_entry(&alice.enc_sk, &genesis_entry).expect("Alice must be able to decrypt slot 0");
     assert!(alice_tx.receives_coin(&alice_coin.commitment()), "Alice's tx must transfer her coin");
     println!("  [{}] discovered coin (value={}) at slot 0", alice.name, alice_coin.value);
+    println!("  Proving Alice's receipt: this coin was really created by a verified spend, is really published on the board at this slot, and that spend's own parent wasn't a double-spend — all without revealing tag/rand/value.");
 
     let alice_receipt_board_root =
         compute_root_from_path(merkle_leaf(0, &genesis_entry), 0, &genesis_append_path);
@@ -552,7 +555,7 @@ fn run_prove() {
     let t = Instant::now();
     assert!(cloakkchain_circuit_coinproof::verify(&alice_receipt_vk, &alice_receipt_public_inputs, &alice_receipt_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  proved & verified Alice's receipt ({prove_secs:.1}s)");
+    println!("  Proved in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
     stats.push(ProveStats {
         name: "Alice's receipt".into(),
         board_size: entries.len(),
@@ -564,6 +567,7 @@ fn run_prove() {
     });
 
     // --- wrap Alice's receipt so her spend circuit can verify it ---
+    println!("  Wrapping Alice's receipt so her spend circuit (back on MNT4-753) can recursively verify it as proof of provenance.");
     let wrap_alice_receipt_circuit = WrapCircuit::<RECEIPT_PUBLIC_INPUTS> {
         inner_vk: alice_receipt_vk.clone(),
         inner_proof: Some(alice_receipt_proof),
@@ -575,7 +579,7 @@ fn run_prove() {
     let t = Instant::now();
     assert!(cloakkchain_circuit_wrap::verify(&wrap_alice_receipt_vk, &wrap_alice_receipt_public_inputs, &wrap_alice_receipt_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  wrapped Alice's receipt ({prove_secs:.1}s)");
+    println!("  Wrapped in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
     stats.push(ProveStats {
         name: "Wrap Alice's receipt".into(),
         board_size: entries.len(),
@@ -589,7 +593,8 @@ fn run_prove() {
     // =========================================================================
     // Slot 1: Alice spends 1-in-2-out — 40 to Bob, 60 change to herself
     // =========================================================================
-    println!("\n--- Slot 1: Alice spends to Bob + change ---");
+    println!("\n--- Slot 1: Alice spends to Bob (40) + change back to herself (60) ---");
+    println!("  Proving: Alice owns the input coin, value conservation holds (100 in = 40 + 60 out), the two new coins are correctly published, and her wrapped receipt recursively verifies she really received the coin she's spending.");
     let bob_coin = coin(0xB1, 40, bob.pk_p);
     let change_coin = coin(0xB2, 60, alice.pk_p);
     let alice_spend_outputs = pad_outputs(&[bob_coin.commitment(), change_coin.commitment()]);
@@ -629,7 +634,7 @@ fn run_prove() {
     let t = Instant::now();
     assert!(cloakkchain_circuit_spend::verify_non_genesis(&alice_spend_vk, &alice_spend_public_inputs, &alice_spend_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  proved & verified Alice's spend ({prove_secs:.1}s)");
+    println!("  Proved in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
     stats.push(ProveStats {
         name: "Alice -> Bob + change".into(),
         board_size: entries.len() + 1,
@@ -653,6 +658,7 @@ fn run_prove() {
     let entry1_bytes = bincode::serialize(&alice_entry).map(|v| v.len()).ok();
 
     // --- wrap Alice's spend so Bob's receipt circuit can verify it ---
+    println!("  Wrapping Alice's spend so Bob's receipt circuit (back on MNT4-753) can recursively verify it.");
     let wrap_alice_spend_circuit = WrapCircuit::<GENESIS_SPEND_PUBLIC_INPUTS> {
         inner_vk: alice_spend_vk.clone(),
         inner_proof: Some(alice_spend_proof),
@@ -664,7 +670,7 @@ fn run_prove() {
     let t = Instant::now();
     assert!(cloakkchain_circuit_wrap::verify(&wrap_alice_spend_vk, &wrap_alice_spend_public_inputs, &wrap_alice_spend_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  wrapped Alice's spend ({prove_secs:.1}s)");
+    println!("  Wrapped in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
     stats.push(ProveStats {
         name: "Wrap Alice's spend".into(),
         board_size: entries.len(),
@@ -686,6 +692,7 @@ fn run_prove() {
     let bob_tx = scan_entry(&bob.enc_sk, &alice_entry).expect("Bob must be able to decrypt slot 1");
     assert!(bob_tx.receives_coin(&bob_coin.commitment()));
     println!("  [{}] discovered coin (value={}) at slot 1", bob.name, bob_coin.value);
+    println!("  Proving Bob's receipt (second generation: recursively verifies a wrapped *spend* proof this time, not a wrapped genesis proof — same circuit, keyed to Alice's spend's verifying key instead).");
 
     let bob_receipt_board_root =
         compute_root_from_path(merkle_leaf(1, &alice_entry), 1, &alice_spend_append_path);
@@ -718,7 +725,7 @@ fn run_prove() {
     let t = Instant::now();
     assert!(cloakkchain_circuit_coinproof::verify(&bob_receipt_vk, &bob_receipt_public_inputs, &bob_receipt_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  proved & verified Bob's receipt ({prove_secs:.1}s)");
+    println!("  Proved in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
     stats.push(ProveStats {
         name: "Bob's receipt (gen 2)".into(),
         board_size: entries.len(),
@@ -730,6 +737,7 @@ fn run_prove() {
     });
 
     // --- wrap Bob's receipt so his spend circuit can verify it ---
+    println!("  Wrapping Bob's receipt so his spend circuit can recursively verify it.");
     let wrap_bob_receipt_circuit = WrapCircuit::<RECEIPT_PUBLIC_INPUTS> {
         inner_vk: bob_receipt_vk.clone(),
         inner_proof: Some(bob_receipt_proof),
@@ -741,7 +749,7 @@ fn run_prove() {
     let t = Instant::now();
     assert!(cloakkchain_circuit_wrap::verify(&wrap_bob_receipt_vk, &wrap_bob_receipt_public_inputs, &wrap_bob_receipt_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  wrapped Bob's receipt ({prove_secs:.1}s)");
+    println!("  Wrapped in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
     stats.push(ProveStats {
         name: "Wrap Bob's receipt".into(),
         board_size: entries.len(),
@@ -755,7 +763,8 @@ fn run_prove() {
     // =========================================================================
     // Slot 2: Bob spends his 40 units to Carol
     // =========================================================================
-    println!("\n--- Slot 2: Bob spends to Carol ---");
+    println!("\n--- Slot 2: Bob spends his 40 units to Carol ---");
+    println!("  Proving: Bob owns the input coin, value conservation holds (40 in = 40 out), the new coin is correctly published, and his wrapped receipt recursively verifies provenance.");
     let carol_coin = coin(0xC1, 40, carol.pk_p);
     let bob_spend_outputs = pad_outputs(&[carol_coin.commitment()]);
 
@@ -792,7 +801,7 @@ fn run_prove() {
     let t = Instant::now();
     assert!(cloakkchain_circuit_spend::verify_non_genesis(&bob_spend_vk, &bob_spend_public_inputs, &bob_spend_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  proved & verified Bob's spend ({prove_secs:.1}s)");
+    println!("  Proved in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
     stats.push(ProveStats {
         name: "Bob -> Carol (gen 2)".into(),
         board_size: entries.len() + 1,
