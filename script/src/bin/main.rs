@@ -184,6 +184,18 @@ fn wait_tracking_peak_memory(mut child: std::process::Child) -> (std::process::E
     }
 }
 
+/// Synthesizes `circuit` on a fresh `ConstraintSystem` in the same
+/// `SynthesisMode::Setup` mode `Groth16::circuit_specific_setup` itself
+/// uses, and returns the resulting constraint count. Cheap — synthesis
+/// alone is native field arithmetic (no FFTs/pairings/proving), so this
+/// runs in a few seconds even for the ~600K-constraint spend circuit.
+fn count_constraints<F: ark_ff::Field, C: ConstraintSynthesizer<F> + Clone>(circuit: &C) -> usize {
+    let cs = ConstraintSystem::<F>::new_ref();
+    cs.set_mode(ark_relations::r1cs::SynthesisMode::Setup);
+    circuit.clone().generate_constraints(cs.clone()).expect("synthesize constraints for counting");
+    cs.num_constraints()
+}
+
 fn write_vk_proof<E: Pairing>(vk: &VerifyingKey<E>, proof: &Proof<E>, path: &std::path::Path) {
     let mut buf = Vec::new();
     vk.serialize_compressed(&mut buf).expect("serialize verifying key");
@@ -297,11 +309,22 @@ fn run_internal_step(kind: &str, witness_path: &str, output_path: &str) {
 struct ProveStats {
     name: String,
     board_size: usize,
+    constraints: usize,
     prove_secs: f64,
     verify_ms: f64,
     proof_bytes: usize,
     entry_bytes: Option<usize>,
     peak_mem_kb: u64,
+}
+
+fn fmt_constraints(c: usize) -> String {
+    if c >= 1_000_000 {
+        format!("{:.2}M", c as f64 / 1_000_000.0)
+    } else if c >= 1_000 {
+        format!("{:.1}K", c as f64 / 1_000.0)
+    } else {
+        format!("{c}")
+    }
 }
 
 fn fmt_bytes(b: usize) -> String {
@@ -319,22 +342,23 @@ fn fmt_mem_kb(kb: u64) -> String {
 }
 
 fn print_prove_table(stats: &[ProveStats]) {
-    let w = 108;
+    let w = 122;
     println!("\n{}", "=".repeat(w));
     println!("  Proof Statistics");
     println!("{}", "=".repeat(w));
     println!(
-        "{:<28} {:>5}  {:>9}  {:>10}  {:>11}  {:>11}  {:>11}",
-        "Step", "Board", "Prove", "Verify", "Proof", "Entry", "Peak Mem"
+        "{:<28} {:>5}  {:>11}  {:>9}  {:>10}  {:>11}  {:>11}  {:>11}",
+        "Step", "Board", "Constraints", "Prove", "Verify", "Proof", "Entry", "Peak Mem"
     );
     println!("{}", "-".repeat(w));
     let (mut tp, mut tv) = (0f64, 0f64);
     for s in stats {
         let entry_col = s.entry_bytes.map_or("          —".into(), |b| format!("{:>11}", fmt_bytes(b)));
         println!(
-            "{:<28} {:>5} {:>7.1} s  {:>8.1} ms  {:>11}  {}  {:>11}",
+            "{:<28} {:>5}  {:>11} {:>7.1} s  {:>8.1} ms  {:>11}  {}  {:>11}",
             s.name,
             s.board_size,
+            fmt_constraints(s.constraints),
             s.prove_secs,
             s.verify_ms,
             fmt_bytes(s.proof_bytes),
@@ -477,6 +501,7 @@ fn run_prove() {
     stats.push(ProveStats {
         name: "Genesis mint".into(),
         board_size: entries.len() + 1,
+        constraints: count_constraints(&genesis_circuit),
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&genesis_proof),
@@ -508,6 +533,7 @@ fn run_prove() {
     stats.push(ProveStats {
         name: "Wrap genesis proof".into(),
         board_size: entries.len(),
+        constraints: count_constraints(&wrap_genesis_circuit),
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&wrap_genesis_proof),
@@ -559,6 +585,7 @@ fn run_prove() {
     stats.push(ProveStats {
         name: "Alice's receipt".into(),
         board_size: entries.len(),
+        constraints: count_constraints(&alice_receipt_circuit),
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&alice_receipt_proof),
@@ -583,6 +610,7 @@ fn run_prove() {
     stats.push(ProveStats {
         name: "Wrap Alice's receipt".into(),
         board_size: entries.len(),
+        constraints: count_constraints(&wrap_alice_receipt_circuit),
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&wrap_alice_receipt_proof),
@@ -638,6 +666,7 @@ fn run_prove() {
     stats.push(ProveStats {
         name: "Alice -> Bob + change".into(),
         board_size: entries.len() + 1,
+        constraints: count_constraints(&alice_spend_circuit),
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&alice_spend_proof),
@@ -674,6 +703,7 @@ fn run_prove() {
     stats.push(ProveStats {
         name: "Wrap Alice's spend".into(),
         board_size: entries.len(),
+        constraints: count_constraints(&wrap_alice_spend_circuit),
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&wrap_alice_spend_proof),
@@ -729,6 +759,7 @@ fn run_prove() {
     stats.push(ProveStats {
         name: "Bob's receipt (gen 2)".into(),
         board_size: entries.len(),
+        constraints: count_constraints(&bob_receipt_circuit),
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&bob_receipt_proof),
@@ -753,6 +784,7 @@ fn run_prove() {
     stats.push(ProveStats {
         name: "Wrap Bob's receipt".into(),
         board_size: entries.len(),
+        constraints: count_constraints(&wrap_bob_receipt_circuit),
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&wrap_bob_receipt_proof),
@@ -805,6 +837,7 @@ fn run_prove() {
     stats.push(ProveStats {
         name: "Bob -> Carol (gen 2)".into(),
         board_size: entries.len() + 1,
+        constraints: count_constraints(&bob_spend_circuit),
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&bob_spend_proof),

@@ -480,6 +480,7 @@ name = "cloakkchain-script"
 version = "0.1.0"
 dependencies = [
  "ark-ec",
+ "ark-ff",
  "ark-groth16",
  "ark-mnt4-753",
  "ark-mnt6-753",
