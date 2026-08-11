@@ -594,7 +594,7 @@ fn run_prove() {
     // Slot 1: Alice spends 1-in-2-out — 40 to Bob, 60 change to herself
     // =========================================================================
     println!("\n--- Slot 1: Alice spends to Bob (40) + change back to herself (60) ---");
-    println!("  Proving: Alice owns the input coin, value conservation holds (100 in = 40 + 60 out), the two new coins are correctly published, and her wrapped receipt recursively verifies she really received the coin she's spending.");
+    println!("  Proving: Alice owns the input coin, its nullifier isn't already in the nullifier tree (not a double-spend), value conservation holds (100 in = 40 + 60 out), the two new coins are correctly published, and her wrapped receipt recursively verifies she really received the coin she's spending.");
     let bob_coin = coin(0xB1, 40, bob.pk_p);
     let change_coin = coin(0xB2, 60, alice.pk_p);
     let alice_spend_outputs = pad_outputs(&[bob_coin.commitment(), change_coin.commitment()]);
@@ -764,7 +764,7 @@ fn run_prove() {
     // Slot 2: Bob spends his 40 units to Carol
     // =========================================================================
     println!("\n--- Slot 2: Bob spends his 40 units to Carol ---");
-    println!("  Proving: Bob owns the input coin, value conservation holds (40 in = 40 out), the new coin is correctly published, and his wrapped receipt recursively verifies provenance.");
+    println!("  Proving: Bob owns the input coin, its nullifier isn't already in the nullifier tree (not a double-spend), value conservation holds (40 in = 40 out), the new coin is correctly published, and his wrapped receipt recursively verifies provenance.");
     let carol_coin = coin(0xC1, 40, carol.pk_p);
     let bob_spend_outputs = pad_outputs(&[carol_coin.commitment()]);
 
