@@ -479,6 +479,10 @@ dependencies = [
 name = "cloakkchain-script"
 version = "0.1.0"
 dependencies = [
+ "ark-ec",
+ "ark-groth16",
+ "ark-mnt4-753",
+ "ark-mnt6-753",
  "ark-relations",
  "ark-serialize",
  "ark-std",
@@ -489,7 +493,6 @@ dependencies = [
  "cloakkchain-circuit-wrap",
  "cloakkchain-lib",
  "hex",
- "serde",
  "sha2",
 ]
 

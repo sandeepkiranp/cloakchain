@@ -39,6 +39,7 @@ use ark_mnt4_753::MNT4_753;
 use ark_mnt6_753::MNT6_753;
 use ark_r1cs_std::{cmp::CmpGadget, fields::fp::FpVar, prelude::*};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_snark::SNARK;
 use ark_std::rand::{CryptoRng, RngCore};
 use cloakkchain_circuit_wrap::{chunks_per_value, combine_chunks_var, public_input_chunks, Fr6};
@@ -271,7 +272,7 @@ fn gate(check: Boolean<Fr>, is_active: &Boolean<Fr>) -> Boolean<Fr> {
 /// (allocated first, in this exact order — matches [`public_inputs`]):
 /// `pk_p.x, pk_p.y, output_commitments[0..MAX_OUTPUTS], board_root,
 /// current_nullifier_root`.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, CanonicalSerialize, CanonicalDeserialize)]
 pub struct GenesisSpendCircuit {
     // Public values.
     pub pk_p: Option<OwnerPk>,
@@ -430,7 +431,7 @@ pub const SPEND_PUBLIC_INPUT_COUNT: usize = 2 + MAX_OUTPUTS + 2;
 /// proofs from one specific deployment (all active input slots share the
 /// same `wrap_vk` — mixing receipt "generations" within one spend isn't
 /// supported) — see `circuit_coinproof`'s module doc comment for why.
-#[derive(Clone)]
+#[derive(Clone, CanonicalSerialize, CanonicalDeserialize)]
 pub struct SpendStepCircuit {
     // Public values (same layout as `GenesisSpendCircuit`).
     pub pk_p: Option<OwnerPk>,

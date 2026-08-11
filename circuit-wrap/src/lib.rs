@@ -28,6 +28,7 @@ use ark_mnt4_753::MNT4_753;
 use ark_mnt6_753::MNT6_753;
 use ark_r1cs_std::{fields::fp::FpVar, prelude::*};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_snark::SNARK;
 use ark_std::rand::{CryptoRng, RngCore};
 use cloakkchain_lib::Fr as Fr4;
@@ -57,7 +58,7 @@ fn opt<T: Clone>(o: &Option<T>) -> Result<T, SynthesisError> {
 /// fixed verifying key, re-exposing each public input as `chunks_per_value()`
 /// small `Fr6` public inputs (`N * chunks_per_value()` total, in input
 /// order, each value's chunks contiguous and low-chunk-first).
-#[derive(Clone)]
+#[derive(Clone, CanonicalSerialize, CanonicalDeserialize)]
 pub struct WrapCircuit<const N: usize> {
     /// Fixed per `WrapCircuit<N>` use (e.g. "wraps GenesisSpendCircuit
     /// proofs") — not `Option`, since a verifying key isn't secret and

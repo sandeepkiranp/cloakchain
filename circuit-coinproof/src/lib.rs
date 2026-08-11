@@ -26,6 +26,7 @@ use ark_mnt4_753::MNT4_753;
 use ark_mnt6_753::MNT6_753;
 use ark_r1cs_std::{cmp::CmpGadget, fields::fp::FpVar, prelude::*};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_snark::SNARK;
 use ark_std::rand::{CryptoRng, RngCore};
 use cloakkchain_circuit_wrap::{chunks_per_value, combine_chunks_var, public_input_chunks, Fr6};
@@ -136,7 +137,7 @@ fn is_member(target: &Fp, list: &[Fp]) -> Result<Boolean<Fr>, SynthesisError> {
 
 /// Public values, in this order: `owner_pk.x, owner_pk.y, coin_commitment,
 /// board_root, received_at`.
-#[derive(Clone)]
+#[derive(Clone, CanonicalSerialize, CanonicalDeserialize)]
 pub struct ReceiptStepCircuit {
     // Public values.
     pub owner_pk_x: Option<Fr>,

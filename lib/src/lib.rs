@@ -5,6 +5,7 @@ use ark_crypto_primitives::sponge::{
 };
 use ark_ec::{AffineRepr, CurveGroup, PrimeGroup};
 use ark_ff::{BigInteger, PrimeField};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use serde::{Deserialize, Serialize};
 
 /// Bridges arkworks' `CanonicalSerialize`/`CanonicalDeserialize` (its own
@@ -162,7 +163,7 @@ pub fn derive_owner_pk(sk: &OwnerScalar) -> OwnerPk {
 /// intended owner, so a coin created for Alice cannot be claimed by Bob even
 /// if he knows the tag/value/rand (analogous to how Zcash embeds the
 /// recipient address in cm).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, CanonicalSerialize, CanonicalDeserialize)]
 pub struct Coin {
     #[serde(with = "field_serde")]
     pub tag: Fr,
@@ -643,7 +644,7 @@ pub fn merkle_verify(root: Fr, slot: usize, entry: &BoardEntry, proof: &[Fr]) ->
 // bug).
 
 /// One leaf of the indexed nullifier tree.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, CanonicalSerialize, CanonicalDeserialize)]
 pub struct IndexedLeaf {
     #[serde(with = "field_serde")]
     pub value: Fr,
@@ -671,7 +672,7 @@ impl IndexedLeaf {
 /// Merkle inclusion path. (If `target` happens to already be a member, the
 /// natural low leaf instead has `next_value == target`, which fails the
 /// strict `target < next_value` check in `verify_nonmembership` below.)
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, CanonicalSerialize, CanonicalDeserialize)]
 pub struct NonMembershipWitness {
     pub low_leaf: IndexedLeaf,
     pub low_leaf_index: u64,
