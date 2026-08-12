@@ -119,16 +119,19 @@ fn pad_outputs(real: &[Fr]) -> [Fr; MAX_OUTPUTS] {
 
 /// Build a Transaction using X25519 note encryption derived from a
 /// per-transaction session key. Returns `(tx, session_key, recipient_enc_pks)`
-/// — pass to `encrypt_tx` as `encrypt_tx(&tx, sender_sk_p, &recipient_enc_pks, session_key)`
-/// (the nullifier is derived there now, not carried on `Transaction` itself
-/// — see its doc comment).
+/// — pass to `encrypt_tx` as
+/// `encrypt_tx(&tx, input_commitment, sender_sk_p, &recipient_enc_pks, session_key)`
+/// (neither the nullifier nor the input commitment it's derived from is
+/// carried on `Transaction` itself — see its doc comment).
 fn make_tx(
     id: u64,
     sender_enc_sk: [u8; 32],
     // Unused now: nullifier derivation moved to `encrypt_tx`. Kept as a
     // parameter so every call site stays self-documenting.
     _sender_sk_p: &OwnerScalar,
-    input_coins: &[Coin],
+    // Unused now: `Transaction` no longer stores input commitments. Kept
+    // for the same self-documenting reason.
+    _input_coins: &[Coin],
     outputs: &[(Coin, [u8; 32])], // (coin, recipient's X25519 enc_pk)
 ) -> (Transaction, [u8; 32], Vec<[u8; 32]>) {
     use sha2::{Digest, Sha256};
@@ -141,7 +144,6 @@ fn make_tx(
         out.copy_from_slice(&h.finalize());
         out
     };
-    let input_commitments: Vec<Fr> = input_coins.iter().map(|c| c.commitment()).collect();
     let recipient_enc_pks: Vec<[u8; 32]> = outputs.iter().map(|(_, rpk)| *rpk).collect();
     let output_commitments: Vec<Fr> = outputs.iter().map(|(c, _)| c.commitment()).collect();
     let note_encs: Vec<Vec<u8>> = outputs
@@ -149,7 +151,7 @@ fn make_tx(
         .enumerate()
         .map(|(i, (c, _))| cloakkchain_lib::build_note_enc(&session_key, i, c))
         .collect();
-    let tx = Transaction { id, input_commitments, output_commitments, note_encs, spend_proof: vec![] };
+    let tx = Transaction { id, output_commitments, note_encs, spend_proof: vec![] };
     (tx, session_key, recipient_enc_pks)
 }
 
@@ -515,7 +517,7 @@ fn run_prove() {
     let (mut tx0, s0, r0) =
         make_tx(0, genesis.enc_sk, &genesis.sk_p, &[genesis_coin.clone()], &[(alice_coin.clone(), alice.enc_pk)]);
     tx0.spend_proof = ark_serialize_bytes(&genesis_proof);
-    let genesis_entry = cloakkchain_lib::encrypt_tx(&tx0, &genesis.sk_p, &r0, s0);
+    let genesis_entry = cloakkchain_lib::encrypt_tx(&tx0, genesis_coin.commitment(), &genesis.sk_p, &r0, s0);
     entries.push(genesis_entry.clone());
     let entry0_bytes = bincode::serialize(&genesis_entry).map(|v| v.len()).ok();
 
@@ -688,7 +690,7 @@ fn run_prove() {
         &[(bob_coin.clone(), bob.enc_pk), (change_coin.clone(), alice.enc_pk)],
     );
     tx1.spend_proof = ark_serialize_bytes(&alice_spend_proof);
-    let alice_entry = cloakkchain_lib::encrypt_tx(&tx1, &alice.sk_p, &r1, s1);
+    let alice_entry = cloakkchain_lib::encrypt_tx(&tx1, alice_coin.commitment(), &alice.sk_p, &r1, s1);
     entries.push(alice_entry.clone());
     let entry1_bytes = bincode::serialize(&alice_entry).map(|v| v.len()).ok();
 
@@ -857,7 +859,7 @@ fn run_prove() {
     let (mut tx2, s2, r2) =
         make_tx(2, bob.enc_sk, &bob.sk_p, &[bob_coin.clone()], &[(carol_coin.clone(), carol.enc_pk)]);
     tx2.spend_proof = ark_serialize_bytes(&bob_spend_proof);
-    let bob_entry = cloakkchain_lib::encrypt_tx(&tx2, &bob.sk_p, &r2, s2);
+    let bob_entry = cloakkchain_lib::encrypt_tx(&tx2, bob_coin.commitment(), &bob.sk_p, &r2, s2);
     entries.push(bob_entry.clone());
     // No further wrap step exists in this demo chain (Carol never builds a
     // receipt), so — unlike genesis/Alice's spend, whose entry size rides
