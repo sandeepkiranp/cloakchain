@@ -158,15 +158,13 @@ pub fn derive_owner_pk(sk: &OwnerScalar) -> OwnerPk {
     (ark_mnt6_753::G1Projective::generator() * sk).into_affine()
 }
 
-/// A coin: tag `t`, value `v`, owner public key `pk`, plus masking randomness `r`.
-/// Commitment cn = Poseidon(t, v, r, pk.x, pk.y) — binds the coin to its
+/// A coin: value `v`, owner public key `pk`, plus masking randomness `r`.
+/// Commitment cn = Poseidon(v, r, pk.x, pk.y) — binds the coin to its
 /// intended owner, so a coin created for Alice cannot be claimed by Bob even
-/// if he knows the tag/value/rand (analogous to how Zcash embeds the
-/// recipient address in cm).
+/// if he knows the value/rand (analogous to how Zcash embeds the recipient
+/// address in cm).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, CanonicalSerialize, CanonicalDeserialize)]
 pub struct Coin {
-    #[serde(with = "field_serde")]
-    pub tag: Fr,
     pub value: u64,
     #[serde(with = "field_serde")]
     pub rand: Fr,
@@ -177,7 +175,7 @@ pub struct Coin {
 impl Coin {
     pub fn commitment(&self) -> Fr {
         let (px, py) = owner_pk_to_field_pair(&self.owner_pk);
-        poseidon_hash(&[self.tag, Fr::from(self.value), self.rand, px, py])
+        poseidon_hash(&[Fr::from(self.value), self.rand, px, py])
     }
 }
 
@@ -190,7 +188,7 @@ impl Coin {
 /// no circuit or wallet workflow ever reads it back out of the decrypted
 /// transaction, so there's nothing to gain by encrypting a second copy) and
 /// recipient ownership is encoded inside each coin commitment
-/// (`Poseidon(tag, v, r, pk)`). Each output's coin data is encrypted in
+/// (`Poseidon(v, r, pk)`). Each output's coin data is encrypted in
 /// `note_encs[i]` per recipient.
 ///
 /// `spend_proof` is attached after proving and the whole struct re-encrypted.
@@ -224,8 +222,8 @@ impl Transaction {
 // ---- X25519 sender-anonymous encryption ------------------------------------
 //
 // Unchanged from the SHA256/SP1 design and entirely off-circuit: this is
-// *wallet-side* bookkeeping (delivering a coin's opening — tag/value/rand —
-// to its recipient), not something any circuit needs to prove anymore. The
+// *wallet-side* bookkeeping (delivering a coin's opening — value/rand — to
+// its recipient), not something any circuit needs to prove anymore. The
 // port's "move decryption off-circuit" decision made `BoardEntry`'s
 // `output_commitments` public instead (see below), so `check_coin_receipt`
 // no longer calls any of this. X25519 keys are now entirely separate from
@@ -236,7 +234,7 @@ impl Transaction {
 // the recipient's private key can recover it. The sender is never identified:
 // the recipient only uses their own sk and the ephemeral public key `ek_pk`.
 //
-// Note data (coin tag/value/rand) for output i is encrypted with a key derived
+// Note data (coin value/rand) for output i is encrypted with a key derived
 // from the session key: `note_key_i = H(session_key || i || NOTE_SALT)`. The
 // recipient decrypts the transaction ciphertext first (giving session_key), then
 // tries each index to find their coin.
@@ -308,7 +306,7 @@ fn wrapping_key(shared: &[u8; 32]) -> [u8; 32] {
 /// entry.output_commitments` directly, without decrypting anything
 /// in-circuit — see the MNT-native port plan's "move decryption off-circuit"
 /// decision. This leaks nothing beyond what a hiding commitment already
-/// leaks (nothing about tag/value/rand/owner), the same trade-off Zcash's
+/// leaks (nothing about value/rand/owner), the same trade-off Zcash's
 /// public note-commitment tree makes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardEntry {
@@ -1109,7 +1107,7 @@ mod tests {
     }
 
     fn coin(seed: u8, value: u64, owner_pk: OwnerPk) -> Coin {
-        Coin { tag: Fr::from(seed as u64 + 1), value, rand: Fr::from(seed as u64 + 1000), owner_pk }
+        Coin { value, rand: Fr::from(seed as u64 + 1000), owner_pk }
     }
 
     /// Build a Transaction using X25519 note encryption derived from session_key.

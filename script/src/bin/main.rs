@@ -103,7 +103,7 @@ impl Party {
 }
 
 fn coin(seed: u8, value: u64, owner_pk: OwnerPk) -> Coin {
-    Coin { tag: Fr::from(seed as u64 + 1), value, rand: Fr::from(seed as u64 + 1000), owner_pk }
+    Coin { value, rand: Fr::from(seed as u64 + 1000), owner_pk }
 }
 
 /// Pads a variable-length list of real output commitments out to
@@ -574,7 +574,6 @@ fn run_prove() {
         parent_nonmembership: Some(empty_tree.prove_non_membership(genesis_entry.nullifier)),
         nullifier_root_at_parent_slot: Some(empty_tree.root()),
         sk_p: Some(alice.sk_p),
-        coin_tag: Some(alice_coin.tag),
         coin_value: Some(alice_coin.value),
         coin_rand: Some(alice_coin.rand),
     };
@@ -752,7 +751,6 @@ fn run_prove() {
         parent_nonmembership: Some(tree_after_genesis.prove_non_membership(alice_entry.nullifier)),
         nullifier_root_at_parent_slot: Some(tree_after_genesis.root()),
         sk_p: Some(bob.sk_p),
-        coin_tag: Some(bob_coin.tag),
         coin_value: Some(bob_coin.value),
         coin_rand: Some(bob_coin.rand),
     };

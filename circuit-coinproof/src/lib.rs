@@ -141,11 +141,11 @@ fn is_member(target: &Fp, list: &[Fp]) -> Result<Boolean<Fr>, SynthesisError> {
 /// board_root, received_at`.
 ///
 /// `owner_pk` is not a free claim: the circuit derives it in-circuit from a
-/// witnessed `sk_p` and requires the witnessed coin opening (`coin_tag`/
-/// `coin_value`/`coin_rand` plus that same `owner_pk`) to actually hash to
-/// the public `coin_commitment`. So building a valid receipt requires
-/// genuinely knowing how to open the coin, not just naming a commitment
-/// that happens to be on the board.
+/// witnessed `sk_p` and requires the witnessed coin opening (`coin_value`/
+/// `coin_rand` plus that same `owner_pk`) to actually hash to the public
+/// `coin_commitment`. So building a valid receipt requires genuinely
+/// knowing how to open the coin, not just naming a commitment that happens
+/// to be on the board.
 #[derive(Clone, CanonicalSerialize, CanonicalDeserialize)]
 pub struct ReceiptStepCircuit {
     // Public values.
@@ -182,7 +182,6 @@ pub struct ReceiptStepCircuit {
     // `sk_p` (not a free claim, see the constraint below), and the coin's
     // full opening checked to actually hash to the public `coin_commitment`.
     pub sk_p: Option<OwnerScalar>,
-    pub coin_tag: Option<Fr>,
     pub coin_value: Option<u64>,
     pub coin_rand: Option<Fr>,
 }
@@ -217,12 +216,11 @@ impl ConstraintSynthesizer<Fr> for ReceiptStepCircuit {
         pk_p_computed.x.enforce_equal(&owner_pk_x)?;
         pk_p_computed.y.enforce_equal(&owner_pk_y)?;
 
-        let coin_tag = Fp::new_witness(cs.clone(), || opt(&self.coin_tag))?;
         let coin_value = UInt64::new_witness(cs.clone(), || opt(&self.coin_value))?;
         let coin_rand = Fp::new_witness(cs.clone(), || opt(&self.coin_rand))?;
         let coin_commitment_computed = poseidon_hash_var(
             cs.clone(),
-            &[coin_tag, coin_value.to_fp()?, coin_rand, owner_pk_x, owner_pk_y],
+            &[coin_value.to_fp()?, coin_rand, owner_pk_x, owner_pk_y],
         )?;
         coin_commitment_computed.enforce_equal(&coin_commitment)?;
 
@@ -369,7 +367,6 @@ pub fn setup<R: RngCore + CryptoRng>(
         parent_nonmembership: None,
         nullifier_root_at_parent_slot: None,
         sk_p: None,
-        coin_tag: None,
         coin_value: None,
         coin_rand: None,
     };
@@ -428,10 +425,10 @@ mod tests {
 
         let sk_genesis = genesis_sk();
         let pk_genesis = derive_owner_pk(&sk_genesis);
-        let genesis_input = Coin { tag: Fr::from(1u64), value: 100, rand: Fr::from(2u64), owner_pk: pk_genesis };
+        let genesis_input = Coin { value: 100, rand: Fr::from(2u64), owner_pk: pk_genesis };
         let alice_sk = OwnerScalar::from(42u64);
         let alice_pk = derive_owner_pk(&alice_sk);
-        let alice_coin = Coin { tag: Fr::from(3u64), value: 100, rand: Fr::from(4u64), owner_pk: alice_pk };
+        let alice_coin = Coin { value: 100, rand: Fr::from(4u64), owner_pk: alice_pk };
 
         let genesis_input_commitment = genesis_input.commitment();
         let alice_commitment = alice_coin.commitment();
@@ -506,7 +503,6 @@ mod tests {
             parent_nonmembership: Some(empty_tree.prove_non_membership(genesis_own_nullifier)),
             nullifier_root_at_parent_slot: Some(empty_tree.root()),
             sk_p: Some(alice_sk),
-            coin_tag: Some(alice_coin.tag),
             coin_value: Some(alice_coin.value),
             coin_rand: Some(alice_coin.rand),
         };
@@ -541,10 +537,10 @@ mod tests {
         // --- Genesis mints 100 to Alice (1-in-1-out) ---
         let sk_genesis = genesis_sk();
         let pk_genesis = derive_owner_pk(&sk_genesis);
-        let genesis_input = Coin { tag: Fr::from(1u64), value: 100, rand: Fr::from(2u64), owner_pk: pk_genesis };
+        let genesis_input = Coin { value: 100, rand: Fr::from(2u64), owner_pk: pk_genesis };
         let alice_sk = OwnerScalar::from(42u64);
         let alice_pk = derive_owner_pk(&alice_sk);
-        let alice_coin = Coin { tag: Fr::from(3u64), value: 100, rand: Fr::from(4u64), owner_pk: alice_pk };
+        let alice_coin = Coin { value: 100, rand: Fr::from(4u64), owner_pk: alice_pk };
 
         let genesis_input_commitment = genesis_input.commitment();
         let alice_commitment = alice_coin.commitment();
@@ -620,7 +616,6 @@ mod tests {
             parent_nonmembership: Some(empty_tree.prove_non_membership(genesis_own_nullifier)),
             nullifier_root_at_parent_slot: Some(empty_tree.root()),
             sk_p: Some(alice_sk),
-            coin_tag: Some(alice_coin.tag),
             coin_value: Some(alice_coin.value),
             coin_rand: Some(alice_coin.rand),
         };
@@ -648,8 +643,8 @@ mod tests {
         // --- Alice spends 1-in-2-out: 40 to Bob, 60 change to herself ---
         let bob_sk = OwnerScalar::from(7u64);
         let bob_pk = derive_owner_pk(&bob_sk);
-        let bob_coin = Coin { tag: Fr::from(5u64), value: 40, rand: Fr::from(6u64), owner_pk: bob_pk };
-        let change_coin = Coin { tag: Fr::from(7u64), value: 60, rand: Fr::from(8u64), owner_pk: alice_pk };
+        let bob_coin = Coin { value: 40, rand: Fr::from(6u64), owner_pk: bob_pk };
+        let change_coin = Coin { value: 60, rand: Fr::from(8u64), owner_pk: alice_pk };
         let bob_commitment = bob_coin.commitment();
         let change_commitment = change_coin.commitment();
 
@@ -739,7 +734,6 @@ mod tests {
             parent_nonmembership: Some(tree_after_genesis.prove_non_membership(alice_own_nullifier)),
             nullifier_root_at_parent_slot: Some(tree_after_genesis.root()),
             sk_p: Some(bob_sk),
-            coin_tag: Some(bob_coin.tag),
             coin_value: Some(bob_coin.value),
             coin_rand: Some(bob_coin.rand),
         };
@@ -767,7 +761,7 @@ mod tests {
         // --- Bob spends his 40 units to Carol (1-in-1-out, "second generation" spend) ---
         let carol_sk = OwnerScalar::from(13u64);
         let carol_pk = derive_owner_pk(&carol_sk);
-        let carol_coin = Coin { tag: Fr::from(9u64), value: 40, rand: Fr::from(10u64), owner_pk: carol_pk };
+        let carol_coin = Coin { value: 40, rand: Fr::from(10u64), owner_pk: carol_pk };
         let carol_commitment = carol_coin.commitment();
 
         let bob_spend_slot = 2u64;

@@ -206,7 +206,6 @@ fn opt<T: Clone>(o: &Option<T>) -> Result<T, SynthesisError> {
 /// pair avoids needing on-curve verification that isn't otherwise required
 /// (see the module's design notes in the MNT-native port plan).
 struct CoinVar {
-    tag: Fp,
     value: UInt64<Fr>,
     rand: Fp,
     owner_pk_x: Fp,
@@ -223,7 +222,6 @@ impl CoinVar {
     fn new_witness(cs: ConstraintSystemRef<Fr>, coin: &Option<Coin>) -> Result<Self, SynthesisError> {
         let owner_xy = coin.as_ref().map(|c| owner_pk_to_field_pair(&c.owner_pk));
         Ok(Self {
-            tag: Fp::new_witness(cs.clone(), || Ok(coin.as_ref().map(|c| c.tag).unwrap_or(Fr::from(0u64))))?,
             value: UInt64::new_witness(cs.clone(), || Ok(coin.as_ref().map(|c| c.value).unwrap_or(0)))?,
             rand: Fp::new_witness(cs.clone(), || Ok(coin.as_ref().map(|c| c.rand).unwrap_or(Fr::from(0u64))))?,
             owner_pk_x: Fp::new_witness(cs.clone(), || Ok(owner_xy.map(|(x, _)| x).unwrap_or(Fr::from(0u64))))?,
@@ -233,10 +231,7 @@ impl CoinVar {
 
     fn commitment(&self, cs: ConstraintSystemRef<Fr>) -> Result<Fp, SynthesisError> {
         let value_fp = self.value.to_fp()?;
-        poseidon_hash_var(
-            cs,
-            &[self.tag.clone(), value_fp, self.rand.clone(), self.owner_pk_x.clone(), self.owner_pk_y.clone()],
-        )
+        poseidon_hash_var(cs, &[value_fp, self.rand.clone(), self.owner_pk_x.clone(), self.owner_pk_y.clone()])
     }
 
     /// This slot's value if `is_active`, else `0` — used for the
@@ -710,10 +705,10 @@ mod tests {
         let sk_p = genesis_sk();
         let pk_p = derive_owner_pk(&sk_p);
 
-        let input_coin = Coin { tag: Fr::from(1u64), value: 100, rand: Fr::from(2u64), owner_pk: pk_p };
+        let input_coin = Coin { value: 100, rand: Fr::from(2u64), owner_pk: pk_p };
         let recipient_sk = OwnerScalar::from(42u64);
         let recipient_pk = derive_owner_pk(&recipient_sk);
-        let output_coin = Coin { tag: Fr::from(3u64), value: 100, rand: Fr::from(4u64), owner_pk: recipient_pk };
+        let output_coin = Coin { value: 100, rand: Fr::from(4u64), owner_pk: recipient_pk };
 
         let coin_commitment = input_coin.commitment();
         let output_commitment = output_coin.commitment();
@@ -754,11 +749,11 @@ mod tests {
     fn two_real_outputs_with_conservation_satisfies_constraints() {
         let sk_p = genesis_sk();
         let pk_p = derive_owner_pk(&sk_p);
-        let input_coin = Coin { tag: Fr::from(1u64), value: 100, rand: Fr::from(2u64), owner_pk: pk_p };
+        let input_coin = Coin { value: 100, rand: Fr::from(2u64), owner_pk: pk_p };
         let bob_pk = derive_owner_pk(&OwnerScalar::from(7u64));
-        let bob_coin = Coin { tag: Fr::from(3u64), value: 40, rand: Fr::from(4u64), owner_pk: bob_pk };
+        let bob_coin = Coin { value: 40, rand: Fr::from(4u64), owner_pk: bob_pk };
         let change_pk = pk_p;
-        let change_coin = Coin { tag: Fr::from(5u64), value: 60, rand: Fr::from(6u64), owner_pk: change_pk };
+        let change_coin = Coin { value: 60, rand: Fr::from(6u64), owner_pk: change_pk };
 
         let coin_commitment = input_coin.commitment();
         let entry_position = 0u64;
@@ -793,15 +788,14 @@ mod tests {
         // regardless of the witnessed `value` field.
         let sk_p = genesis_sk();
         let pk_p = derive_owner_pk(&sk_p);
-        let input_coin = Coin { tag: Fr::from(1u64), value: 100, rand: Fr::from(2u64), owner_pk: pk_p };
-        let output_coin = Coin { tag: Fr::from(3u64), value: 100, rand: Fr::from(4u64), owner_pk: pk_p };
+        let input_coin = Coin { value: 100, rand: Fr::from(2u64), owner_pk: pk_p };
+        let output_coin = Coin { value: 100, rand: Fr::from(4u64), owner_pk: pk_p };
         // A "free" phantom second output worth 50, but left officially
         // inactive (output_present[1] derived from output_coins[1].is_some()
         // — so mark it None while still trying to have it contribute value
         // is impossible via the public struct; the attack this test checks
         // is the *value_or_zero* mechanism itself, exercised directly).
         let phantom = CoinVar {
-            tag: Fp::constant(Fr::from(9u64)),
             value: UInt64::constant(50),
             rand: Fp::constant(Fr::from(9u64)),
             owner_pk_x: Fp::constant(Fr::from(0u64)),
