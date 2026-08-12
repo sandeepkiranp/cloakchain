@@ -570,6 +570,10 @@ fn run_prove() {
         append_path: Some(genesis_append_path.clone()),
         parent_nonmembership: Some(empty_tree.prove_non_membership(genesis_entry.nullifier)),
         nullifier_root_at_parent_slot: Some(empty_tree.root()),
+        sk_p: Some(alice.sk_p),
+        coin_tag: Some(alice_coin.tag),
+        coin_value: Some(alice_coin.value),
+        coin_rand: Some(alice_coin.rand),
     };
     let alice_receipt_public_inputs: [Fr; RECEIPT_PUBLIC_INPUTS] =
         ReceiptStepCircuit::public_inputs(apx, apy, alice_coin.commitment(), alice_receipt_board_root, 0)
@@ -744,6 +748,10 @@ fn run_prove() {
         append_path: Some(alice_spend_append_path.clone()),
         parent_nonmembership: Some(tree_after_genesis.prove_non_membership(alice_entry.nullifier)),
         nullifier_root_at_parent_slot: Some(tree_after_genesis.root()),
+        sk_p: Some(bob.sk_p),
+        coin_tag: Some(bob_coin.tag),
+        coin_value: Some(bob_coin.value),
+        coin_rand: Some(bob_coin.rand),
     };
     let bob_receipt_public_inputs: [Fr; RECEIPT_PUBLIC_INPUTS] =
         ReceiptStepCircuit::public_inputs(bpx, bpy, bob_coin.commitment(), bob_receipt_board_root, 1)
