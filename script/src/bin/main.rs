@@ -1184,6 +1184,32 @@ fn run_prove_grid_cell() {
     assert!(cloakkchain_circuit_spend::verify_non_genesis(&spend_vk, &spend_public_inputs, &spend_proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
     println!("  Proved in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
+
+    // Build (and size) the real board entry too, even though nothing in
+    // this harness spends it onward — matches how the mint steps report
+    // their entry size, so the paper's entry-size column isn't blank for
+    // the row that matters most (`MAX_OUTPUTS` outputs, at their largest).
+    let mut spend_outputs_for_tx: Vec<(Coin, [u8; 32])> = vec![(output_coins_vec[0].clone(), bob.enc_pk)];
+    if output_coins_vec.len() > 1 {
+        spend_outputs_for_tx.push((output_coins_vec[1].clone(), alice.enc_pk));
+    }
+    let (mut spend_tx, spend_s, spend_r) = make_tx(
+        100,
+        alice.enc_sk,
+        &alice.sk_p,
+        &alice_inputs.iter().map(|ai| ai.coin.clone()).collect::<Vec<_>>(),
+        &spend_outputs_for_tx,
+    );
+    spend_tx.spend_proof = ark_serialize_bytes(&spend_proof);
+    let spend_entry = cloakkchain_lib::encrypt_tx(
+        &spend_tx,
+        alice_inputs[0].coin.commitment(),
+        &alice.sk_p,
+        &spend_r,
+        spend_s,
+    );
+    let spend_entry_bytes = bincode::serialize(&spend_entry).map(|v| v.len()).ok();
+
     stats.push(ProveStats {
         name: format!("Alice's spend ({MAX_INPUTS}-in-{MAX_OUTPUTS}-out)"),
         board_size: entries.len() + 1,
@@ -1191,7 +1217,7 @@ fn run_prove_grid_cell() {
         prove_secs,
         verify_ms,
         proof_bytes: ark_serialize_len(&spend_proof),
-        entry_bytes: None,
+        entry_bytes: spend_entry_bytes,
         peak_mem_kb,
     });
 
