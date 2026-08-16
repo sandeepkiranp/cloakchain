@@ -62,7 +62,7 @@ type MNT6PairingVar = ark_mnt6_753::constraints::PairingVar;
 /// nothing else about the padding/`is_active` design changes with `N`.
 pub const MAX_INPUTS: usize = 1;
 /// Up to this many real output coins per spend.
-pub const MAX_OUTPUTS: usize = 1;
+pub const MAX_OUTPUTS: usize = 2;
 
 /// `ReceiptStepCircuit`'s public-input count/order (mirrors
 /// `circuit_coinproof::ReceiptStepCircuit::public_inputs`, duplicated as a
