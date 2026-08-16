@@ -693,60 +693,8 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ark_relations::r1cs::{ConstraintSystem, SynthesisMode};
+    use ark_relations::r1cs::ConstraintSystem;
     use cloakkchain_lib::{append_path_for_next, derive_owner_pk, fold_owner_scalar, genesis_sk, poseidon_hash, NullifierTree};
-
-    #[test]
-    fn diag_paper_constraint_counts() {
-        let genesis_cs = ConstraintSystem::<Fr>::new_ref();
-        genesis_cs.set_mode(SynthesisMode::Setup);
-        GenesisSpendCircuit::default().generate_constraints(genesis_cs.clone()).unwrap();
-        eprintln!(
-            "[PAPER] GenesisSpendCircuit MAX_INPUTS={} MAX_OUTPUTS={}: {} constraints",
-            MAX_INPUTS, MAX_OUTPUTS, genesis_cs.num_constraints()
-        );
-
-        let dummy_wrap_vk: VerifyingKey<MNT6_753> = {
-            struct TinyCircuit;
-            impl ark_relations::r1cs::ConstraintSynthesizer<ark_mnt6_753::Fr> for TinyCircuit {
-                fn generate_constraints(
-                    self,
-                    cs: ConstraintSystemRef<ark_mnt6_753::Fr>,
-                ) -> Result<(), SynthesisError> {
-                    for _ in 0..(RECEIPT_PUBLIC_INPUT_COUNT * chunks_per_value()) {
-                        Fp6Var::new_input(cs.clone(), || Ok(ark_mnt6_753::Fr::from(0u64)))?;
-                    }
-                    Ok(())
-                }
-            }
-            type Fp6Var = ark_r1cs_std::fields::fp::FpVar<ark_mnt6_753::Fr>;
-            use ark_std::rand::SeedableRng;
-            let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0);
-            Groth16::<MNT6_753>::circuit_specific_setup(TinyCircuit, &mut rng).unwrap().1
-        };
-        let spend_circuit = SpendStepCircuit {
-            pk_p: None,
-            output_commitments: None,
-            board_root: None,
-            current_nullifier_root: None,
-            sk_p: None,
-            input_coins: std::array::from_fn(|_| None),
-            output_coins: std::array::from_fn(|_| None),
-            entry_position: None,
-            append_path: None,
-            own_nullifier_nonmembership: std::array::from_fn(|_| None),
-            wrap_vk: dummy_wrap_vk,
-            input_receipt_proofs: std::array::from_fn(|_| Some(SpendStepCircuit::dummy_wrap_proof())),
-            input_receipt_public_inputs: std::array::from_fn(|_| None),
-        };
-        let spend_cs = ConstraintSystem::<Fr>::new_ref();
-        spend_cs.set_mode(SynthesisMode::Setup);
-        spend_circuit.generate_constraints(spend_cs.clone()).unwrap();
-        eprintln!(
-            "[PAPER] SpendStepCircuit MAX_INPUTS={} MAX_OUTPUTS={}: {} constraints",
-            MAX_INPUTS, MAX_OUTPUTS, spend_cs.num_constraints()
-        );
-    }
 
     /// Build a valid genesis-mint witness (1 real input, 1 real output,
     /// padding slots empty) the same way the native `check_spend`/test
@@ -777,15 +725,15 @@ mod tests {
 
         GenesisSpendCircuit {
             pk_p: Some(pk_p),
-            output_commitments: Some([output_commitment]),
+            output_commitments: Some([output_commitment, Fr::from(0u64)]),
             board_root: Some(board_root),
             current_nullifier_root: Some(current_nullifier_root),
             sk_p: Some(sk_p),
-            input_coins: [Some(input_coin), None],
-            output_coins: [Some(output_coin)],
+            input_coins: [Some(input_coin)],
+            output_coins: [Some(output_coin), None],
             entry_position: Some(entry_position),
             append_path: Some(append_path),
-            own_nullifier_nonmembership: [Some(own_nullifier_nonmembership), None],
+            own_nullifier_nonmembership: [Some(own_nullifier_nonmembership)],
         }
     }
 
@@ -798,7 +746,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "MAX_OUTPUTS temporarily 1 for a paper-results experiment; not a real regression"]
     fn two_real_outputs_with_conservation_satisfies_constraints() {
         let sk_p = genesis_sk();
         let pk_p = derive_owner_pk(&sk_p);
@@ -817,15 +764,15 @@ mod tests {
 
         let c = GenesisSpendCircuit {
             pk_p: Some(pk_p),
-            output_commitments: Some([bob_coin.commitment()]),
+            output_commitments: Some([bob_coin.commitment(), change_coin.commitment()]),
             board_root: Some(board_root),
             current_nullifier_root: Some(tree.root()),
             sk_p: Some(sk_p),
-            input_coins: [Some(input_coin), None],
-            output_coins: [Some(bob_coin)],
+            input_coins: [Some(input_coin)],
+            output_coins: [Some(bob_coin), Some(change_coin)],
             entry_position: Some(entry_position),
             append_path: Some(append_path),
-            own_nullifier_nonmembership: [Some(tree.prove_non_membership(own_nullifier)), None],
+            own_nullifier_nonmembership: [Some(tree.prove_non_membership(own_nullifier))],
         };
         let cs = ConstraintSystem::<Fr>::new_ref();
         c.generate_constraints(cs.clone()).unwrap();
@@ -908,7 +855,7 @@ mod tests {
         let mut tree = NullifierTree::new();
         tree.insert(own_nullifier);
         c.current_nullifier_root = Some(tree.root());
-        c.own_nullifier_nonmembership = [Some(tree.prove_non_membership(own_nullifier)), None];
+        c.own_nullifier_nonmembership = [Some(tree.prove_non_membership(own_nullifier))];
         c.generate_constraints(cs.clone()).unwrap();
         assert!(!cs.is_satisfied().unwrap(), "a nullifier already in the accumulator must fail non-membership");
     }
