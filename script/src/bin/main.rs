@@ -39,16 +39,19 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::{rngs::StdRng, SeedableRng};
 use clap::Parser;
 use cloakkchain_circuit_coinproof::ReceiptStepCircuit;
-use cloakkchain_circuit_spend::{GenesisSpendCircuit, SpendStepCircuit, MAX_OUTPUTS};
+use cloakkchain_circuit_spend::{GenesisSpendCircuit, SpendStepCircuit, MAX_INPUTS, MAX_OUTPUTS};
 use cloakkchain_circuit_wrap::WrapCircuit;
 use cloakkchain_lib::{
     append_path_for_next, compute_root_from_path, derive_enc_pk, derive_owner_pk,
     entry_ciphertext_commitment, fold_owner_scalar, genesis_pk, genesis_sk, merkle_leaf,
-    owner_pk_to_field_pair, poseidon_hash, scan_entry, BoardEntry, Coin, Fr, NullifierTree,
-    OwnerPk, OwnerScalar, Transaction, EK_SALT,
+    owner_pk_to_field_pair, poseidon_hash, scan_entry, BoardEntry, Coin, Fr, NonMembershipWitness,
+    NullifierTree, OwnerPk, OwnerScalar, Transaction, EK_SALT,
 };
 
-const GENESIS_SPEND_PUBLIC_INPUTS: usize = 6; // 2 (pk) + MAX_OUTPUTS(2) + 2 (board_root, nullifier_root)
+// 2 (pk) + MAX_OUTPUTS + 2 (board_root, nullifier_root) — computed from
+// circuit-spend's own MAX_OUTPUTS so this stays correct across the paper's
+// grid-cell experiments (see `run_prove_grid_cell`), which flip that const.
+const GENESIS_SPEND_PUBLIC_INPUTS: usize = 2 + MAX_OUTPUTS + 2;
 const RECEIPT_PUBLIC_INPUTS: usize = 5;
 
 // ---- CLI args ---------------------------------------------------------------
@@ -60,6 +63,12 @@ struct Args {
     execute: bool,
     #[arg(long)]
     prove: bool,
+    /// Ad hoc: real Groth16 setup+prove+verify at whichever MAX_INPUTS/
+    /// MAX_OUTPUTS shape circuit-spend/circuit-coinproof are currently
+    /// compiled with — for filling in the paper's 2x2 grid cells. See
+    /// `run_prove_grid_cell`'s doc comment. Not part of the normal demo.
+    #[arg(long)]
+    grid_cell: bool,
     /// Hidden: re-invokes this binary as a single setup+prove subprocess
     /// (see the module doc comment). One of "genesis", "spend_non_genesis",
     /// "receipt", "wrap6", "wrap5". Not for direct use.
@@ -400,6 +409,11 @@ fn main() {
         return;
     }
 
+    if args.grid_cell {
+        run_prove_grid_cell();
+        return;
+    }
+
     let mode_count = [args.execute, args.prove].iter().filter(|&&b| b).count();
     if mode_count != 1 {
         eprintln!("Error: specify exactly one of --execute, --prove");
@@ -442,11 +456,11 @@ fn run_execute(genesis: &Party, genesis_coin: &Coin, alice_coin: &Coin) {
         board_root: Some(board_root),
         current_nullifier_root: Some(tree.root()),
         sk_p: Some(genesis.sk_p),
-        input_coins: [Some(genesis_coin.clone())],
-        output_coins: [Some(alice_coin.clone()), None],
+        input_coins: [Some(genesis_coin.clone()), None],
+        output_coins: [Some(alice_coin.clone())],
         entry_position: Some(0),
         append_path: Some(append_path),
-        own_nullifier_nonmembership: [Some(tree.prove_non_membership(own_nullifier))],
+        own_nullifier_nonmembership: [Some(tree.prove_non_membership(own_nullifier)), None],
     };
 
     let cs = ConstraintSystem::<Fr>::new_ref();
@@ -486,11 +500,11 @@ fn run_prove() {
         board_root: Some(genesis_board_root),
         current_nullifier_root: Some(empty_tree.root()),
         sk_p: Some(genesis.sk_p),
-        input_coins: [Some(genesis_coin.clone())],
-        output_coins: [Some(alice_coin.clone()), None],
+        input_coins: [Some(genesis_coin.clone()), None],
+        output_coins: [Some(alice_coin.clone())],
         entry_position: Some(entries.len() as u64),
         append_path: Some(genesis_append_path.clone()),
-        own_nullifier_nonmembership: [Some(empty_tree.prove_non_membership(genesis_own_nullifier))],
+        own_nullifier_nonmembership: [Some(empty_tree.prove_non_membership(genesis_own_nullifier)), None],
     };
     let genesis_public_inputs: [Fr; GENESIS_SPEND_PUBLIC_INPUTS] =
         GenesisSpendCircuit::public_inputs(genesis.pk_p, genesis_outputs, genesis_board_root, empty_tree.root())
@@ -647,14 +661,14 @@ fn run_prove() {
         board_root: Some(alice_spend_board_root),
         current_nullifier_root: Some(tree_after_genesis.root()),
         sk_p: Some(alice.sk_p),
-        input_coins: [Some(alice_coin.clone())],
-        output_coins: [Some(bob_coin.clone()), Some(change_coin.clone())],
+        input_coins: [Some(alice_coin.clone()), None],
+        output_coins: [Some(bob_coin.clone())],
         entry_position: Some(entries.len() as u64),
         append_path: Some(alice_spend_append_path.clone()),
-        own_nullifier_nonmembership: [Some(tree_after_genesis.prove_non_membership(alice_own_nullifier))],
+        own_nullifier_nonmembership: [Some(tree_after_genesis.prove_non_membership(alice_own_nullifier)), None],
         wrap_vk: wrap_alice_receipt_vk.clone(),
-        input_receipt_proofs: [Some(wrap_alice_receipt_proof)],
-        input_receipt_public_inputs: [Some(alice_receipt_public_inputs)],
+        input_receipt_proofs: [Some(wrap_alice_receipt_proof), None],
+        input_receipt_public_inputs: [Some(alice_receipt_public_inputs), None],
     };
     let alice_spend_public_inputs: [Fr; GENESIS_SPEND_PUBLIC_INPUTS] = SpendStepCircuit::public_inputs(
         alice.pk_p,
@@ -823,14 +837,14 @@ fn run_prove() {
         board_root: Some(bob_spend_board_root),
         current_nullifier_root: Some(tree_after_alice_spend.root()),
         sk_p: Some(bob.sk_p),
-        input_coins: [Some(bob_coin.clone())],
-        output_coins: [Some(carol_coin.clone()), None],
+        input_coins: [Some(bob_coin.clone()), None],
+        output_coins: [Some(carol_coin.clone())],
         entry_position: Some(entries.len() as u64),
         append_path: Some(bob_spend_append_path),
-        own_nullifier_nonmembership: [Some(tree_after_alice_spend.prove_non_membership(bob_own_nullifier))],
+        own_nullifier_nonmembership: [Some(tree_after_alice_spend.prove_non_membership(bob_own_nullifier)), None],
         wrap_vk: wrap_bob_receipt_vk.clone(),
-        input_receipt_proofs: [Some(wrap_bob_receipt_proof)],
-        input_receipt_public_inputs: [Some(bob_receipt_public_inputs)],
+        input_receipt_proofs: [Some(wrap_bob_receipt_proof), None],
+        input_receipt_public_inputs: [Some(bob_receipt_public_inputs), None],
     };
     let bob_spend_public_inputs = SpendStepCircuit::public_inputs(
         bob.pk_p,
@@ -873,4 +887,314 @@ fn run_prove() {
     println!("  [{}] discovered coin (value={}) at slot 2 — end of chain (no further receipt built)", carol.name, carol_coin.value);
 
     print_prove_table(&stats);
+}
+
+// ---- Grid-cell diagnostic (paper results) ------------------------------------
+//
+// Ad hoc scenario for measuring *real* Groth16 proving stats (constraints,
+// prove time, verify time, proof size, subprocess-isolated peak memory) at
+// whichever (MAX_INPUTS, MAX_OUTPUTS) shape circuit-spend/circuit-coinproof
+// currently happen to be compiled with. `run_prove`'s demo chain only ever
+// exercises one compiled shape at a time (the committed baseline); this
+// function exists so the same measurement methodology (real proving,
+// subprocess-isolated memory) can be pointed at the other three cells of
+// the 2x2 grid by temporarily editing those crates' MAX_INPUTS/MAX_OUTPUTS
+// consts (never committed) and rerunning `--grid-cell`.
+//
+// Scenario: Alice receives one coin per input slot MAX_INPUTS calls for
+// (via that many independent genesis mints + receipts, values summing to
+// 100 — 100 alone if MAX_INPUTS==1, else 60+40), then spends all of them
+// at once into MAX_OUTPUTS outputs (Bob gets 40 plus change back to
+// herself if MAX_OUTPUTS>1, otherwise Bob gets the full 100). Every input
+// slot is genuinely active — this is the maximal-cost, fully-realistic
+// shape for whatever the compiled MAX_INPUTS/MAX_OUTPUTS is, matching how
+// the committed baseline's own Alice-spend row is exercised.
+//
+// Deliberately doesn't build/publish a `BoardEntry` for the final spend
+// (unlike the mint steps, which need one so Alice's receipt can recursively
+// verify real Merkle inclusion) — nothing downstream ever spends Alice's
+// new outputs in this harness, so there's no need for the multi-input
+// nullifier-bookkeeping a real continuation would require (this design
+// only ever publishes one nullifier per `BoardEntry`; a genuine multi-input
+// spend that needs to remain spendable-from later would need a second
+// nullifier slot on `BoardEntry` — out of scope here, since only the
+// proof's own real cost is being measured).
+fn run_prove_grid_cell() {
+    println!("=== Grid cell: MAX_INPUTS={MAX_INPUTS} MAX_OUTPUTS={MAX_OUTPUTS} ===");
+
+    let mut stats: Vec<ProveStats> = Vec::new();
+    let mut entries: Vec<BoardEntry> = vec![];
+    let mut tree = NullifierTree::new();
+
+    let genesis = Party::genesis();
+    let alice = Party::new("Alice", 1);
+    let bob = Party::new("Bob", 2);
+
+    let input_values: Vec<u64> = match MAX_INPUTS {
+        1 => vec![100],
+        2 => vec![60, 40],
+        n => panic!("grid-cell scenario only supports MAX_INPUTS 1 or 2, got {n}"),
+    };
+
+    struct AliceInput {
+        coin: Coin,
+        own_nullifier: Fr,
+    }
+    let mut alice_inputs: Vec<AliceInput> = Vec::new();
+    let mut wrap_vk_for_spend: Option<VerifyingKey<MNT6_753>> = None;
+    let mut input_receipt_wraps: Vec<(Proof<MNT6_753>, Vec<Fr>)> = Vec::new();
+
+    for (k, &val) in input_values.iter().enumerate() {
+        println!("\n--- Genesis mint #{k}: {val} units to Alice ---");
+        let genesis_coin = coin(0xA0 + k as u8, val, genesis.pk_p);
+        let alice_coin = coin(0xB0 + k as u8, val, alice.pk_p);
+        let genesis_outputs = pad_outputs(&[alice_coin.commitment()]);
+        let g_append_path = append_path_for_next(&entries);
+        let g_board_root = compute_root_from_path(Fr::from(0u64), entries.len(), &g_append_path);
+        let g_own_nullifier = poseidon_hash(&[genesis_coin.commitment(), fold_owner_scalar(&genesis.sk_p)]);
+        let nullifier_root_before = tree.root();
+        let own_nonmembership = tree.prove_non_membership(g_own_nullifier);
+
+        let mut g_input_coins: [Option<Coin>; MAX_INPUTS] = std::array::from_fn(|_| None);
+        g_input_coins[0] = Some(genesis_coin.clone());
+        let mut g_nonmembership: [Option<NonMembershipWitness>; MAX_INPUTS] = std::array::from_fn(|_| None);
+        g_nonmembership[0] = Some(own_nonmembership.clone());
+        let mut g_output_coins: [Option<Coin>; MAX_OUTPUTS] = std::array::from_fn(|_| None);
+        g_output_coins[0] = Some(alice_coin.clone());
+
+        let genesis_circuit = GenesisSpendCircuit {
+            pk_p: Some(genesis.pk_p),
+            output_commitments: Some(genesis_outputs),
+            board_root: Some(g_board_root),
+            current_nullifier_root: Some(nullifier_root_before),
+            sk_p: Some(genesis.sk_p),
+            input_coins: g_input_coins,
+            output_coins: g_output_coins,
+            entry_position: Some(entries.len() as u64),
+            append_path: Some(g_append_path.clone()),
+            own_nullifier_nonmembership: g_nonmembership,
+        };
+        let genesis_public_inputs: [Fr; GENESIS_SPEND_PUBLIC_INPUTS] =
+            GenesisSpendCircuit::public_inputs(genesis.pk_p, genesis_outputs, g_board_root, nullifier_root_before)
+                .try_into()
+                .unwrap();
+
+        let (genesis_vk, genesis_proof, prove_secs, peak_mem_kb) =
+            run_step_subprocess::<_, MNT4_753>("genesis", &genesis_circuit);
+        let t = Instant::now();
+        assert!(cloakkchain_circuit_spend::verify(&genesis_vk, &genesis_public_inputs, &genesis_proof).unwrap());
+        let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+        println!("  Proved in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
+        stats.push(ProveStats {
+            name: format!("Genesis mint #{k}"),
+            board_size: entries.len() + 1,
+            constraints: count_constraints(&genesis_circuit),
+            prove_secs,
+            verify_ms,
+            proof_bytes: ark_serialize_len(&genesis_proof),
+            entry_bytes: None,
+            peak_mem_kb,
+        });
+
+        let (mut tx, s, r) = make_tx(
+            k as u64,
+            genesis.enc_sk,
+            &genesis.sk_p,
+            &[genesis_coin.clone()],
+            &[(alice_coin.clone(), alice.enc_pk)],
+        );
+        tx.spend_proof = ark_serialize_bytes(&genesis_proof);
+        let entry = cloakkchain_lib::encrypt_tx(&tx, genesis_coin.commitment(), &genesis.sk_p, &r, s);
+        let entry_bytes = bincode::serialize(&entry).map(|v| v.len()).ok();
+        let entry_position = entries.len();
+        entries.push(entry.clone());
+        tree.insert(g_own_nullifier);
+
+        // --- wrap the genesis proof ---
+        let wrap_genesis_circuit = WrapCircuit::<GENESIS_SPEND_PUBLIC_INPUTS> {
+            inner_vk: genesis_vk.clone(),
+            inner_proof: Some(genesis_proof),
+            inner_public_inputs: Some(genesis_public_inputs),
+        };
+        let (wrap_genesis_vk, wrap_genesis_proof, prove_secs, peak_mem_kb) =
+            run_step_subprocess::<_, MNT6_753>("wrap6", &wrap_genesis_circuit);
+        let wrap_genesis_public_inputs = cloakkchain_circuit_wrap::public_input_chunks(&genesis_public_inputs);
+        let t = Instant::now();
+        assert!(cloakkchain_circuit_wrap::verify(&wrap_genesis_vk, &wrap_genesis_public_inputs, &wrap_genesis_proof).unwrap());
+        let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+        println!("  Wrapped in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
+        stats.push(ProveStats {
+            name: format!("Wrap genesis mint #{k}"),
+            board_size: entries.len(),
+            constraints: count_constraints(&wrap_genesis_circuit),
+            prove_secs,
+            verify_ms,
+            proof_bytes: ark_serialize_len(&wrap_genesis_proof),
+            entry_bytes,
+            peak_mem_kb,
+        });
+
+        // --- Alice's receipt for this coin ---
+        let receipt_board_root =
+            compute_root_from_path(merkle_leaf(entry_position, &entry), entry_position, &g_append_path);
+        let (apx, apy) = owner_pk_to_field_pair(&alice.pk_p);
+        let receipt_circuit = ReceiptStepCircuit {
+            owner_pk_x: Some(apx),
+            owner_pk_y: Some(apy),
+            coin_commitment: Some(alice_coin.commitment()),
+            board_root: Some(receipt_board_root),
+            received_at: Some(entry_position as u64),
+            wrap_vk: wrap_genesis_vk.clone(),
+            wrap_proof: Some(wrap_genesis_proof),
+            wrap_public_inputs: Some(genesis_public_inputs),
+            entry_nullifier: Some(entry.nullifier),
+            entry_output_commitments: Some(genesis_outputs),
+            entry_ciphertext_commitment: Some(entry_ciphertext_commitment(&entry)),
+            received_slot: Some(entry_position as u64),
+            append_path: Some(g_append_path.clone()),
+            parent_nonmembership: Some(own_nonmembership),
+            nullifier_root_at_parent_slot: Some(nullifier_root_before),
+            sk_p: Some(alice.sk_p),
+            coin_value: Some(alice_coin.value),
+            coin_rand: Some(alice_coin.rand),
+        };
+        let receipt_public_inputs: [Fr; RECEIPT_PUBLIC_INPUTS] = ReceiptStepCircuit::public_inputs(
+            apx,
+            apy,
+            alice_coin.commitment(),
+            receipt_board_root,
+            entry_position as u64,
+        )
+        .try_into()
+        .unwrap();
+
+        let (receipt_vk, receipt_proof, prove_secs, peak_mem_kb) =
+            run_step_subprocess::<_, MNT4_753>("receipt", &receipt_circuit);
+        let t = Instant::now();
+        assert!(cloakkchain_circuit_coinproof::verify(&receipt_vk, &receipt_public_inputs, &receipt_proof).unwrap());
+        let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+        println!("  Proved in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
+        stats.push(ProveStats {
+            name: format!("Alice's receipt #{k}"),
+            board_size: entries.len(),
+            constraints: count_constraints(&receipt_circuit),
+            prove_secs,
+            verify_ms,
+            proof_bytes: ark_serialize_len(&receipt_proof),
+            entry_bytes: None,
+            peak_mem_kb,
+        });
+
+        // --- wrap Alice's receipt so her spend can recursively verify it ---
+        let wrap_receipt_circuit = WrapCircuit::<RECEIPT_PUBLIC_INPUTS> {
+            inner_vk: receipt_vk.clone(),
+            inner_proof: Some(receipt_proof),
+            inner_public_inputs: Some(receipt_public_inputs),
+        };
+        let (wrap_receipt_vk, wrap_receipt_proof, prove_secs, peak_mem_kb) =
+            run_step_subprocess::<_, MNT6_753>("wrap5", &wrap_receipt_circuit);
+        let wrap_receipt_public_inputs = cloakkchain_circuit_wrap::public_input_chunks(&receipt_public_inputs);
+        let t = Instant::now();
+        assert!(cloakkchain_circuit_wrap::verify(&wrap_receipt_vk, &wrap_receipt_public_inputs, &wrap_receipt_proof).unwrap());
+        let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+        println!("  Wrapped in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
+        stats.push(ProveStats {
+            name: format!("Wrap Alice's receipt #{k}"),
+            board_size: entries.len(),
+            constraints: count_constraints(&wrap_receipt_circuit),
+            prove_secs,
+            verify_ms,
+            proof_bytes: ark_serialize_len(&wrap_receipt_proof),
+            entry_bytes: None,
+            peak_mem_kb,
+        });
+
+        wrap_vk_for_spend = Some(wrap_receipt_vk);
+        input_receipt_wraps.push((wrap_receipt_proof, receipt_public_inputs.to_vec()));
+        alice_inputs.push(AliceInput {
+            coin: alice_coin.clone(),
+            own_nullifier: poseidon_hash(&[alice_coin.commitment(), fold_owner_scalar(&alice.sk_p)]),
+        });
+    }
+
+    // =========================================================================
+    // Alice spends all MAX_INPUTS coins into MAX_OUTPUTS outputs
+    // =========================================================================
+    println!("\n--- Alice spends {MAX_INPUTS} input(s) into {MAX_OUTPUTS} output(s) ---");
+    let total: u64 = input_values.iter().sum();
+    let bob_val = if MAX_OUTPUTS > 1 { 40 } else { total };
+    let bob_coin = coin(0xC0, bob_val, bob.pk_p);
+    let mut output_coins_vec: Vec<Coin> = vec![bob_coin.clone()];
+    if MAX_OUTPUTS > 1 {
+        output_coins_vec.push(coin(0xC1, total - bob_val, alice.pk_p));
+    }
+    let real_output_commitments: Vec<Fr> = output_coins_vec.iter().map(|c| c.commitment()).collect();
+    let spend_outputs = pad_outputs(&real_output_commitments);
+
+    let spend_append_path = append_path_for_next(&entries);
+    let spend_board_root = compute_root_from_path(Fr::from(0u64), entries.len(), &spend_append_path);
+    let nullifier_root_before_spend = tree.root();
+
+    let mut spend_input_coins: [Option<Coin>; MAX_INPUTS] = std::array::from_fn(|_| None);
+    let mut spend_nonmembership: [Option<NonMembershipWitness>; MAX_INPUTS] = std::array::from_fn(|_| None);
+    for (i, ai) in alice_inputs.iter().enumerate() {
+        spend_input_coins[i] = Some(ai.coin.clone());
+        spend_nonmembership[i] = Some(tree.prove_non_membership(ai.own_nullifier));
+    }
+    let mut spend_output_coins: [Option<Coin>; MAX_OUTPUTS] = std::array::from_fn(|_| None);
+    for (i, c) in output_coins_vec.iter().enumerate() {
+        spend_output_coins[i] = Some(c.clone());
+    }
+    let mut input_receipt_proofs: [Option<Proof<MNT6_753>>; MAX_INPUTS] =
+        std::array::from_fn(|_| Some(SpendStepCircuit::dummy_wrap_proof()));
+    let mut input_receipt_public_inputs: [Option<[Fr; RECEIPT_PUBLIC_INPUTS]>; MAX_INPUTS] =
+        std::array::from_fn(|_| None);
+    for (i, (proof, pis)) in input_receipt_wraps.into_iter().enumerate() {
+        input_receipt_proofs[i] = Some(proof);
+        input_receipt_public_inputs[i] = Some(pis.try_into().unwrap());
+    }
+
+    let spend_circuit = SpendStepCircuit {
+        pk_p: Some(alice.pk_p),
+        output_commitments: Some(spend_outputs),
+        board_root: Some(spend_board_root),
+        current_nullifier_root: Some(nullifier_root_before_spend),
+        sk_p: Some(alice.sk_p),
+        input_coins: spend_input_coins,
+        output_coins: spend_output_coins,
+        entry_position: Some(entries.len() as u64),
+        append_path: Some(spend_append_path),
+        own_nullifier_nonmembership: spend_nonmembership,
+        wrap_vk: wrap_vk_for_spend.expect("at least one input coin"),
+        input_receipt_proofs,
+        input_receipt_public_inputs,
+    };
+    let spend_public_inputs: [Fr; GENESIS_SPEND_PUBLIC_INPUTS] = SpendStepCircuit::public_inputs(
+        alice.pk_p,
+        spend_outputs,
+        spend_board_root,
+        nullifier_root_before_spend,
+    )
+    .try_into()
+    .unwrap();
+
+    let (spend_vk, spend_proof, prove_secs, peak_mem_kb) =
+        run_step_subprocess::<_, MNT4_753>("spend_non_genesis", &spend_circuit);
+    let t = Instant::now();
+    assert!(cloakkchain_circuit_spend::verify_non_genesis(&spend_vk, &spend_public_inputs, &spend_proof).unwrap());
+    let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+    println!("  Proved in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
+    stats.push(ProveStats {
+        name: format!("Alice's spend ({MAX_INPUTS}-in-{MAX_OUTPUTS}-out)"),
+        board_size: entries.len() + 1,
+        constraints: count_constraints(&spend_circuit),
+        prove_secs,
+        verify_ms,
+        proof_bytes: ark_serialize_len(&spend_proof),
+        entry_bytes: None,
+        peak_mem_kb,
+    });
+
+    print_prove_table(&stats);
+    println!("\n=== Grid cell done: MAX_INPUTS={MAX_INPUTS} MAX_OUTPUTS={MAX_OUTPUTS} ===");
 }
