@@ -60,7 +60,7 @@ type MNT6PairingVar = ark_mnt6_753::constraints::PairingVar;
 /// verification (~250-300K constraints), by far the dominant cost driver.
 /// Revisit raising this back to 2+ if/when multi-input spends are needed;
 /// nothing else about the padding/`is_active` design changes with `N`.
-pub const MAX_INPUTS: usize = 1;
+pub const MAX_INPUTS: usize = 2;
 /// Up to this many real output coins per spend.
 pub const MAX_OUTPUTS: usize = 2;
 
