@@ -367,7 +367,12 @@ fn print_prove_table(stats: &[ProveStats]) {
     println!("{}", "-".repeat(w));
     let (mut tp, mut tv) = (0f64, 0f64);
     for s in stats {
-        let entry_col = s.entry_bytes.map_or("          —".into(), |b| format!("{:>11}", fmt_bytes(b)));
+        // Exact byte count, not `fmt_bytes`'s rounded KB/MB — entry size is
+        // small enough (low KB) that rounding loses precision worth keeping
+        // (e.g. distinguishing 1043 B from 1050 B), unlike proof size
+        // (already sub-1KB, so `fmt_bytes` prints it exactly anyway) or peak
+        // memory (large enough that KB/MB rounding doesn't matter).
+        let entry_col = s.entry_bytes.map_or("          —".into(), |b| format!("{:>8} B", b));
         println!(
             "{:<28} {:>5}  {:>11} {:>7.1} s  {:>8.1} ms  {:>11}  {}  {:>11}",
             s.name,
