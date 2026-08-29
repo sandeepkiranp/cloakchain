@@ -19,9 +19,9 @@ use ark_crypto_primitives::snark::{constraints::SNARKGadget, BooleanInputVar};
 use ark_crypto_primitives::sponge::{constraints::CryptographicSpongeVar, poseidon::constraints::PoseidonSpongeVar};
 use ark_ec::PrimeGroup;
 use ark_ff::{BigInteger, PrimeField};
-use ark_groth16::{
-    constraints::{Groth16VerifierGadget, ProofVar, VerifyingKeyVar},
-    Groth16, Proof, ProvingKey, VerifyingKey,
+use ark_gm17::{
+    constraints::{GM17VerifierGadget, ProofVar, VerifyingKeyVar},
+    GM17, Proof, ProvingKey, VerifyingKey,
 };
 use ark_mnt4_753::MNT4_753;
 use ark_mnt6_753::MNT6_753;
@@ -244,7 +244,7 @@ impl ConstraintSynthesizer<Fr> for ReceiptStepCircuit {
         let wrap_proof_var =
             ProofVar::<MNT6_753, MNT6PairingVar>::new_witness(cs.clone(), || opt(&self.wrap_proof))?;
         let pvk = wrap_vk_var.prepare()?;
-        let ok = Groth16VerifierGadget::<MNT6_753, MNT6PairingVar>::verify_with_processed_vk(
+        let ok = GM17VerifierGadget::<MNT6_753, MNT6PairingVar>::verify_with_processed_vk(
             &pvk,
             &input_var,
             &wrap_proof_var,
@@ -370,7 +370,7 @@ pub fn setup<R: RngCore + CryptoRng>(
         coin_value: None,
         coin_rand: None,
     };
-    Groth16::<MNT4_753>::circuit_specific_setup(circuit, rng)
+    GM17::<MNT4_753>::circuit_specific_setup(circuit, rng)
 }
 
 pub fn prove<R: RngCore + CryptoRng>(
@@ -378,7 +378,7 @@ pub fn prove<R: RngCore + CryptoRng>(
     circuit: ReceiptStepCircuit,
     rng: &mut R,
 ) -> Result<Proof<MNT4_753>, SynthesisError> {
-    Groth16::<MNT4_753>::prove(pk, circuit, rng)
+    GM17::<MNT4_753>::prove(pk, circuit, rng)
 }
 
 pub fn verify(
@@ -386,7 +386,7 @@ pub fn verify(
     public_inputs: &[Fr],
     proof: &Proof<MNT4_753>,
 ) -> Result<bool, SynthesisError> {
-    Groth16::<MNT4_753>::verify(vk, public_inputs, proof)
+    GM17::<MNT4_753>::verify(vk, public_inputs, proof)
 }
 
 #[cfg(test)]
@@ -416,7 +416,7 @@ mod tests {
     /// here, not the recursive-verification/board-inclusion machinery, so
     /// this only pays for one genuine genesis+wrap proof (needed as a real
     /// witness either way) and then checks raw constraint satisfiability
-    /// directly — no Groth16 setup/prove needed for the receipt itself.
+    /// directly — no GM17 setup/prove needed for the receipt itself.
     #[test]
     fn wrong_owner_key_fails_receipt() {
         use ark_relations::r1cs::ConstraintSystem;
@@ -529,7 +529,7 @@ mod tests {
     /// real multi-output), then Bob receives via a receipt that verifies a
     /// *wrapped spend* proof (not genesis) — the "second generation" that
     /// completes the Bob -> Carol hop — and spends on to Carol.
-    /// Nine real Groth16 proofs end to end.
+    /// Nine real GM17 proofs end to end.
     #[test]
     fn genesis_alice_change_then_bob_to_carol() {
         let mut rng = StdRng::seed_from_u64(20260810);

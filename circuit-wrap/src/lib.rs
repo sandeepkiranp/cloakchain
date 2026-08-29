@@ -1,5 +1,5 @@
 //! Generic "wrap" circuit: recursively verifies an MNT4-753 (`Fr4`-native)
-//! Groth16 proof against a fixed, compile-time-known verifying key, and
+//! GM17 proof against a fixed, compile-time-known verifying key, and
 //! re-exposes each of its `N` public inputs as its own public output —
 //! losslessly, via a fixed per-value chunking scheme, rather than relying on
 //! `BooleanInputVar`'s own capacity-based repacking (which concatenates all
@@ -20,9 +20,9 @@
 
 use ark_crypto_primitives::snark::{BooleanInputVar, SNARKGadget};
 use ark_ff::{BigInteger, Field, PrimeField};
-use ark_groth16::{
-    constraints::{Groth16VerifierGadget, ProofVar, VerifyingKeyVar},
-    Groth16, Proof, ProvingKey, VerifyingKey,
+use ark_gm17::{
+    constraints::{GM17VerifierGadget, ProofVar, VerifyingKeyVar},
+    GM17, Proof, ProvingKey, VerifyingKey,
 };
 use ark_mnt4_753::MNT4_753;
 use ark_mnt6_753::MNT6_753;
@@ -54,7 +54,7 @@ fn opt<T: Clone>(o: &Option<T>) -> Result<T, SynthesisError> {
     o.clone().ok_or(SynthesisError::AssignmentMissing)
 }
 
-/// Recursively verifies an `N`-public-input MNT4-753 Groth16 proof from a
+/// Recursively verifies an `N`-public-input MNT4-753 GM17 proof from a
 /// fixed verifying key, re-exposing each public input as `chunks_per_value()`
 /// small `Fr6` public inputs (`N * chunks_per_value()` total, in input
 /// order, each value's chunks contiguous and low-chunk-first).
@@ -86,11 +86,11 @@ impl<const N: usize> ConstraintSynthesizer<Fr6> for WrapCircuit<N> {
         }
         let input_var = BooleanInputVar::<Fr4, Fr6>::new(per_value_bits.clone());
 
-        // Recursive Groth16 verification of the inner (Fr4/MNT4-753) proof.
+        // Recursive GM17 verification of the inner (Fr4/MNT4-753) proof.
         let vk_var = VerifyingKeyVar::<MNT4_753, MNT4PairingVar>::new_constant(cs.clone(), &self.inner_vk)?;
         let proof_var = ProofVar::<MNT4_753, MNT4PairingVar>::new_witness(cs.clone(), || opt(&self.inner_proof))?;
         let pvk = vk_var.prepare()?;
-        let ok = Groth16VerifierGadget::<MNT4_753, MNT4PairingVar>::verify_with_processed_vk(
+        let ok = GM17VerifierGadget::<MNT4_753, MNT4PairingVar>::verify_with_processed_vk(
             &pvk,
             &input_var,
             &proof_var,
@@ -133,7 +133,7 @@ pub fn combine_chunks_var(chunk_bits: &[Vec<Boolean<Fr4>>]) -> Result<FpVar<Fr4>
 
 /// Host-side mirror of what `WrapCircuit<N>`'s constraints compute for the
 /// public-input pass-through — used to build the `Vec<Fr6>` public-input
-/// vector for `Groth16::<MNT6_753>::verify`.
+/// vector for `GM17::<MNT6_753>::verify`.
 pub fn public_input_chunks(values: &[Fr4]) -> Vec<Fr6> {
     let bit_len = Fr4::MODULUS_BIT_SIZE as usize;
     let mut out = Vec::new();
@@ -170,7 +170,7 @@ pub fn setup<const N: usize, R: RngCore + CryptoRng>(
         c: ark_mnt4_753::G1Affine::identity(),
     };
     let circuit = WrapCircuit::<N> { inner_vk, inner_proof: Some(dummy_proof), inner_public_inputs: None };
-    Groth16::<MNT6_753>::circuit_specific_setup(circuit, rng)
+    GM17::<MNT6_753>::circuit_specific_setup(circuit, rng)
 }
 
 pub fn prove<const N: usize, R: RngCore + CryptoRng>(
@@ -178,7 +178,7 @@ pub fn prove<const N: usize, R: RngCore + CryptoRng>(
     circuit: WrapCircuit<N>,
     rng: &mut R,
 ) -> Result<Proof<MNT6_753>, SynthesisError> {
-    Groth16::<MNT6_753>::prove(pk, circuit, rng)
+    GM17::<MNT6_753>::prove(pk, circuit, rng)
 }
 
 pub fn verify(
@@ -186,7 +186,7 @@ pub fn verify(
     public_inputs: &[Fr6],
     proof: &Proof<MNT6_753>,
 ) -> Result<bool, SynthesisError> {
-    Groth16::<MNT6_753>::verify(vk, public_inputs, proof)
+    GM17::<MNT6_753>::verify(vk, public_inputs, proof)
 }
 
 #[cfg(test)]
@@ -200,7 +200,7 @@ mod tests {
 
         // A real GenesisSpendCircuit proof (Phase 2), reproduced minimally
         // here to avoid a circular dev-dependency on circuit-spend: any
-        // valid MNT4-753 Groth16 proof exercises WrapCircuit identically,
+        // valid MNT4-753 GM17 proof exercises WrapCircuit identically,
         // since Wrap never inspects the inner circuit's shape beyond its VK
         // and public-input count.
         use ark_relations::r1cs::ConstraintSystemRef;
@@ -222,13 +222,13 @@ mod tests {
             }
         }
 
-        let (toy_pk, toy_vk) = Groth16::<MNT4_753>::circuit_specific_setup(Toy::default(), &mut rng).unwrap();
+        let (toy_pk, toy_vk) = GM17::<MNT4_753>::circuit_specific_setup(Toy::default(), &mut rng).unwrap();
         let a = Fr::from(6u64);
         let b = Fr::from(7u64);
         let c = Fr::from(42u64);
         let toy_proof =
-            Groth16::<MNT4_753>::prove(&toy_pk, Toy { a: Some(a), b: Some(b), c: Some(c) }, &mut rng).unwrap();
-        assert!(Groth16::<MNT4_753>::verify(&toy_vk, &[a, c], &toy_proof).unwrap());
+            GM17::<MNT4_753>::prove(&toy_pk, Toy { a: Some(a), b: Some(b), c: Some(c) }, &mut rng).unwrap();
+        assert!(GM17::<MNT4_753>::verify(&toy_vk, &[a, c], &toy_proof).unwrap());
 
         // Now wrap it.
         let (wrap_pk, wrap_vk) = setup::<2, _>(toy_vk, &mut rng).unwrap();

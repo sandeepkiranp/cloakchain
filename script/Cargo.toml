@@ -19,7 +19,7 @@ ark-std = { workspace = true }
 ark-serialize = { workspace = true }
 ark-ec = { workspace = true }
 ark-ff = { workspace = true }
-ark-groth16 = { workspace = true }
+ark-gm17 = { workspace = true }
 ark-mnt4-753 = { workspace = true }
 ark-mnt6-753 = { workspace = true }
 

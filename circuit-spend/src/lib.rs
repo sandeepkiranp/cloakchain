@@ -3,7 +3,7 @@
 //! recursive coin-proof verification, since genesis mints never have a
 //! parent receipt. `SpendStepCircuit` is the non-genesis variant, which does
 //! recursively verify one wrapped `ReceiptStepCircuit` proof *per active
-//! input slot* via `Groth16VerifierGadget`.
+//! input slot* via `GM17VerifierGadget`.
 //!
 //! Both support up to [`MAX_INPUTS`] input coins and [`MAX_OUTPUTS`] output
 //! coins (slot 0 of each is mandatory; the rest are optional, gated by an
@@ -31,9 +31,9 @@ use ark_crypto_primitives::sponge::{
 };
 use ark_ec::{CurveGroup, PrimeGroup};
 use ark_ff::{BigInteger, PrimeField};
-use ark_groth16::{
-    constraints::{Groth16VerifierGadget, ProofVar, VerifyingKeyVar},
-    Groth16, Proof, ProvingKey, VerifyingKey,
+use ark_gm17::{
+    constraints::{GM17VerifierGadget, ProofVar, VerifyingKeyVar},
+    GM17, Proof, ProvingKey, VerifyingKey,
 };
 use ark_mnt4_753::MNT4_753;
 use ark_mnt6_753::MNT6_753;
@@ -56,7 +56,7 @@ type MNT6PairingVar = ark_mnt6_753::constraints::PairingVar;
 /// optional — see the module doc comment for the padding scheme).
 ///
 /// Temporarily reduced to 1 (from 2) to measure/reduce spend-step proving
-/// cost — each input slot needs its own full recursive `Groth16VerifierGadget`
+/// cost — each input slot needs its own full recursive `GM17VerifierGadget`
 /// verification (~250-300K constraints), by far the dominant cost driver.
 /// Revisit raising this back to 2+ if/when multi-input spends are needed;
 /// nothing else about the padding/`is_active` design changes with `N`.
@@ -396,7 +396,7 @@ impl ConstraintSynthesizer<Fr> for GenesisSpendCircuit {
 }
 
 impl GenesisSpendCircuit {
-    /// Build the Groth16 public-input vector for this circuit's public
+    /// Build the GM17 public-input vector for this circuit's public
     /// values, in the exact order `generate_constraints` allocates them.
     pub fn public_inputs(
         pk_p: OwnerPk,
@@ -466,7 +466,7 @@ impl SpendStepCircuit {
     /// is false (see the module doc comment).
     /// Deliberately *not* the point at infinity: unlike `circuit-wrap`'s and
     /// `circuit-coinproof`'s own `setup()` dummy proofs (which only ever run
-    /// in Groth16 setup mode, where witness values are never numerically
+    /// in GM17 setup mode, where witness values are never numerically
     /// checked), this one is also used as the real witness for an *inactive*
     /// input slot during actual proving — the pairing gadget's internal
     /// (Miller-loop) arithmetic isn't guaranteed well-defined at infinity
@@ -578,7 +578,7 @@ impl ConstraintSynthesizer<Fr> for SpendStepCircuit {
             let input_var = BooleanInputVar::<Fr6, Fr>::new(per_chunk_bits.clone());
             let proof_native = self.input_receipt_proofs[i].clone().unwrap_or_else(Self::dummy_wrap_proof);
             let proof_var = ProofVar::<MNT6_753, MNT6PairingVar>::new_witness(cs.clone(), || Ok(proof_native))?;
-            let recursive_ok = Groth16VerifierGadget::<MNT6_753, MNT6PairingVar>::verify_with_processed_vk(
+            let recursive_ok = GM17VerifierGadget::<MNT6_753, MNT6PairingVar>::verify_with_processed_vk(
                 &pvk,
                 &input_var,
                 &proof_var,
@@ -615,7 +615,7 @@ impl ConstraintSynthesizer<Fr> for SpendStepCircuit {
 }
 
 impl SpendStepCircuit {
-    /// Build the Groth16 public-input vector for this circuit's public
+    /// Build the GM17 public-input vector for this circuit's public
     /// values — same layout as `GenesisSpendCircuit::public_inputs`.
     pub fn public_inputs(
         pk_p: OwnerPk,
@@ -649,7 +649,7 @@ pub fn setup_non_genesis<R: RngCore + CryptoRng>(
         input_receipt_proofs: std::array::from_fn(|_| Some(SpendStepCircuit::dummy_wrap_proof())),
         input_receipt_public_inputs: std::array::from_fn(|_| None),
     };
-    Groth16::<MNT4_753>::circuit_specific_setup(circuit, rng)
+    GM17::<MNT4_753>::circuit_specific_setup(circuit, rng)
 }
 
 pub fn prove_non_genesis<R: RngCore + CryptoRng>(
@@ -657,7 +657,7 @@ pub fn prove_non_genesis<R: RngCore + CryptoRng>(
     circuit: SpendStepCircuit,
     rng: &mut R,
 ) -> Result<Proof<MNT4_753>, SynthesisError> {
-    Groth16::<MNT4_753>::prove(pk, circuit, rng)
+    GM17::<MNT4_753>::prove(pk, circuit, rng)
 }
 
 pub fn verify_non_genesis(
@@ -665,13 +665,13 @@ pub fn verify_non_genesis(
     public_inputs: &[Fr],
     proof: &Proof<MNT4_753>,
 ) -> Result<bool, SynthesisError> {
-    Groth16::<MNT4_753>::verify(vk, public_inputs, proof)
+    GM17::<MNT4_753>::verify(vk, public_inputs, proof)
 }
 
 pub fn setup<R: RngCore + CryptoRng>(
     rng: &mut R,
 ) -> Result<(ProvingKey<MNT4_753>, VerifyingKey<MNT4_753>), SynthesisError> {
-    Groth16::<MNT4_753>::circuit_specific_setup(GenesisSpendCircuit::default(), rng)
+    GM17::<MNT4_753>::circuit_specific_setup(GenesisSpendCircuit::default(), rng)
 }
 
 pub fn prove<R: RngCore + CryptoRng>(
@@ -679,7 +679,7 @@ pub fn prove<R: RngCore + CryptoRng>(
     circuit: GenesisSpendCircuit,
     rng: &mut R,
 ) -> Result<Proof<MNT4_753>, SynthesisError> {
-    Groth16::<MNT4_753>::prove(pk, circuit, rng)
+    GM17::<MNT4_753>::prove(pk, circuit, rng)
 }
 
 pub fn verify(
@@ -687,7 +687,7 @@ pub fn verify(
     public_inputs: &[Fr],
     proof: &Proof<MNT4_753>,
 ) -> Result<bool, SynthesisError> {
-    Groth16::<MNT4_753>::verify(vk, public_inputs, proof)
+    GM17::<MNT4_753>::verify(vk, public_inputs, proof)
 }
 
 #[cfg(test)]
@@ -818,9 +818,9 @@ mod tests {
     }
 
     #[test]
-    fn full_groth16_round_trip() {
+    fn full_gm17_round_trip() {
         // `ark_std::test_rng()` is deterministic but deliberately doesn't
-        // implement `CryptoRng` (it's not a CSPRNG) — `Groth16::setup`/
+        // implement `CryptoRng` (it's not a CSPRNG) — `GM17::setup`/
         // `prove` require `CryptoRng`, so use a seeded `StdRng` instead.
         use ark_std::rand::{rngs::StdRng, SeedableRng};
         let mut rng = StdRng::seed_from_u64(42);

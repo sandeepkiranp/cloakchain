@@ -25,13 +25,13 @@
 //!
 //! ```shell
 //! RUST_LOG=info cargo run --release -- --execute   # genesis circuit's constraint check only, no proving
-//! RUST_LOG=info cargo run --release -- --prove     # full chain, nine real Groth16 proofs
+//! RUST_LOG=info cargo run --release -- --prove     # full chain, nine real GM17 proofs
 //! ```
 
 use std::time::Instant;
 
 use ark_ec::pairing::Pairing;
-use ark_groth16::{Proof, VerifyingKey};
+use ark_gm17::{Proof, VerifyingKey};
 use ark_mnt4_753::MNT4_753;
 use ark_mnt6_753::MNT6_753;
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
@@ -63,7 +63,7 @@ struct Args {
     execute: bool,
     #[arg(long)]
     prove: bool,
-    /// Ad hoc: real Groth16 setup+prove+verify at whichever MAX_INPUTS/
+    /// Ad hoc: real GM17 setup+prove+verify at whichever MAX_INPUTS/
     /// MAX_OUTPUTS shape circuit-spend/circuit-coinproof are currently
     /// compiled with — for filling in the paper's 2x2 grid cells. See
     /// `run_prove_grid_cell`'s doc comment. Not part of the normal demo.
@@ -199,7 +199,7 @@ fn wait_tracking_peak_memory(mut child: std::process::Child) -> (std::process::E
 }
 
 /// Synthesizes `circuit` on a fresh `ConstraintSystem` in the same
-/// `SynthesisMode::Setup` mode `Groth16::circuit_specific_setup` itself
+/// `SynthesisMode::Setup` mode `GM17::circuit_specific_setup` itself
 /// uses, and returns the resulting constraint count. Cheap — synthesis
 /// alone is native field arithmetic (no FFTs/pairings/proving), so this
 /// runs in a few seconds even for the ~600K-constraint spend circuit.
@@ -439,12 +439,12 @@ fn main() {
 }
 
 /// Cheap sanity check: build the genesis-mint witness and confirm it
-/// satisfies `GenesisSpendCircuit`'s constraints, with no Groth16 setup or
+/// satisfies `GenesisSpendCircuit`'s constraints, with no GM17 setup or
 /// proving. This is the only circuit in the chain that doesn't recursively
 /// verify another proof, so it's the only one a "no real proving" mode can
 /// meaningfully check in isolation — `ReceiptStepCircuit`/`SpendStepCircuit`
 /// need a genuine inner proof to exist as a witness regardless (there's no
-/// zkVM-style mock-mode equivalent for a Groth16 recursive-verification
+/// zkVM-style mock-mode equivalent for a GM17 recursive-verification
 /// gadget), so exercising them for real is what `--prove` is for.
 fn run_execute(genesis: &Party, genesis_coin: &Coin, alice_coin: &Coin) {
     println!("--execute: checking GenesisSpendCircuit's constraints only (no proving)");
@@ -474,7 +474,7 @@ fn run_execute(genesis: &Party, genesis_coin: &Coin, alice_coin: &Coin) {
     println!("  constraints: {}", cs.num_constraints());
     println!("  satisfied:   {satisfied}");
     assert!(satisfied);
-    println!("\nRun --prove for the full chain (nine real Groth16 proofs).");
+    println!("\nRun --prove for the full chain (nine real GM17 proofs).");
 }
 
 fn run_prove() {
@@ -896,7 +896,7 @@ fn run_prove() {
 
 // ---- Grid-cell diagnostic (paper results) ------------------------------------
 //
-// Ad hoc scenario for measuring *real* Groth16 proving stats (constraints,
+// Ad hoc scenario for measuring *real* GM17 proving stats (constraints,
 // prove time, verify time, proof size, subprocess-isolated peak memory) at
 // whichever (MAX_INPUTS, MAX_OUTPUTS) shape circuit-spend/circuit-coinproof
 // currently happen to be compiled with. `run_prove`'s demo chain only ever
