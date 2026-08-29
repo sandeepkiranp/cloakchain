@@ -618,4 +618,72 @@ mod test {
             cs.which_is_unsatisfied().unwrap().unwrap_or_default()
         );
     }
+
+    /// Same recursive-verification test as `gm17_snark_test`, but over the
+    /// actual MNT4-753/MNT6-753 curve cycle `mnt-native` uses (the -298
+    /// pair above is upstream's own toy test curve, not what this project
+    /// deploys) — cloakchain-specific, added on the `gm17-port` branch to
+    /// validate the 0.4->0.5 port before any circuit integration work.
+    #[test]
+    fn gm17_snark_test_mnt753() {
+        use ark_mnt4_753::{
+            constraints::PairingVar as MNT4753PairingVar, Fr as MNT4753Fr,
+            MNT4_753 as MNT4753Pairing,
+        };
+        use ark_mnt6_753::Fr as MNT6753Fr;
+
+        type TestSNARK753 = GM17<MNT4753Pairing>;
+        type TestSNARKGadget753 = GM17VerifierGadget<MNT4753Pairing, MNT4753PairingVar>;
+
+        let mut _rng = ark_std::test_rng();
+        let mut rng = rngs::StdRng::from_seed(_rng.gen());
+        let a = MNT4753Fr::rand(&mut rng);
+        let b = MNT4753Fr::rand(&mut rng);
+        let mut c = a;
+        c.mul_assign(&b);
+
+        let circ = Circuit { a: Some(a), b: Some(b), num_constraints: 100, num_variables: 25 };
+
+        let (pk, vk) = TestSNARK753::setup(circ, &mut rng).unwrap();
+        let proof = TestSNARK753::prove(&pk, circ, &mut rng).unwrap();
+        assert!(
+            TestSNARK753::verify(&vk, &vec![c], &proof).unwrap(),
+            "The native verification check fails."
+        );
+
+        let cs_sys = ConstraintSystem::<MNT6753Fr>::new();
+        let cs = ConstraintSystemRef::new(cs_sys);
+
+        let input_gadget = <TestSNARKGadget753 as SNARKGadget<
+            <MNT4753Pairing as Pairing>::ScalarField,
+            <MNT4753Pairing as Pairing>::BaseField,
+            TestSNARK753,
+        >>::InputVar::new_input(ns!(cs, "new_input"), || Ok(vec![c]))
+        .unwrap();
+        let proof_gadget = <TestSNARKGadget753 as SNARKGadget<
+            <MNT4753Pairing as Pairing>::ScalarField,
+            <MNT4753Pairing as Pairing>::BaseField,
+            TestSNARK753,
+        >>::ProofVar::new_witness(ns!(cs, "alloc_proof"), || Ok(proof))
+        .unwrap();
+        let pvk = TestSNARK753::process_vk(&vk).unwrap();
+        let pvk_gadget = <TestSNARKGadget753 as SNARKGadget<
+            <MNT4753Pairing as Pairing>::ScalarField,
+            <MNT4753Pairing as Pairing>::BaseField,
+            TestSNARK753,
+        >>::ProcessedVerifyingKeyVar::new_constant(
+            ns!(cs, "alloc_pvk"), pvk.clone()
+        )
+        .unwrap();
+        TestSNARKGadget753::verify_with_processed_vk(&pvk_gadget, &input_gadget, &proof_gadget)
+            .unwrap()
+            .enforce_equal(&Boolean::constant(true))
+            .unwrap();
+
+        assert!(
+            cs.is_satisfied().unwrap(),
+            "Constraints not satisfied: {}",
+            cs.which_is_unsatisfied().unwrap().unwrap_or_default()
+        );
+    }
 }
