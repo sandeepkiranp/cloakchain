@@ -42,7 +42,7 @@ type G1Var = ark_mnt6_753::constraints::G1Var;
 /// a crate dependency, to avoid a circuit-coinproof <-> circuit-spend
 /// cycle — both sides must keep this in sync by construction, not by the
 /// type system).
-pub const MAX_OUTPUTS: usize = 1;
+pub const MAX_OUTPUTS: usize = 2;
 
 /// The wrapped spend circuit's public-input count/order (mirrors
 /// `circuit_spend::SPEND_PUBLIC_INPUT_COUNT`
