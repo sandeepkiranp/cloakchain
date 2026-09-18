@@ -48,8 +48,8 @@ pub const MAX_OUTPUTS: usize = 2;
 /// `circuit_spend::SPEND_PUBLIC_INPUT_COUNT`
 /// /`GenesisSpendCircuit::public_inputs`): `pk.x, pk.y,
 /// output_commitments[0..MAX_OUTPUTS], board_root, nullifier_root`.
-const SPEND_PUBLIC_INPUT_COUNT: usize = 2 + MAX_OUTPUTS + 2;
-const SPEND_OUTPUT_COMMITMENTS_START: usize = 2;
+const SPEND_PUBLIC_INPUT_COUNT: usize = MAX_OUTPUTS + 2;
+const SPEND_OUTPUT_COMMITMENTS_START: usize = 0;
 
 // Gadget helpers duplicated from circuit-spend (small, self-contained;
 // keeping each circuit crate independently buildable rather than factoring
@@ -452,17 +452,17 @@ mod tests {
             own_nullifier_nonmembership: [Some(empty_tree.prove_non_membership(genesis_own_nullifier))],
         };
         let (genesis_pk_data, genesis_vk) = cloakkchain_circuit_spend::setup(&mut rng).unwrap();
-        let genesis_public_inputs: [Fr; 6] =
-            GenesisSpendCircuit::public_inputs(pk_genesis, genesis_outputs, genesis_board_root, empty_tree.root())
+        let genesis_public_inputs: [Fr; 4] =
+            GenesisSpendCircuit::public_inputs(genesis_outputs, genesis_board_root, empty_tree.root())
                 .try_into()
                 .unwrap();
         let genesis_proof = cloakkchain_circuit_spend::prove(&genesis_pk_data, genesis_circuit, &mut rng).unwrap();
 
         let (wrap_genesis_pk, wrap_genesis_vk) =
-            cloakkchain_circuit_wrap::setup::<6, _>(genesis_vk, &mut rng).unwrap();
-        let wrap_genesis_proof = cloakkchain_circuit_wrap::prove::<6, _>(
+            cloakkchain_circuit_wrap::setup::<4, _>(genesis_vk, &mut rng).unwrap();
+        let wrap_genesis_proof = cloakkchain_circuit_wrap::prove::<4, _>(
             &wrap_genesis_pk,
-            cloakkchain_circuit_wrap::WrapCircuit::<6> {
+            cloakkchain_circuit_wrap::WrapCircuit::<4> {
                 inner_vk: genesis_pk_data.vk.clone(),
                 inner_proof: Some(genesis_proof),
                 inner_public_inputs: Some(genesis_public_inputs),
@@ -564,18 +564,18 @@ mod tests {
             own_nullifier_nonmembership: [Some(empty_tree.prove_non_membership(genesis_own_nullifier))],
         };
         let (genesis_pk_data, genesis_vk) = cloakkchain_circuit_spend::setup(&mut rng).unwrap();
-        let genesis_public_inputs: [Fr; 6] =
-            GenesisSpendCircuit::public_inputs(pk_genesis, genesis_outputs, genesis_board_root, empty_tree.root())
+        let genesis_public_inputs: [Fr; 4] =
+            GenesisSpendCircuit::public_inputs(genesis_outputs, genesis_board_root, empty_tree.root())
                 .try_into()
                 .unwrap();
         let genesis_proof = cloakkchain_circuit_spend::prove(&genesis_pk_data, genesis_circuit, &mut rng).unwrap();
         assert!(cloakkchain_circuit_spend::verify(&genesis_vk, &genesis_public_inputs, &genesis_proof).unwrap());
 
         let (wrap_genesis_pk, wrap_genesis_vk) =
-            cloakkchain_circuit_wrap::setup::<6, _>(genesis_vk, &mut rng).unwrap();
-        let wrap_genesis_proof = cloakkchain_circuit_wrap::prove::<6, _>(
+            cloakkchain_circuit_wrap::setup::<4, _>(genesis_vk, &mut rng).unwrap();
+        let wrap_genesis_proof = cloakkchain_circuit_wrap::prove::<4, _>(
             &wrap_genesis_pk,
-            cloakkchain_circuit_wrap::WrapCircuit::<6> {
+            cloakkchain_circuit_wrap::WrapCircuit::<4> {
                 inner_vk: genesis_pk_data.vk.clone(),
                 inner_proof: Some(genesis_proof),
                 inner_public_inputs: Some(genesis_public_inputs),
@@ -675,7 +675,7 @@ mod tests {
         let (alice_spend_pk, alice_spend_vk) =
             cloakkchain_circuit_spend::setup_non_genesis(wrap_alice_receipt_vk, &mut rng).unwrap();
         let alice_spend_public_inputs =
-            SpendStepCircuit::public_inputs(alice_pk, alice_spend_outputs, alice_spend_board_root, tree_after_genesis.root());
+            SpendStepCircuit::public_inputs(alice_spend_outputs, alice_spend_board_root, tree_after_genesis.root());
         let alice_spend_proof =
             cloakkchain_circuit_spend::prove_non_genesis(&alice_spend_pk, alice_spend_circuit, &mut rng).unwrap();
         assert!(cloakkchain_circuit_spend::verify_non_genesis(
@@ -686,11 +686,11 @@ mod tests {
         .unwrap());
 
         let (wrap_alice_spend_pk, wrap_alice_spend_vk) =
-            cloakkchain_circuit_wrap::setup::<6, _>(alice_spend_vk, &mut rng).unwrap();
-        let alice_spend_public_inputs_arr: [Fr; 6] = alice_spend_public_inputs.clone().try_into().unwrap();
-        let wrap_alice_spend_proof = cloakkchain_circuit_wrap::prove::<6, _>(
+            cloakkchain_circuit_wrap::setup::<4, _>(alice_spend_vk, &mut rng).unwrap();
+        let alice_spend_public_inputs_arr: [Fr; 4] = alice_spend_public_inputs.clone().try_into().unwrap();
+        let wrap_alice_spend_proof = cloakkchain_circuit_wrap::prove::<4, _>(
             &wrap_alice_spend_pk,
-            cloakkchain_circuit_wrap::WrapCircuit::<6> {
+            cloakkchain_circuit_wrap::WrapCircuit::<4> {
                 inner_vk: alice_spend_pk.vk.clone(),
                 inner_proof: Some(alice_spend_proof),
                 inner_public_inputs: Some(alice_spend_public_inputs_arr),
@@ -792,7 +792,7 @@ mod tests {
         let (bob_spend_pk, bob_spend_vk) =
             cloakkchain_circuit_spend::setup_non_genesis(wrap_bob_receipt_vk, &mut rng).unwrap();
         let bob_spend_public_inputs =
-            SpendStepCircuit::public_inputs(bob_pk, bob_spend_outputs, bob_spend_board_root, tree_after_alice_spend.root());
+            SpendStepCircuit::public_inputs(bob_spend_outputs, bob_spend_board_root, tree_after_alice_spend.root());
         let bob_spend_proof =
             cloakkchain_circuit_spend::prove_non_genesis(&bob_spend_pk, bob_spend_circuit, &mut rng).unwrap();
 

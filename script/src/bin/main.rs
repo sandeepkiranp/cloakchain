@@ -48,10 +48,11 @@ use cloakkchain_lib::{
     NullifierTree, OwnerPk, OwnerScalar, Transaction, EK_SALT,
 };
 
-// 2 (pk) + MAX_OUTPUTS + 2 (board_root, nullifier_root) — computed from
+// MAX_OUTPUTS + 2 (board_root, nullifier_root) — computed from
 // circuit-spend's own MAX_OUTPUTS so this stays correct across the paper's
 // grid-cell experiments (see `run_prove_grid_cell`), which flip that const.
-const GENESIS_SPEND_PUBLIC_INPUTS: usize = 2 + MAX_OUTPUTS + 2;
+// pk_p is a private witness, not part of this vector.
+const GENESIS_SPEND_PUBLIC_INPUTS: usize = MAX_OUTPUTS + 2;
 const RECEIPT_PUBLIC_INPUTS: usize = 5;
 
 // ---- CLI args ---------------------------------------------------------------
@@ -512,7 +513,7 @@ fn run_prove() {
         own_nullifier_nonmembership: [Some(empty_tree.prove_non_membership(genesis_own_nullifier))],
     };
     let genesis_public_inputs: [Fr; GENESIS_SPEND_PUBLIC_INPUTS] =
-        GenesisSpendCircuit::public_inputs(genesis.pk_p, genesis_outputs, genesis_board_root, empty_tree.root())
+        GenesisSpendCircuit::public_inputs(genesis_outputs, genesis_board_root, empty_tree.root())
             .try_into()
             .unwrap();
 
@@ -676,7 +677,6 @@ fn run_prove() {
         input_receipt_public_inputs: [Some(alice_receipt_public_inputs)],
     };
     let alice_spend_public_inputs: [Fr; GENESIS_SPEND_PUBLIC_INPUTS] = SpendStepCircuit::public_inputs(
-        alice.pk_p,
         alice_spend_outputs,
         alice_spend_board_root,
         tree_after_genesis.root(),
@@ -852,7 +852,6 @@ fn run_prove() {
         input_receipt_public_inputs: [Some(bob_receipt_public_inputs)],
     };
     let bob_spend_public_inputs = SpendStepCircuit::public_inputs(
-        bob.pk_p,
         bob_spend_outputs,
         bob_spend_board_root,
         tree_after_alice_spend.root(),
@@ -980,7 +979,7 @@ fn run_prove_grid_cell() {
             own_nullifier_nonmembership: g_nonmembership,
         };
         let genesis_public_inputs: [Fr; GENESIS_SPEND_PUBLIC_INPUTS] =
-            GenesisSpendCircuit::public_inputs(genesis.pk_p, genesis_outputs, g_board_root, nullifier_root_before)
+            GenesisSpendCircuit::public_inputs(genesis_outputs, g_board_root, nullifier_root_before)
                 .try_into()
                 .unwrap();
 
@@ -1175,7 +1174,6 @@ fn run_prove_grid_cell() {
         input_receipt_public_inputs,
     };
     let spend_public_inputs: [Fr; GENESIS_SPEND_PUBLIC_INPUTS] = SpendStepCircuit::public_inputs(
-        alice.pk_p,
         spend_outputs,
         spend_board_root,
         nullifier_root_before_spend,

@@ -298,7 +298,16 @@ pub struct GenesisSpendCircuit {
 
 impl ConstraintSynthesizer<Fr> for GenesisSpendCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
-        // --- public inputs, in the fixed order `public_inputs` matches ---
+        // --- pk_p is a private witness, not a public input: nothing
+        // downstream ever needs to read it back out of a genesis/spend
+        // proof (the receipt circuit's provenance check only pulls
+        // `output_commitments`), and its own uses here — the ownership
+        // check against the input coin, and (for genesis specifically) the
+        // fixed-authority check — work identically whether it's public or
+        // private, since both are equality checks against values already
+        // available inside this circuit. Keeping it private is a pure
+        // privacy win (an outside observer of a standalone proof can no
+        // longer see who minted/spent) with no loss of soundness anywhere.
         let (pk_x_native, pk_y_native) = match &self.pk_p {
             Some(pk) => {
                 let (x, y) = owner_pk_to_field_pair(pk);
@@ -306,8 +315,10 @@ impl ConstraintSynthesizer<Fr> for GenesisSpendCircuit {
             }
             None => (None, None),
         };
-        let pk_p_x = Fp::new_input(cs.clone(), || opt(&pk_x_native))?;
-        let pk_p_y = Fp::new_input(cs.clone(), || opt(&pk_y_native))?;
+        let pk_p_x = Fp::new_witness(cs.clone(), || opt(&pk_x_native))?;
+        let pk_p_y = Fp::new_witness(cs.clone(), || opt(&pk_y_native))?;
+
+        // --- public inputs, in the fixed order `public_inputs` matches ---
         let output_commitments: Vec<Fp> = (0..MAX_OUTPUTS)
             .map(|i| Fp::new_input(cs.clone(), || opt(&self.output_commitments.map(|a| a[i]))))
             .collect::<Result<_, _>>()?;
@@ -399,14 +410,11 @@ impl GenesisSpendCircuit {
     /// Build the GM17 public-input vector for this circuit's public
     /// values, in the exact order `generate_constraints` allocates them.
     pub fn public_inputs(
-        pk_p: OwnerPk,
         output_commitments: [Fr; MAX_OUTPUTS],
         board_root: Fr,
         current_nullifier_root: Fr,
     ) -> Vec<Fr> {
-        let (x, y) = owner_pk_to_field_pair(&pk_p);
-        let mut out = vec![x, y];
-        out.extend_from_slice(&output_commitments);
+        let mut out = output_commitments.to_vec();
         out.push(board_root);
         out.push(current_nullifier_root);
         out
@@ -414,9 +422,10 @@ impl GenesisSpendCircuit {
 }
 
 /// Total public-input count for [`GenesisSpendCircuit`]/[`SpendStepCircuit`]
-/// (both share the same layout) — `2 (pk) + MAX_OUTPUTS + 2 (board_root,
-/// nullifier_root)`.
-pub const SPEND_PUBLIC_INPUT_COUNT: usize = 2 + MAX_OUTPUTS + 2;
+/// (both share the same layout) — `MAX_OUTPUTS + 2 (board_root,
+/// nullifier_root)`. `pk_p` is a private witness, not part of this vector —
+/// see the `pk_p` allocation in each circuit's `generate_constraints` for why.
+pub const SPEND_PUBLIC_INPUT_COUNT: usize = MAX_OUTPUTS + 2;
 
 /// The non-genesis variant of the spend relation (`check_spend` with
 /// `is_genesis = false`): everything `GenesisSpendCircuit` checks, minus the
@@ -484,7 +493,8 @@ impl SpendStepCircuit {
 
 impl ConstraintSynthesizer<Fr> for SpendStepCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
-        // --- public inputs ---
+        // --- pk_p is a private witness — see GenesisSpendCircuit's matching
+        // comment for why nothing is lost by not publishing it.
         let (pk_x_native, pk_y_native) = match &self.pk_p {
             Some(pk) => {
                 let (x, y) = owner_pk_to_field_pair(pk);
@@ -492,8 +502,10 @@ impl ConstraintSynthesizer<Fr> for SpendStepCircuit {
             }
             None => (None, None),
         };
-        let pk_p_x = Fp::new_input(cs.clone(), || opt(&pk_x_native))?;
-        let pk_p_y = Fp::new_input(cs.clone(), || opt(&pk_y_native))?;
+        let pk_p_x = Fp::new_witness(cs.clone(), || opt(&pk_x_native))?;
+        let pk_p_y = Fp::new_witness(cs.clone(), || opt(&pk_y_native))?;
+
+        // --- public inputs ---
         let output_commitments: Vec<Fp> = (0..MAX_OUTPUTS)
             .map(|i| Fp::new_input(cs.clone(), || opt(&self.output_commitments.map(|a| a[i]))))
             .collect::<Result<_, _>>()?;
@@ -618,12 +630,11 @@ impl SpendStepCircuit {
     /// Build the GM17 public-input vector for this circuit's public
     /// values — same layout as `GenesisSpendCircuit::public_inputs`.
     pub fn public_inputs(
-        pk_p: OwnerPk,
         output_commitments: [Fr; MAX_OUTPUTS],
         board_root: Fr,
         current_nullifier_root: Fr,
     ) -> Vec<Fr> {
-        GenesisSpendCircuit::public_inputs(pk_p, output_commitments, board_root, current_nullifier_root)
+        GenesisSpendCircuit::public_inputs(output_commitments, board_root, current_nullifier_root)
     }
 }
 
@@ -828,7 +839,6 @@ mod tests {
 
         let c = valid_circuit();
         let public_inputs = GenesisSpendCircuit::public_inputs(
-            c.pk_p.unwrap(),
             c.output_commitments.unwrap(),
             c.board_root.unwrap(),
             c.current_nullifier_root.unwrap(),
