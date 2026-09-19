@@ -137,20 +137,18 @@ fn is_member(target: &Fp, list: &[Fp]) -> Result<Boolean<Fr>, SynthesisError> {
     Ok(any)
 }
 
-/// Public values, in this order: `owner_pk.x, owner_pk.y, coin_commitment,
-/// board_root, received_at`.
+/// Public values, in this order: `coin_commitment, board_root, received_at`.
 ///
-/// `owner_pk` is not a free claim: the circuit derives it in-circuit from a
-/// witnessed `sk_p` and requires the witnessed coin opening (`coin_value`/
-/// `coin_rand` plus that same `owner_pk`) to actually hash to the public
-/// `coin_commitment`. So building a valid receipt requires genuinely
-/// knowing how to open the coin, not just naming a commitment that happens
-/// to be on the board.
+/// `owner_pk` is derived in-circuit from a witnessed `sk_p` (never a public
+/// input itself — nothing downstream needs to read it back out, see the
+/// `sk_p` derivation in `generate_constraints`), and the witnessed coin
+/// opening (`coin_value`/`coin_rand` plus that derived `owner_pk`) must
+/// genuinely hash to the public `coin_commitment`. So building a valid
+/// receipt requires genuinely knowing how to open the coin, not just
+/// naming a commitment that happens to be on the board.
 #[derive(Clone, CanonicalSerialize, CanonicalDeserialize)]
 pub struct ReceiptStepCircuit {
     // Public values.
-    pub owner_pk_x: Option<Fr>,
-    pub owner_pk_y: Option<Fr>,
     pub coin_commitment: Option<Fr>,
     pub board_root: Option<Fr>,
     pub received_at: Option<u64>,
@@ -188,20 +186,14 @@ pub struct ReceiptStepCircuit {
 
 impl ConstraintSynthesizer<Fr> for ReceiptStepCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
-        // --- public inputs ---
-        let owner_pk_x = Fp::new_input(cs.clone(), || opt(&self.owner_pk_x))?;
-        let owner_pk_y = Fp::new_input(cs.clone(), || opt(&self.owner_pk_y))?;
-        let coin_commitment = Fp::new_input(cs.clone(), || opt(&self.coin_commitment))?;
-        let board_root = Fp::new_input(cs.clone(), || opt(&self.board_root))?;
-        let received_at = Fp::new_input(cs.clone(), || opt(&self.received_at.map(Fr::from)))?;
-
-        // --- ownership + opening: owner_pk must genuinely be derived from
-        // sk_p, and (owner_pk, tag, value, rand) must genuinely hash to the
-        // public coin_commitment — the receipt-builder must actually be able
-        // to open the coin they're claiming, not just assert a commitment
-        // value that happens to be on the board. Mirrors the same
-        // scalar-mult + canonicity pattern `GenesisSpendCircuit`/
-        // `SpendStepCircuit` use for their own `pk_p`.
+        // --- owner_pk is a private witness, not a public input: nothing
+        // downstream needs to read it back out separately, since
+        // SpendStepCircuit's binding check only needs coin_commitment to
+        // match (see its own comment) — by Poseidon's collision resistance,
+        // matching the full commitment already forces every ingredient
+        // that went into it (including owner_pk) to match too, so a
+        // separately-exposed owner_pk added no soundness this didn't
+        // already provide.
         let sk_bit_values: Option<Vec<bool>> = self.sk_p.map(|sk| sk.into_bigint().to_bits_le());
         let sk_bit_len = OwnerScalar::MODULUS_BIT_SIZE as usize;
         let sk_bits: Vec<Boolean<Fr>> = (0..sk_bit_len)
@@ -211,16 +203,27 @@ impl ConstraintSynthesizer<Fr> for ReceiptStepCircuit {
         modulus_minus_one[0] -= 1; // odd prime modulus, so this can't borrow
         Boolean::enforce_smaller_or_equal_than_le(&sk_bits, modulus_minus_one)?;
 
+        // owner_pk is derived here and used below, but never allocated as a
+        // public input — see the comment above.
         let generator = G1Var::new_constant(cs.clone(), ark_mnt6_753::G1Projective::generator())?;
         let pk_p_computed = generator.scalar_mul_le(sk_bits.iter())?.to_affine()?;
-        pk_p_computed.x.enforce_equal(&owner_pk_x)?;
-        pk_p_computed.y.enforce_equal(&owner_pk_y)?;
+        let owner_pk_x = pk_p_computed.x;
+        let owner_pk_y = pk_p_computed.y;
 
+        // --- public inputs ---
+        let coin_commitment = Fp::new_input(cs.clone(), || opt(&self.coin_commitment))?;
+        let board_root = Fp::new_input(cs.clone(), || opt(&self.board_root))?;
+        let received_at = Fp::new_input(cs.clone(), || opt(&self.received_at.map(Fr::from)))?;
+
+        // --- opening: (owner_pk, value, rand) must genuinely hash to the
+        // public coin_commitment — the receipt-builder must actually be
+        // able to open the coin they're claiming, not just assert a
+        // commitment value that happens to be on the board.
         let coin_value = UInt64::new_witness(cs.clone(), || opt(&self.coin_value))?;
         let coin_rand = Fp::new_witness(cs.clone(), || opt(&self.coin_rand))?;
         let coin_commitment_computed = poseidon_hash_var(
             cs.clone(),
-            &[coin_value.to_fp()?, coin_rand, owner_pk_x, owner_pk_y],
+            &[coin_value.to_fp()?, coin_rand, owner_pk_x.clone(), owner_pk_y.clone()],
         )?;
         coin_commitment_computed.enforce_equal(&coin_commitment)?;
 
@@ -327,14 +330,8 @@ impl ConstraintSynthesizer<Fr> for ReceiptStepCircuit {
 }
 
 impl ReceiptStepCircuit {
-    pub fn public_inputs(
-        owner_pk_x: Fr,
-        owner_pk_y: Fr,
-        coin_commitment: Fr,
-        board_root: Fr,
-        received_at: u64,
-    ) -> Vec<Fr> {
-        vec![owner_pk_x, owner_pk_y, coin_commitment, board_root, Fr::from(received_at)]
+    pub fn public_inputs(coin_commitment: Fr, board_root: Fr, received_at: u64) -> Vec<Fr> {
+        vec![coin_commitment, board_root, Fr::from(received_at)]
     }
 }
 
@@ -351,8 +348,6 @@ pub fn setup<R: RngCore + CryptoRng>(
         c: ark_mnt6_753::G1Affine::identity(),
     };
     let circuit = ReceiptStepCircuit {
-        owner_pk_x: None,
-        owner_pk_y: None,
         coin_commitment: None,
         board_root: None,
         received_at: None,
@@ -484,11 +479,8 @@ mod tests {
             genesis_slot as usize,
             &genesis_append_path,
         );
-        let (apx, apy) = cloakkchain_lib::owner_pk_to_field_pair(&alice_pk);
 
         let base_circuit = ReceiptStepCircuit {
-            owner_pk_x: Some(apx),
-            owner_pk_y: Some(apy),
             coin_commitment: Some(alice_commitment),
             board_root: Some(alice_receipt_board_root),
             received_at: Some(genesis_slot),
@@ -598,10 +590,7 @@ mod tests {
             genesis_slot as usize,
             &genesis_append_path,
         );
-        let (apx, apy) = cloakkchain_lib::owner_pk_to_field_pair(&alice_pk);
         let alice_receipt_circuit = ReceiptStepCircuit {
-            owner_pk_x: Some(apx),
-            owner_pk_y: Some(apy),
             coin_commitment: Some(alice_commitment),
             board_root: Some(alice_receipt_board_root),
             received_at: Some(genesis_slot),
@@ -620,18 +609,18 @@ mod tests {
             coin_rand: Some(alice_coin.rand),
         };
         let (alice_receipt_pk, alice_receipt_vk) = setup(wrap_genesis_vk, &mut rng).unwrap();
-        let alice_receipt_public_inputs: [Fr; 5] =
-            ReceiptStepCircuit::public_inputs(apx, apy, alice_commitment, alice_receipt_board_root, genesis_slot)
+        let alice_receipt_public_inputs: [Fr; 3] =
+            ReceiptStepCircuit::public_inputs(alice_commitment, alice_receipt_board_root, genesis_slot)
                 .try_into()
                 .unwrap();
         let alice_receipt_proof = prove(&alice_receipt_pk, alice_receipt_circuit, &mut rng).unwrap();
         assert!(verify(&alice_receipt_vk, &alice_receipt_public_inputs, &alice_receipt_proof).unwrap());
 
         let (wrap_alice_receipt_pk, wrap_alice_receipt_vk) =
-            cloakkchain_circuit_wrap::setup::<5, _>(alice_receipt_vk, &mut rng).unwrap();
-        let wrap_alice_receipt_proof = cloakkchain_circuit_wrap::prove::<5, _>(
+            cloakkchain_circuit_wrap::setup::<3, _>(alice_receipt_vk, &mut rng).unwrap();
+        let wrap_alice_receipt_proof = cloakkchain_circuit_wrap::prove::<3, _>(
             &wrap_alice_receipt_pk,
-            cloakkchain_circuit_wrap::WrapCircuit::<5> {
+            cloakkchain_circuit_wrap::WrapCircuit::<3> {
                 inner_vk: alice_receipt_pk.vk.clone(),
                 inner_proof: Some(alice_receipt_proof),
                 inner_public_inputs: Some(alice_receipt_public_inputs),
@@ -716,10 +705,7 @@ mod tests {
             alice_spend_slot as usize,
             &alice_spend_append_path,
         );
-        let (bpx, bpy) = cloakkchain_lib::owner_pk_to_field_pair(&bob_pk);
         let bob_receipt_circuit = ReceiptStepCircuit {
-            owner_pk_x: Some(bpx),
-            owner_pk_y: Some(bpy),
             coin_commitment: Some(bob_commitment),
             board_root: Some(bob_receipt_board_root),
             received_at: Some(alice_spend_slot),
@@ -738,18 +724,18 @@ mod tests {
             coin_rand: Some(bob_coin.rand),
         };
         let (bob_receipt_pk, bob_receipt_vk) = setup(wrap_alice_spend_vk, &mut rng).unwrap();
-        let bob_receipt_public_inputs: [Fr; 5] =
-            ReceiptStepCircuit::public_inputs(bpx, bpy, bob_commitment, bob_receipt_board_root, alice_spend_slot)
+        let bob_receipt_public_inputs: [Fr; 3] =
+            ReceiptStepCircuit::public_inputs(bob_commitment, bob_receipt_board_root, alice_spend_slot)
                 .try_into()
                 .unwrap();
         let bob_receipt_proof = prove(&bob_receipt_pk, bob_receipt_circuit, &mut rng).unwrap();
         assert!(verify(&bob_receipt_vk, &bob_receipt_public_inputs, &bob_receipt_proof).unwrap());
 
         let (wrap_bob_receipt_pk, wrap_bob_receipt_vk) =
-            cloakkchain_circuit_wrap::setup::<5, _>(bob_receipt_vk, &mut rng).unwrap();
-        let wrap_bob_receipt_proof = cloakkchain_circuit_wrap::prove::<5, _>(
+            cloakkchain_circuit_wrap::setup::<3, _>(bob_receipt_vk, &mut rng).unwrap();
+        let wrap_bob_receipt_proof = cloakkchain_circuit_wrap::prove::<3, _>(
             &wrap_bob_receipt_pk,
-            cloakkchain_circuit_wrap::WrapCircuit::<5> {
+            cloakkchain_circuit_wrap::WrapCircuit::<3> {
                 inner_vk: bob_receipt_pk.vk.clone(),
                 inner_proof: Some(bob_receipt_proof),
                 inner_public_inputs: Some(bob_receipt_public_inputs),

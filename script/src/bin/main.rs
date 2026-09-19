@@ -44,7 +44,7 @@ use cloakkchain_circuit_wrap::WrapCircuit;
 use cloakkchain_lib::{
     append_path_for_next, compute_root_from_path, derive_enc_pk, derive_owner_pk,
     entry_ciphertext_commitment, fold_owner_scalar, genesis_pk, genesis_sk, merkle_leaf,
-    owner_pk_to_field_pair, poseidon_hash, scan_entry, BoardEntry, Coin, Fr, NonMembershipWitness,
+    poseidon_hash, scan_entry, BoardEntry, Coin, Fr, NonMembershipWitness,
     NullifierTree, OwnerPk, OwnerScalar, Transaction, EK_SALT,
 };
 
@@ -53,7 +53,7 @@ use cloakkchain_lib::{
 // grid-cell experiments (see `run_prove_grid_cell`), which flip that const.
 // pk_p is a private witness, not part of this vector.
 const GENESIS_SPEND_PUBLIC_INPUTS: usize = MAX_OUTPUTS + 2;
-const RECEIPT_PUBLIC_INPUTS: usize = 5;
+const RECEIPT_PUBLIC_INPUTS: usize = 3;
 
 // ---- CLI args ---------------------------------------------------------------
 
@@ -577,11 +577,8 @@ fn run_prove() {
 
     let alice_receipt_board_root =
         compute_root_from_path(merkle_leaf(0, &genesis_entry), 0, &genesis_append_path);
-    let (apx, apy) = owner_pk_to_field_pair(&alice.pk_p);
 
     let alice_receipt_circuit = ReceiptStepCircuit {
-        owner_pk_x: Some(apx),
-        owner_pk_y: Some(apy),
         coin_commitment: Some(alice_coin.commitment()),
         board_root: Some(alice_receipt_board_root),
         received_at: Some(0),
@@ -600,7 +597,7 @@ fn run_prove() {
         coin_rand: Some(alice_coin.rand),
     };
     let alice_receipt_public_inputs: [Fr; RECEIPT_PUBLIC_INPUTS] =
-        ReceiptStepCircuit::public_inputs(apx, apy, alice_coin.commitment(), alice_receipt_board_root, 0)
+        ReceiptStepCircuit::public_inputs(alice_coin.commitment(), alice_receipt_board_root, 0)
             .try_into()
             .unwrap();
 
@@ -753,11 +750,8 @@ fn run_prove() {
 
     let bob_receipt_board_root =
         compute_root_from_path(merkle_leaf(1, &alice_entry), 1, &alice_spend_append_path);
-    let (bpx, bpy) = owner_pk_to_field_pair(&bob.pk_p);
 
     let bob_receipt_circuit = ReceiptStepCircuit {
-        owner_pk_x: Some(bpx),
-        owner_pk_y: Some(bpy),
         coin_commitment: Some(bob_coin.commitment()),
         board_root: Some(bob_receipt_board_root),
         received_at: Some(1),
@@ -776,7 +770,7 @@ fn run_prove() {
         coin_rand: Some(bob_coin.rand),
     };
     let bob_receipt_public_inputs: [Fr; RECEIPT_PUBLIC_INPUTS] =
-        ReceiptStepCircuit::public_inputs(bpx, bpy, bob_coin.commitment(), bob_receipt_board_root, 1)
+        ReceiptStepCircuit::public_inputs(bob_coin.commitment(), bob_receipt_board_root, 1)
             .try_into()
             .unwrap();
 
@@ -1041,10 +1035,7 @@ fn run_prove_grid_cell() {
         // --- Alice's receipt for this coin ---
         let receipt_board_root =
             compute_root_from_path(merkle_leaf(entry_position, &entry), entry_position, &g_append_path);
-        let (apx, apy) = owner_pk_to_field_pair(&alice.pk_p);
         let receipt_circuit = ReceiptStepCircuit {
-            owner_pk_x: Some(apx),
-            owner_pk_y: Some(apy),
             coin_commitment: Some(alice_coin.commitment()),
             board_root: Some(receipt_board_root),
             received_at: Some(entry_position as u64),
@@ -1063,8 +1054,6 @@ fn run_prove_grid_cell() {
             coin_rand: Some(alice_coin.rand),
         };
         let receipt_public_inputs: [Fr; RECEIPT_PUBLIC_INPUTS] = ReceiptStepCircuit::public_inputs(
-            apx,
-            apy,
             alice_coin.commitment(),
             receipt_board_root,
             entry_position as u64,

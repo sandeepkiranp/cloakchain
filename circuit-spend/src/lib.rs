@@ -69,10 +69,8 @@ pub const MAX_OUTPUTS: usize = 2;
 /// plain constant rather than a crate dependency, to avoid a
 /// circuit-spend <-> circuit-coinproof cycle — both sides must keep this in
 /// sync by construction, not by the type system).
-const RECEIPT_PUBLIC_INPUT_COUNT: usize = 5;
-const RECEIPT_OWNER_PK_X: usize = 0;
-const RECEIPT_OWNER_PK_Y: usize = 1;
-const RECEIPT_COIN_COMMITMENT: usize = 2;
+const RECEIPT_PUBLIC_INPUT_COUNT: usize = 3;
+const RECEIPT_COIN_COMMITMENT: usize = 0;
 
 // ---- gadget helpers (mirror cloakkchain_lib's native functions exactly) --
 
@@ -598,11 +596,18 @@ impl ConstraintSynthesizer<Fr> for SpendStepCircuit {
             gate(recursive_ok, &input_active[i]).enforce_equal(&Boolean::TRUE)?;
 
             let group = |idx: usize| -> &[Vec<Boolean<Fr>>] { &per_chunk_bits[idx * cpv..(idx + 1) * cpv] };
-            let receipt_owner_pk_x = combine_chunks_var(group(RECEIPT_OWNER_PK_X))?;
-            let receipt_owner_pk_y = combine_chunks_var(group(RECEIPT_OWNER_PK_Y))?;
+            // Binding: the receipt's committed coin_commitment must match
+            // this input's own recomputed commitment. This alone is
+            // sufficient — no separate owner_pk comparison needed. By
+            // Poseidon's collision resistance, `commitment` (computed from
+            // this witnessed coin, whose owner_pk is already forced equal
+            // to pk_p by owner_ok above) can only equal the receipt's real
+            // coin_commitment if every ingredient that produced it matches
+            // too, including owner_pk — so matching the full commitment
+            // already implies the same owner, without owner_pk ever
+            // needing to be a receipt public input at all.
             let receipt_coin_commitment = combine_chunks_var(group(RECEIPT_COIN_COMMITMENT))?;
-            let binding_ok = &(&receipt_owner_pk_x.is_eq(&pk_p_x)? & &receipt_owner_pk_y.is_eq(&pk_p_y)?)
-                & &receipt_coin_commitment.is_eq(&commitment)?;
+            let binding_ok = receipt_coin_commitment.is_eq(&commitment)?;
             gate(binding_ok, &input_active[i]).enforce_equal(&Boolean::TRUE)?;
 
             total_in += coin.value_or_zero(&input_active[i])?;
