@@ -11,7 +11,6 @@ path = "src/bin/main.rs"
 [dependencies]
 cloakkchain-lib = { path = "../lib" }
 cloakkchain-circuit-spend = { path = "../circuit-spend" }
-cloakkchain-circuit-coinproof = { path = "../circuit-coinproof" }
 cloakkchain-circuit-wrap = { path = "../circuit-wrap" }
 
 ark-relations = { workspace = true }

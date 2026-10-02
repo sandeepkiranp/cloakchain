@@ -470,26 +470,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "cloakkchain-circuit-coinproof"
-version = "0.1.0"
-dependencies = [
- "ark-crypto-primitives",
- "ark-ec",
- "ark-ff",
- "ark-gm17",
- "ark-mnt4-753",
- "ark-mnt6-753",
- "ark-r1cs-std",
- "ark-relations",
- "ark-serialize",
- "ark-snark",
- "ark-std",
- "cloakkchain-circuit-spend",
- "cloakkchain-circuit-wrap",
- "cloakkchain-lib",
-]
-
-[[package]]
 name = "cloakkchain-circuit-spend"
 version = "0.1.0"
 dependencies = [
@@ -558,7 +538,6 @@ dependencies = [
  "ark-std",
  "bincode",
  "clap",
- "cloakkchain-circuit-coinproof",
  "cloakkchain-circuit-spend",
  "cloakkchain-circuit-wrap",
  "cloakkchain-lib",

@@ -324,6 +324,21 @@ pub struct BoardEntry {
     /// `tx.output_commitments` — public, see the struct doc comment above.
     #[serde(with = "field_serde")]
     pub output_commitments: Vec<Fr>,
+    /// The board root as it stood immediately before this entry was posted —
+    /// i.e. exactly this entry's own spend proof's public `board_root`
+    /// value, carried forward into the leaf. Embedding it here (rather than
+    /// letting a later proof witness it unchecked) is what lets a spend
+    /// prove, against its own real and publicly-checkable root, that the
+    /// entry it claims funded it was genuinely preceded by the state it
+    /// claims — see `merkle_leaf_from_commitment`.
+    #[serde(with = "field_serde")]
+    pub prev_board_root: Fr,
+    /// The nullifier-accumulator root as it stood immediately before this
+    /// entry was posted — this entry's own spend proof's public
+    /// `current_nullifier_root` value. Same role as `prev_board_root`, for
+    /// the nullifier accumulator.
+    #[serde(with = "field_serde")]
+    pub prev_nullifier_root: Fr,
 }
 
 /// Encrypt `tx` for the given `recipient_pks` (X25519 encryption keys — a
@@ -336,6 +351,8 @@ pub fn encrypt_tx(
     sender_sk: &OwnerScalar,
     recipient_pks: &[[u8; 32]],
     session_key: [u8; 32],
+    prev_board_root: Fr,
+    prev_nullifier_root: Fr,
 ) -> BoardEntry {
     // Derive the ephemeral key from the session key (deterministic).
     let ek_sk = ek_secret(&session_key);
@@ -372,6 +389,8 @@ pub fn encrypt_tx(
         key_encs,
         nullifier,
         output_commitments: tx.output_commitments.clone(),
+        prev_board_root,
+        prev_nullifier_root,
     }
 }
 
@@ -477,10 +496,23 @@ pub fn decrypt_note(session_key: &[u8; 32], index: usize, note_enc: &[u8]) -> Op
 pub const TREE_DEPTH: usize = 32;
 
 /// Leaf hash = Poseidon(slot, fold(ciphertext), fold(ek_pk), fold(key_encs),
-/// nullifier, Poseidon(output_commitments)). Including the slot index
-/// prevents permuting entries while keeping a valid root.
+/// nullifier, Poseidon(output_commitments), prev_board_root,
+/// prev_nullifier_root). Including the slot index prevents permuting entries
+/// while keeping a valid root. Including `prev_board_root`/
+/// `prev_nullifier_root` — the state as it stood immediately before this
+/// entry — is what lets a later spend prove, against its own real root, that
+/// an entry it's spending from was genuinely preceded by the state it
+/// claims, rather than a self-chosen one: see `circuit-spend`'s binding
+/// check against a recursively-verified parent proof's own public roots.
 pub fn merkle_leaf(slot: usize, entry: &BoardEntry) -> Fr {
-    merkle_leaf_from_commitment(slot, entry.nullifier, &entry.output_commitments, entry_ciphertext_commitment(entry))
+    merkle_leaf_from_commitment(
+        slot,
+        entry.nullifier,
+        &entry.output_commitments,
+        entry_ciphertext_commitment(entry),
+        entry.prev_board_root,
+        entry.prev_nullifier_root,
+    )
 }
 
 /// Fold a board entry's off-circuit-only fields (`ciphertext`, `ek_pk`,
@@ -508,12 +540,16 @@ pub fn merkle_leaf_from_commitment(
     nullifier: Fr,
     output_commitments: &[Fr],
     ciphertext_commitment: Fr,
+    prev_board_root: Fr,
+    prev_nullifier_root: Fr,
 ) -> Fr {
     poseidon_hash(&[
         Fr::from(slot as u64),
         ciphertext_commitment,
         nullifier,
         poseidon_hash(output_commitments),
+        prev_board_root,
+        prev_nullifier_root,
     ])
 }
 
@@ -1142,6 +1178,11 @@ mod tests {
         (tx, session_key, recipient_enc_pks)
     }
 
+    // This legacy test module exercises the pre-GM17 `check_spend`/
+    // `check_coin_receipt` reference functions, not `circuit-spend`'s
+    // `SpendStepCircuit` (where the prev-root binding fix actually lives) —
+    // so `enc` just threads placeholder empty roots through `BoardEntry`'s
+    // two new fields rather than tracking real ones end to end.
     fn enc(
         tx: &Transaction,
         input_commitment: Fr,
@@ -1149,7 +1190,10 @@ mod tests {
         recipient_enc_pks: &[[u8; 32]],
         session_key: [u8; 32],
     ) -> BoardEntry {
-        encrypt_tx(tx, input_commitment, sender_sk, recipient_enc_pks, session_key)
+        encrypt_tx(
+            tx, input_commitment, sender_sk, recipient_enc_pks, session_key,
+            empty_root(), NullifierTree::new().root(),
+        )
     }
 
     /// Build a coin's one-shot receipt: `entries[received_slot]` must be the

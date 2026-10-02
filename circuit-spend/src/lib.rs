@@ -64,13 +64,13 @@ pub const MAX_INPUTS: usize = 1;
 /// Up to this many real output coins per spend.
 pub const MAX_OUTPUTS: usize = 2;
 
-/// `ReceiptStepCircuit`'s public-input count/order (mirrors
-/// `circuit_coinproof::ReceiptStepCircuit::public_inputs`, duplicated as a
-/// plain constant rather than a crate dependency, to avoid a
-/// circuit-spend <-> circuit-coinproof cycle — both sides must keep this in
-/// sync by construction, not by the type system).
-const RECEIPT_PUBLIC_INPUT_COUNT: usize = 3;
-const RECEIPT_COIN_COMMITMENT: usize = 0;
+/// Index, within a recursively-verified parent spend proof's public-input
+/// chunk groups, of each value — mirrors `GenesisSpendCircuit::public_inputs`'/
+/// `SpendStepCircuit::public_inputs`'s own fixed order:
+/// `output_commitments[0..MAX_OUTPUTS], board_root, current_nullifier_root`.
+const PARENT_OUTPUT_COMMITMENTS_START: usize = 0;
+const PARENT_BOARD_ROOT: usize = MAX_OUTPUTS;
+const PARENT_NULLIFIER_ROOT: usize = MAX_OUTPUTS + 1;
 
 // ---- gadget helpers (mirror cloakkchain_lib's native functions exactly) --
 
@@ -244,6 +244,17 @@ fn alloc_fp_vec(cs: ConstraintSystemRef<Fr>, values: &Option<Vec<Fr>>, len: usiz
     (0..len)
         .map(|i| Fp::new_witness(cs.clone(), || opt(&values.as_ref().map(|v| v[i]))))
         .collect()
+}
+
+/// `target` is a member of `list` — an OR of per-slot equality checks. Used
+/// to identify which of an origin entry's (up to `MAX_OUTPUTS`) output
+/// commitments is this input coin's own commitment.
+fn is_member(target: &Fp, list: &[Fp]) -> Result<Boolean<Fr>, SynthesisError> {
+    let mut any = Boolean::FALSE;
+    for item in list {
+        any = &any | &target.is_eq(item)?;
+    }
+    Ok(any)
 }
 
 /// `active[0]` is always `Boolean::TRUE` (every spend has at least one input
@@ -426,19 +437,32 @@ impl GenesisSpendCircuit {
 pub const SPEND_PUBLIC_INPUT_COUNT: usize = MAX_OUTPUTS + 2;
 
 /// The non-genesis variant of the spend relation (`check_spend` with
-/// `is_genesis = false`): everything `GenesisSpendCircuit` checks, minus the
-/// fixed-genesis-key constraint, plus a recursive verification of one
-/// wrapped parent coin-receipt proof (`circuit_coinproof::ReceiptStepCircuit`,
-/// wrapped via `circuit-wrap`) *per active input slot* — mirrors (and
-/// generalizes, see the module doc comment) `check_spend`'s
-/// `coin_proof.owner_pk == pk_p` / `coin_proof.coin_commitment ==
-/// coin_commitment` checks, except the receipt's claims are now backed by
-/// an actual verified proof rather than a plain witness.
+/// `is_genesis = false`): everything `GenesisSpendCircuit` checks, plus, per
+/// active input slot:
 ///
-/// Currently fixed to recursively verify wrapped `ReceiptStepCircuit`
-/// proofs from one specific deployment (all active input slots share the
-/// same `wrap_vk` — mixing receipt "generations" within one spend isn't
-/// supported) — see `circuit_coinproof`'s module doc comment for why.
+/// - a Merkle inclusion proof that the board entry which created this input
+///   coin (the "origin entry") is genuinely included in the tree at THIS
+///   spend's own, real, public `board_root` — not a self-chosen root (see
+///   the module doc comment's board_root/nullifier_root discussion);
+/// - a recursive verification of the parent spend proof that created this
+///   input coin, directly (`GenesisSpendCircuit`/`SpendStepCircuit`, wrapped
+///   via `circuit-wrap` — no separate receipt-proof layer);
+/// - a binding check bridging the two: the roots embedded in the origin
+///   entry's leaf (as they stood immediately before it was posted), and its
+///   output commitments, must equal the parent proof's own recursively
+///   verified public `board_root`/`current_nullifier_root`/
+///   `output_commitments`. Since the inclusion check ties the origin leaf to
+///   the real, checkable `board_root`, and the binding check reuses that
+///   same leaf data against the parent's own public claims, a fabricated
+///   origin can't be laundered one hop and then dropped — it forces the next
+///   hop's own public `board_root` to be fake too, visible to whoever
+///   receives it.
+///
+/// Currently fixed to recursively verify wrapped parent-spend proofs from
+/// one specific deployment (all active input slots share the same
+/// `wrap_vk` — mixing parents of different "generations"/shapes within one
+/// spend isn't supported; this is the same deferred arbitrary-depth
+/// VK-selection limitation as before, just relocated here).
 #[derive(Clone, CanonicalSerialize, CanonicalDeserialize)]
 pub struct SpendStepCircuit {
     // Public values (same layout as `GenesisSpendCircuit`).
@@ -456,15 +480,27 @@ pub struct SpendStepCircuit {
     pub append_path: Option<Vec<Fr>>,
     pub own_nullifier_nonmembership: [Option<NonMembershipWitness>; MAX_INPUTS],
 
-    // Private witnesses: one wrapped parent coin-receipt proof per active
-    // input slot (a Wrap<5> proof over `ReceiptStepCircuit`'s public inputs).
+    // Private witnesses: one wrapped parent spend proof per active input
+    // slot — the proof that created this input coin (a
+    // Wrap<SPEND_PUBLIC_INPUT_COUNT> proof over `GenesisSpendCircuit`'s/
+    // `SpendStepCircuit`'s own public layout).
     /// Fixed per deployment — not `Option`, a verifying key isn't secret.
     pub wrap_vk: VerifyingKey<MNT6_753>,
     /// `None` for a padding slot (still needs *a* structurally-valid dummy
-    /// proof — see `circuit-wrap::setup`'s doc comment for why — supplied
-    /// automatically by [`SpendStepCircuit::pad_input`]).
-    pub input_receipt_proofs: [Option<Proof<MNT6_753>>; MAX_INPUTS],
-    pub input_receipt_public_inputs: [Option<[Fr; RECEIPT_PUBLIC_INPUT_COUNT]>; MAX_INPUTS],
+    /// proof — see `circuit-wrap::setup`'s doc comment for why).
+    pub input_parent_proofs: [Option<Proof<MNT6_753>>; MAX_INPUTS],
+    pub input_parent_public_inputs: [Option<[Fr; SPEND_PUBLIC_INPUT_COUNT]>; MAX_INPUTS],
+
+    // Private witnesses: the origin entry (the board entry that created this
+    // input coin) and the roots that stood immediately before it — see the
+    // struct doc comment. `origin_append_path[i]` has length `TREE_DEPTH`.
+    pub origin_received_slot: [Option<u64>; MAX_INPUTS],
+    pub origin_entry_nullifier: [Option<Fr>; MAX_INPUTS],
+    pub origin_entry_output_commitments: [Option<[Fr; MAX_OUTPUTS]>; MAX_INPUTS],
+    pub origin_entry_ciphertext_commitment: [Option<Fr>; MAX_INPUTS],
+    pub origin_append_path: [Option<Vec<Fr>>; MAX_INPUTS],
+    pub origin_prev_board_root: [Option<Fr>; MAX_INPUTS],
+    pub origin_prev_nullifier_root: [Option<Fr>; MAX_INPUTS],
 }
 
 impl SpendStepCircuit {
@@ -535,11 +571,11 @@ impl ConstraintSynthesizer<Fr> for SpendStepCircuit {
             compute_root_from_path_var(cs.clone(), &Fp::zero(), &entry_position_bits[..TREE_DEPTH], &append_path)?;
         board_root_computed.enforce_equal(&board_root)?;
 
-        // --- wrap VK (shared by every active input slot's receipt) ---
+        // --- wrap VK (shared by every active input slot's parent proof) ---
         let wrap_vk_var = VerifyingKeyVar::<MNT6_753, MNT6PairingVar>::new_constant(cs.clone(), &self.wrap_vk)?;
         let pvk = wrap_vk_var.prepare()?;
         let wrap_bit_len = Fr6::MODULUS_BIT_SIZE as usize;
-        let wrap_public_len = RECEIPT_PUBLIC_INPUT_COUNT * chunks_per_value();
+        let parent_public_len = SPEND_PUBLIC_INPUT_COUNT * chunks_per_value();
         let cpv = chunks_per_value();
 
         // --- input slots ---
@@ -567,48 +603,104 @@ impl ConstraintSynthesizer<Fr> for SpendStepCircuit {
             )?;
             gate(nonmembership_ok, &input_active[i]).enforce_equal(&Boolean::TRUE)?;
 
-            // --- this slot's coin-receipt: recursively verify the wrapped
-            // receipt proof, then bind its claims to this input ---
-            // A padding slot has no real receipt — fall back to all-zero
-            // chunks (never checked, since `recursive_ok` below is gated by
+            // --- origin entry: the board entry that created this input
+            // coin, proven included against THIS spend's own, real,
+            // currently-public `board_root` ("root A") — not a self-chosen
+            // one. See the struct doc comment.
+            let origin_nullifier = Fp::new_witness(cs.clone(), || opt(&self.origin_entry_nullifier[i]))?;
+            let origin_output_commitments: Vec<Fp> = (0..MAX_OUTPUTS)
+                .map(|j| {
+                    Fp::new_witness(cs.clone(), || {
+                        opt(&self.origin_entry_output_commitments[i].map(|a| a[j]))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            let origin_ciphertext_commitment =
+                Fp::new_witness(cs.clone(), || opt(&self.origin_entry_ciphertext_commitment[i]))?;
+            let origin_slot_fp =
+                Fp::new_witness(cs.clone(), || opt(&self.origin_received_slot[i].map(Fr::from)))?;
+            let origin_slot_bits = origin_slot_fp.to_bits_le()?;
+            let origin_append_path = alloc_fp_vec(cs.clone(), &self.origin_append_path[i], TREE_DEPTH)?;
+            let origin_prev_board_root = Fp::new_witness(cs.clone(), || opt(&self.origin_prev_board_root[i]))?;
+            let origin_prev_nullifier_root =
+                Fp::new_witness(cs.clone(), || opt(&self.origin_prev_nullifier_root[i]))?;
+
+            let origin_output_commitments_hash = poseidon_hash_var(cs.clone(), &origin_output_commitments)?;
+            let origin_leaf = poseidon_hash_var(
+                cs.clone(),
+                &[
+                    origin_slot_fp,
+                    origin_ciphertext_commitment,
+                    origin_nullifier,
+                    origin_output_commitments_hash,
+                    origin_prev_board_root.clone(),
+                    origin_prev_nullifier_root.clone(),
+                ],
+            )?;
+            let origin_root_computed = compute_root_from_path_var(
+                cs.clone(),
+                &origin_leaf,
+                &origin_slot_bits[..TREE_DEPTH],
+                &origin_append_path,
+            )?;
+            gate(origin_root_computed.is_eq(&board_root)?, &input_active[i]).enforce_equal(&Boolean::TRUE)?;
+
+            // coin_commitment must be among the origin entry's own output
+            // commitments — identifies which of (up to MAX_OUTPUTS) outputs
+            // is this input coin.
+            gate(is_member(&commitment, &origin_output_commitments)?, &input_active[i])
+                .enforce_equal(&Boolean::TRUE)?;
+
+            // --- recursively verify the parent spend proof that created
+            // this input coin, directly (no separate receipt-proof layer).
+            // A padding slot has no real parent — fall back to all-zero
+            // chunks (never checked, since every check below is gated by
             // `is_active`; see the module doc comment).
-            let receipt_native = &self.input_receipt_public_inputs[i];
-            let wrap_native_chunks: Vec<Fr6> = receipt_native
+            let parent_native = &self.input_parent_public_inputs[i];
+            let parent_chunks: Vec<Fr6> = parent_native
                 .as_ref()
                 .map(|v| public_input_chunks(v))
-                .unwrap_or_else(|| vec![Fr6::from(0u64); wrap_public_len]);
-            let mut per_chunk_bits: Vec<Vec<Boolean<Fr>>> = Vec::with_capacity(wrap_public_len);
-            for k in 0..wrap_public_len {
-                let value_bits: Vec<bool> = wrap_native_chunks[k].into_bigint().to_bits_le();
+                .unwrap_or_else(|| vec![Fr6::from(0u64); parent_public_len]);
+            let mut parent_per_chunk_bits: Vec<Vec<Boolean<Fr>>> = Vec::with_capacity(parent_public_len);
+            for k in 0..parent_public_len {
+                let value_bits: Vec<bool> = parent_chunks[k].into_bigint().to_bits_le();
                 let bits: Vec<Boolean<Fr>> = (0..wrap_bit_len)
                     .map(|j| Boolean::new_witness(cs.clone(), || Ok(value_bits[j])))
                     .collect::<Result<_, _>>()?;
-                per_chunk_bits.push(bits);
+                parent_per_chunk_bits.push(bits);
             }
-            let input_var = BooleanInputVar::<Fr6, Fr>::new(per_chunk_bits.clone());
-            let proof_native = self.input_receipt_proofs[i].clone().unwrap_or_else(Self::dummy_wrap_proof);
-            let proof_var = ProofVar::<MNT6_753, MNT6PairingVar>::new_witness(cs.clone(), || Ok(proof_native))?;
-            let recursive_ok = GM17VerifierGadget::<MNT6_753, MNT6PairingVar>::verify_with_processed_vk(
+            let parent_input_var = BooleanInputVar::<Fr6, Fr>::new(parent_per_chunk_bits.clone());
+            let parent_proof_native = self.input_parent_proofs[i].clone().unwrap_or_else(Self::dummy_wrap_proof);
+            let parent_proof_var =
+                ProofVar::<MNT6_753, MNT6PairingVar>::new_witness(cs.clone(), || Ok(parent_proof_native))?;
+            let parent_recursive_ok = GM17VerifierGadget::<MNT6_753, MNT6PairingVar>::verify_with_processed_vk(
                 &pvk,
-                &input_var,
-                &proof_var,
+                &parent_input_var,
+                &parent_proof_var,
             )?;
-            gate(recursive_ok, &input_active[i]).enforce_equal(&Boolean::TRUE)?;
+            gate(parent_recursive_ok, &input_active[i]).enforce_equal(&Boolean::TRUE)?;
 
-            let group = |idx: usize| -> &[Vec<Boolean<Fr>>] { &per_chunk_bits[idx * cpv..(idx + 1) * cpv] };
-            // Binding: the receipt's committed coin_commitment must match
-            // this input's own recomputed commitment. This alone is
-            // sufficient — no separate owner_pk comparison needed. By
-            // Poseidon's collision resistance, `commitment` (computed from
-            // this witnessed coin, whose owner_pk is already forced equal
-            // to pk_p by owner_ok above) can only equal the receipt's real
-            // coin_commitment if every ingredient that produced it matches
-            // too, including owner_pk — so matching the full commitment
-            // already implies the same owner, without owner_pk ever
-            // needing to be a receipt public input at all.
-            let receipt_coin_commitment = combine_chunks_var(group(RECEIPT_COIN_COMMITMENT))?;
-            let binding_ok = receipt_coin_commitment.is_eq(&commitment)?;
-            gate(binding_ok, &input_active[i]).enforce_equal(&Boolean::TRUE)?;
+            // --- binding: the core fix. The roots (and output commitments)
+            // embedded in the origin leaf must equal the parent proof's own,
+            // recursively verified, public claims — not a separately
+            // witnessed, self-chosen copy. See the struct doc comment for
+            // why this is what stops a fabricated origin from being
+            // laundered past this hop.
+            let pgroup = |idx: usize| -> &[Vec<Boolean<Fr>>] { &parent_per_chunk_bits[idx * cpv..(idx + 1) * cpv] };
+            let parent_output_commitments: Vec<Fp> = (0..MAX_OUTPUTS)
+                .map(|j| combine_chunks_var(pgroup(PARENT_OUTPUT_COMMITMENTS_START + j)))
+                .collect::<Result<_, _>>()?;
+            let parent_board_root = combine_chunks_var(pgroup(PARENT_BOARD_ROOT))?;
+            let parent_nullifier_root = combine_chunks_var(pgroup(PARENT_NULLIFIER_ROOT))?;
+
+            for j in 0..MAX_OUTPUTS {
+                gate(origin_output_commitments[j].is_eq(&parent_output_commitments[j])?, &input_active[i])
+                    .enforce_equal(&Boolean::TRUE)?;
+            }
+            gate(origin_prev_board_root.is_eq(&parent_board_root)?, &input_active[i])
+                .enforce_equal(&Boolean::TRUE)?;
+            gate(origin_prev_nullifier_root.is_eq(&parent_nullifier_root)?, &input_active[i])
+                .enforce_equal(&Boolean::TRUE)?;
 
             total_in += coin.value_or_zero(&input_active[i])?;
         }
@@ -662,8 +754,15 @@ pub fn setup_non_genesis<R: RngCore + CryptoRng>(
         // See circuit-wrap's `setup` for why every slot needs *some*
         // structurally-valid dummy proof rather than `None` — `ProofVar`'s
         // `AllocVar` impl calls its value closure unconditionally.
-        input_receipt_proofs: std::array::from_fn(|_| Some(SpendStepCircuit::dummy_wrap_proof())),
-        input_receipt_public_inputs: std::array::from_fn(|_| None),
+        input_parent_proofs: std::array::from_fn(|_| Some(SpendStepCircuit::dummy_wrap_proof())),
+        input_parent_public_inputs: std::array::from_fn(|_| None),
+        origin_received_slot: std::array::from_fn(|_| None),
+        origin_entry_nullifier: std::array::from_fn(|_| None),
+        origin_entry_output_commitments: std::array::from_fn(|_| None),
+        origin_entry_ciphertext_commitment: std::array::from_fn(|_| None),
+        origin_append_path: std::array::from_fn(|_| None),
+        origin_prev_board_root: std::array::from_fn(|_| None),
+        origin_prev_nullifier_root: std::array::from_fn(|_| None),
     };
     GM17::<MNT4_753>::circuit_specific_setup(circuit, rng)
 }
@@ -710,7 +809,10 @@ pub fn verify(
 mod tests {
     use super::*;
     use ark_relations::r1cs::ConstraintSystem;
-    use cloakkchain_lib::{append_path_for_next, derive_owner_pk, fold_owner_scalar, genesis_sk, poseidon_hash, NullifierTree};
+    use cloakkchain_lib::{
+        append_path_for_next, compute_root_from_path, derive_owner_pk, empty_root, entry_ciphertext_commitment,
+        fold_owner_scalar, genesis_sk, poseidon_hash, BoardEntry, NullifierTree,
+    };
 
     /// Build a valid genesis-mint witness (1 real input, 1 real output,
     /// padding slots empty) the same way the native `check_spend`/test
@@ -873,5 +975,309 @@ mod tests {
         c.own_nullifier_nonmembership = [Some(tree.prove_non_membership(own_nullifier))];
         c.generate_constraints(cs.clone()).unwrap();
         assert!(!cs.is_satisfied().unwrap(), "a nullifier already in the accumulator must fail non-membership");
+    }
+
+    /// Pads a variable-length list of real output commitments out to
+    /// `MAX_OUTPUTS` with a zero sentinel — both a spend's own fixed-size
+    /// public output and any `BoardEntry` built from the same transaction
+    /// must agree on this padding, or the entry's leaf hash won't match what
+    /// the circuit computes.
+    fn pad_outputs(real: &[Fr]) -> [Fr; MAX_OUTPUTS] {
+        let mut out = [Fr::from(0u64); MAX_OUTPUTS];
+        out[..real.len()].copy_from_slice(real);
+        out
+    }
+
+    /// A real genesis mint (100 to Alice) plus its wrapped proof — shared
+    /// setup for the tests below. Returns everything a child `SpendStepCircuit`
+    /// needs to reference genesis as its origin.
+    #[allow(clippy::type_complexity)]
+    fn genesis_mint_to_alice<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>(
+        rng: &mut R,
+    ) -> (
+        BoardEntry,                        // genesis_entry
+        VerifyingKey<MNT6_753>,             // wrap_genesis_vk
+        Proof<MNT6_753>,                    // wrap_genesis_proof
+        [Fr; SPEND_PUBLIC_INPUT_COUNT],     // genesis_public_inputs
+        Coin,                               // alice_coin
+        OwnerScalar,                        // alice_sk
+        OwnerPk,                            // alice_pk
+    ) {
+        let sk_genesis = genesis_sk();
+        let pk_genesis = derive_owner_pk(&sk_genesis);
+        let genesis_input = Coin { value: 100, rand: Fr::from(2u64), owner_pk: pk_genesis };
+        let alice_sk = OwnerScalar::from(42u64);
+        let alice_pk = derive_owner_pk(&alice_sk);
+        let alice_coin = Coin { value: 100, rand: Fr::from(4u64), owner_pk: alice_pk };
+
+        let genesis_input_commitment = genesis_input.commitment();
+        let alice_commitment = alice_coin.commitment();
+        let genesis_slot = 0u64;
+        let genesis_append_path = append_path_for_next(&[]);
+        let genesis_board_root = compute_root_from_path(Fr::from(0u64), genesis_slot as usize, &genesis_append_path);
+        let genesis_own_nullifier = poseidon_hash(&[genesis_input_commitment, fold_owner_scalar(&sk_genesis)]);
+        let empty_tree = NullifierTree::new();
+
+        let genesis_outputs = pad_outputs(&[alice_commitment]);
+        let genesis_circuit = GenesisSpendCircuit {
+            pk_p: Some(pk_genesis),
+            output_commitments: Some(genesis_outputs),
+            board_root: Some(genesis_board_root),
+            current_nullifier_root: Some(empty_tree.root()),
+            sk_p: Some(sk_genesis),
+            input_coins: [Some(genesis_input)],
+            output_coins: [Some(alice_coin.clone()), None],
+            entry_position: Some(genesis_slot),
+            append_path: Some(genesis_append_path.clone()),
+            own_nullifier_nonmembership: [Some(empty_tree.prove_non_membership(genesis_own_nullifier))],
+        };
+        let (genesis_pk_data, genesis_vk) = setup(rng).unwrap();
+        let genesis_public_inputs: [Fr; SPEND_PUBLIC_INPUT_COUNT] =
+            GenesisSpendCircuit::public_inputs(genesis_outputs, genesis_board_root, empty_tree.root())
+                .try_into()
+                .unwrap();
+        let genesis_proof = prove(&genesis_pk_data, genesis_circuit, rng).unwrap();
+
+        let (wrap_genesis_pk, wrap_genesis_vk) =
+            cloakkchain_circuit_wrap::setup::<SPEND_PUBLIC_INPUT_COUNT, _>(genesis_vk, rng).unwrap();
+        let wrap_genesis_proof = cloakkchain_circuit_wrap::prove::<SPEND_PUBLIC_INPUT_COUNT, _>(
+            &wrap_genesis_pk,
+            cloakkchain_circuit_wrap::WrapCircuit::<SPEND_PUBLIC_INPUT_COUNT> {
+                inner_vk: genesis_pk_data.vk.clone(),
+                inner_proof: Some(genesis_proof),
+                inner_public_inputs: Some(genesis_public_inputs),
+            },
+            rng,
+        )
+        .unwrap();
+
+        let genesis_entry = BoardEntry {
+            ciphertext: vec![],
+            ek_pk: [0u8; 32],
+            key_encs: vec![],
+            nullifier: genesis_own_nullifier,
+            output_commitments: genesis_outputs.to_vec(),
+            // Nothing precedes genesis — both roots are the empty ones,
+            // which also happen to be exactly `genesis_board_root`/
+            // `empty_tree.root()` themselves (first-ever entry).
+            prev_board_root: empty_root(),
+            prev_nullifier_root: empty_tree.root(),
+        };
+
+        (genesis_entry, wrap_genesis_vk, wrap_genesis_proof, genesis_public_inputs, alice_coin, alice_sk, alice_pk)
+    }
+
+    /// Build Alice's (non-genesis) `SpendStepCircuit` witness spending the
+    /// coin genesis just minted her, to Bob — exercising the new
+    /// origin-inclusion + binding checks against a real wrapped parent proof.
+    #[allow(clippy::too_many_arguments)]
+    fn alice_spend_circuit(
+        genesis_entry: &BoardEntry,
+        wrap_genesis_vk: VerifyingKey<MNT6_753>,
+        wrap_genesis_proof: Proof<MNT6_753>,
+        genesis_public_inputs: [Fr; SPEND_PUBLIC_INPUT_COUNT],
+        alice_coin: Coin,
+        alice_sk: OwnerScalar,
+        alice_pk: OwnerPk,
+    ) -> (SpendStepCircuit, [Fr; SPEND_PUBLIC_INPUT_COUNT], OwnerScalar) {
+        let bob_sk = OwnerScalar::from(7u64);
+        let bob_pk = derive_owner_pk(&bob_sk);
+        let bob_coin = Coin { value: 100, rand: Fr::from(6u64), owner_pk: bob_pk };
+        let bob_commitment = bob_coin.commitment();
+
+        let alice_spend_slot = 1u64;
+        let alice_spend_append_path = append_path_for_next(std::slice::from_ref(genesis_entry));
+        let alice_spend_board_root =
+            compute_root_from_path(Fr::from(0u64), alice_spend_slot as usize, &alice_spend_append_path);
+        let alice_own_nullifier = poseidon_hash(&[alice_coin.commitment(), fold_owner_scalar(&alice_sk)]);
+        let mut tree_after_genesis = NullifierTree::new();
+        tree_after_genesis.insert(genesis_entry.nullifier);
+
+        let alice_spend_outputs = pad_outputs(&[bob_commitment]);
+        let circuit = SpendStepCircuit {
+            pk_p: Some(alice_pk),
+            output_commitments: Some(alice_spend_outputs),
+            board_root: Some(alice_spend_board_root),
+            current_nullifier_root: Some(tree_after_genesis.root()),
+            sk_p: Some(alice_sk),
+            input_coins: [Some(alice_coin)],
+            output_coins: [Some(bob_coin), None],
+            entry_position: Some(alice_spend_slot),
+            append_path: Some(alice_spend_append_path),
+            own_nullifier_nonmembership: [Some(tree_after_genesis.prove_non_membership(alice_own_nullifier))],
+            wrap_vk: wrap_genesis_vk,
+            input_parent_proofs: [Some(wrap_genesis_proof)],
+            input_parent_public_inputs: [Some(genesis_public_inputs)],
+            origin_received_slot: [Some(0)],
+            origin_entry_nullifier: [Some(genesis_entry.nullifier)],
+            origin_entry_output_commitments: [Some(genesis_entry.output_commitments.clone().try_into().unwrap())],
+            origin_entry_ciphertext_commitment: [Some(entry_ciphertext_commitment(genesis_entry))],
+            origin_append_path: [Some(append_path_for_next(&[]))],
+            origin_prev_board_root: [Some(genesis_entry.prev_board_root)],
+            origin_prev_nullifier_root: [Some(genesis_entry.prev_nullifier_root)],
+        };
+        let public_inputs: [Fr; SPEND_PUBLIC_INPUT_COUNT] =
+            SpendStepCircuit::public_inputs(alice_spend_outputs, alice_spend_board_root, tree_after_genesis.root())
+                .try_into()
+                .unwrap();
+        (circuit, public_inputs, bob_sk)
+    }
+
+    /// The binding fix, exercised directly: a genuine origin (genesis's real
+    /// entry, with its real preceding roots) satisfies every constraint; a
+    /// tampered `origin_prev_board_root` or `origin_entry_output_commitments`
+    /// — the two values the binding check ties to the recursively verified
+    /// parent proof's own public claims — does not. Mirrors
+    /// `wrong_secret_key_fails`'s approach of checking raw constraint
+    /// satisfiability directly, paying for the one real genesis+wrap proof
+    /// needed as a genuine witness either way.
+    #[test]
+    fn tampered_origin_binding_fails() {
+        use ark_std::rand::{rngs::StdRng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(20260918);
+
+        let (genesis_entry, wrap_genesis_vk, wrap_genesis_proof, genesis_public_inputs, alice_coin, alice_sk, alice_pk) =
+            genesis_mint_to_alice(&mut rng);
+        let (base_circuit, _, _) = alice_spend_circuit(
+            &genesis_entry,
+            wrap_genesis_vk,
+            wrap_genesis_proof,
+            genesis_public_inputs,
+            alice_coin,
+            alice_sk,
+            alice_pk,
+        );
+
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        base_circuit.clone().generate_constraints(cs.clone()).unwrap();
+        assert!(cs.is_satisfied().unwrap(), "a genuine origin (real genesis entry) should satisfy every constraint");
+
+        let mut wrong_prev_root = base_circuit.clone();
+        wrong_prev_root.origin_prev_board_root = [Some(Fr::from(999u64))]; // not the real prev root
+        let cs2 = ConstraintSystem::<Fr>::new_ref();
+        wrong_prev_root.generate_constraints(cs2.clone()).unwrap();
+        assert!(
+            !cs2.is_satisfied().unwrap(),
+            "a fabricated origin_prev_board_root must not satisfy the circuit"
+        );
+
+        let mut wrong_outputs = base_circuit;
+        wrong_outputs.origin_entry_output_commitments = [Some([Fr::from(999u64), Fr::from(0u64)])]; // not genesis's real outputs
+        let cs3 = ConstraintSystem::<Fr>::new_ref();
+        wrong_outputs.generate_constraints(cs3.clone()).unwrap();
+        assert!(
+            !cs3.is_satisfied().unwrap(),
+            "origin_entry_output_commitments inconsistent with the parent's own proof must not satisfy the circuit"
+        );
+    }
+
+    /// Full chain, real GM17 proofs end to end, without any receipt-proof
+    /// layer: genesis mints to Alice, Alice spends to Bob (directly
+    /// recursively verifying genesis's own wrapped proof), Bob spends to
+    /// Carol (directly recursively verifying Alice's own wrapped proof).
+    #[test]
+    fn genesis_alice_bob_carol_chain_without_receipts() {
+        use ark_std::rand::{rngs::StdRng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(20260919);
+
+        let (genesis_entry, wrap_genesis_vk, wrap_genesis_proof, genesis_public_inputs, alice_coin, alice_sk, alice_pk) =
+            genesis_mint_to_alice(&mut rng);
+        let (alice_circuit, alice_public_inputs, bob_sk) = alice_spend_circuit(
+            &genesis_entry,
+            wrap_genesis_vk.clone(),
+            wrap_genesis_proof,
+            genesis_public_inputs,
+            alice_coin,
+            alice_sk,
+            alice_pk,
+        );
+        let bob_pk = alice_circuit.output_coins[0].as_ref().unwrap().owner_pk;
+
+        let (alice_spend_pk, alice_spend_vk) = setup_non_genesis(wrap_genesis_vk, &mut rng).unwrap();
+        let alice_spend_proof = prove_non_genesis(&alice_spend_pk, alice_circuit, &mut rng).unwrap();
+        assert!(
+            verify_non_genesis(&alice_spend_vk, &alice_public_inputs, &alice_spend_proof).unwrap(),
+            "Alice's spend (directly wrapping genesis's proof, no receipt layer) must verify"
+        );
+
+        let (wrap_alice_pk, wrap_alice_vk) =
+            cloakkchain_circuit_wrap::setup::<SPEND_PUBLIC_INPUT_COUNT, _>(alice_spend_vk, &mut rng).unwrap();
+        let wrap_alice_proof = cloakkchain_circuit_wrap::prove::<SPEND_PUBLIC_INPUT_COUNT, _>(
+            &wrap_alice_pk,
+            cloakkchain_circuit_wrap::WrapCircuit::<SPEND_PUBLIC_INPUT_COUNT> {
+                inner_vk: alice_spend_pk.vk.clone(),
+                inner_proof: Some(alice_spend_proof),
+                inner_public_inputs: Some(alice_public_inputs),
+            },
+            &mut rng,
+        )
+        .unwrap();
+
+        let bob_coin = Coin { value: 100, rand: Fr::from(6u64), owner_pk: bob_pk };
+        let alice_spend_outputs = pad_outputs(&[bob_coin.commitment()]);
+        let alice_spend_entry = BoardEntry {
+            ciphertext: vec![],
+            ek_pk: [0u8; 32],
+            key_encs: vec![],
+            nullifier: poseidon_hash(&[alice_coin_commitment(&genesis_entry), fold_owner_scalar(&alice_sk)]),
+            output_commitments: alice_spend_outputs.to_vec(),
+            prev_board_root: alice_public_inputs[MAX_OUTPUTS],
+            prev_nullifier_root: alice_public_inputs[MAX_OUTPUTS + 1],
+        };
+
+        let carol_sk = OwnerScalar::from(13u64);
+        let carol_pk = derive_owner_pk(&carol_sk);
+        let carol_coin = Coin { value: 100, rand: Fr::from(10u64), owner_pk: carol_pk };
+        let carol_commitment = carol_coin.commitment();
+
+        let bob_spend_slot = 2u64;
+        let bob_spend_append_path = append_path_for_next(&[genesis_entry.clone(), alice_spend_entry.clone()]);
+        let bob_spend_board_root =
+            compute_root_from_path(Fr::from(0u64), bob_spend_slot as usize, &bob_spend_append_path);
+        let bob_own_nullifier = poseidon_hash(&[bob_coin.commitment(), fold_owner_scalar(&bob_sk)]);
+        let mut tree_after_alice = NullifierTree::new();
+        tree_after_alice.insert(genesis_entry.nullifier);
+        tree_after_alice.insert(alice_spend_entry.nullifier);
+
+        let bob_spend_outputs = pad_outputs(&[carol_commitment]);
+        let bob_spend_circuit = SpendStepCircuit {
+            pk_p: Some(bob_pk),
+            output_commitments: Some(bob_spend_outputs),
+            board_root: Some(bob_spend_board_root),
+            current_nullifier_root: Some(tree_after_alice.root()),
+            sk_p: Some(bob_sk),
+            input_coins: [Some(bob_coin)],
+            output_coins: [Some(carol_coin), None],
+            entry_position: Some(bob_spend_slot),
+            append_path: Some(bob_spend_append_path),
+            own_nullifier_nonmembership: [Some(tree_after_alice.prove_non_membership(bob_own_nullifier))],
+            wrap_vk: wrap_alice_vk.clone(),
+            input_parent_proofs: [Some(wrap_alice_proof)],
+            input_parent_public_inputs: [Some(alice_public_inputs)],
+            origin_received_slot: [Some(1)],
+            origin_entry_nullifier: [Some(alice_spend_entry.nullifier)],
+            origin_entry_output_commitments: [Some(alice_spend_outputs)],
+            origin_entry_ciphertext_commitment: [Some(entry_ciphertext_commitment(&alice_spend_entry))],
+            origin_append_path: [Some(append_path_for_next(std::slice::from_ref(&genesis_entry)))],
+            origin_prev_board_root: [Some(alice_spend_entry.prev_board_root)],
+            origin_prev_nullifier_root: [Some(alice_spend_entry.prev_nullifier_root)],
+        };
+        let (bob_spend_pk, bob_spend_vk) = setup_non_genesis(wrap_alice_vk, &mut rng).unwrap();
+        let bob_spend_public_inputs =
+            SpendStepCircuit::public_inputs(bob_spend_outputs, bob_spend_board_root, tree_after_alice.root());
+        let bob_spend_proof = prove_non_genesis(&bob_spend_pk, bob_spend_circuit, &mut rng).unwrap();
+
+        assert!(
+            verify_non_genesis(&bob_spend_vk, &bob_spend_public_inputs, &bob_spend_proof).unwrap(),
+            "the full genesis->Alice->Bob->Carol chain must verify end to end, with no receipt-proof layer"
+        );
+
+        let mut tampered = bob_spend_public_inputs.clone();
+        tampered[0] += Fr::from(1u64);
+        assert!(!verify_non_genesis(&bob_spend_vk, &tampered, &bob_spend_proof).unwrap());
+    }
+
+    fn alice_coin_commitment(genesis_entry: &BoardEntry) -> Fr {
+        genesis_entry.output_commitments[0]
     }
 }
