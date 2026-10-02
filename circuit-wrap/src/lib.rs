@@ -12,7 +12,7 @@
 //! nullifier-tree work) on the "wrap" side makes every hash foreign-field —
 //! the same cost class the `mnt_native_experiment` measured as catastrophic
 //! for SHA256-in-R1CS. Business logic instead stays entirely native (see
-//! `circuit-spend`, `circuit-coinproof`); this circuit does no hashing of
+//! `circuit-spend`); this circuit does no hashing of
 //! application data at all, only pairing-based proof verification plus
 //! bit-repacking — mirroring the "inner does the real work, outer is a thin
 //! composition layer" pattern the experiment's own inner/outer measurements

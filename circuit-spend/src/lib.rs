@@ -1,9 +1,10 @@
 //! MNT-native spend circuit. `GenesisSpendCircuit` is the genesis-mint
 //! variant of `check_spend` (see `cloakkchain_lib::check_spend`) — no
-//! recursive coin-proof verification, since genesis mints never have a
-//! parent receipt. `SpendStepCircuit` is the non-genesis variant, which does
-//! recursively verify one wrapped `ReceiptStepCircuit` proof *per active
-//! input slot* via `GM17VerifierGadget`.
+//! recursive parent verification, since genesis mints never have a parent
+//! spend. `SpendStepCircuit` is the non-genesis variant, which does
+//! recursively verify one wrapped parent `GenesisSpendCircuit`/
+//! `SpendStepCircuit` proof *per active input slot* via `GM17VerifierGadget`,
+//! directly — no separate receipt-proof layer.
 //!
 //! Both support up to [`MAX_INPUTS`] input coins and [`MAX_OUTPUTS`] output
 //! coins (slot 0 of each is mandatory; the rest are optional, gated by an
