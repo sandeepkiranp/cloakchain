@@ -27,7 +27,7 @@
 //! VK it claims to verify under ([`inner_vk_hash`]), and this circuit enforces
 //! that. The spend circuit then checks the hash it reads back is an expected one.
 
-use ark_crypto_primitives::snark::{BooleanInputVar, SNARKGadget};
+use ark_crypto_primitives::snark::SNARKGadget;
 use ark_crypto_primitives::sponge::{
     constraints::CryptographicSpongeVar, poseidon::constraints::PoseidonSpongeVar, poseidon::PoseidonSponge,
     CryptographicSponge, FieldBasedCryptographicSponge,
@@ -39,7 +39,14 @@ use ark_gm17::{
 };
 use ark_mnt4_753::MNT4_753;
 use ark_mnt6_753::MNT6_753;
-use ark_r1cs_std::{alloc::AllocationMode, fields::fp::FpVar, prelude::*};
+use ark_ec::short_weierstrass::SWCurveConfig;
+use ark_r1cs_std::{
+    alloc::AllocationMode,
+    fields::fp::FpVar,
+    groups::curves::short_weierstrass::{non_zero_affine::NonZeroAffineVar, ProjectiveVar},
+    pairing::PairingVar,
+    prelude::*,
+};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_snark::SNARK;
@@ -65,6 +72,116 @@ pub fn chunks_per_value() -> usize {
 
 fn opt<T: Clone>(o: &Option<T>) -> Result<T, SynthesisError> {
     o.clone().ok_or(SynthesisError::AssignmentMissing)
+}
+
+/// `bits · base` for a base that is a witness, as `ark-r1cs-std`'s
+/// `scalar_mul_le` computes it, but with matrices orders of magnitude sparser.
+///
+/// The library's version leaves each doubling's coordinates as linear
+/// combinations of the previous ones (`x' = λ² − 2x`, `y' = λ(x − x') − y`), so
+/// after hundreds of doublings a single row can hold hundreds of terms. For a
+/// constant base that costs nothing, since doubling a constant is a constant.
+/// For a witness base it made the wrap circuit's matrices 25 times denser than
+/// its constraint count suggests, and prover time and memory follow nonzeros.
+/// Here each doubled point is re-allocated, at one constraint per coordinate.
+///
+/// Otherwise it's the library algorithm step for step, so its completeness
+/// argument carries over: incomplete affine additions on the low
+/// `MODULUS_BIT_SIZE − 2` bits, where the accumulator `k·a` has `2 ≤ k < p − 1`
+/// and so never equals `±` the point being added; complete projective additions
+/// after that; and the base at infinity handled by substituting the generator
+/// and selecting zero at the end. Takes at most `MODULUS_BIT_SIZE` bits.
+pub fn scalar_mul_le_compact<P: SWCurveConfig>(
+    base: &ProjectiveVar<P, FpVar<P::BaseField>>,
+    bits: &[Boolean<P::BaseField>],
+) -> Result<ProjectiveVar<P, FpVar<P::BaseField>>, SynthesisError>
+where
+    P::BaseField: PrimeField,
+{
+    type Point<P> = ProjectiveVar<P, FpVar<<P as ark_ec::CurveConfig>::BaseField>>;
+    let scalar_bits = <P::ScalarField as PrimeField>::MODULUS_BIT_SIZE as usize;
+    assert!(bits.len() <= scalar_bits, "one chunk of scalar bits at most");
+    if bits.is_empty() {
+        return Ok(Point::<P>::zero());
+    }
+
+    let cs = base.cs();
+    let compact = |p: NonZeroAffineVar<P, FpVar<P::BaseField>>| -> Result<_, SynthesisError> {
+        if p.x.is_constant() && p.y.is_constant() {
+            return Ok(p);
+        }
+        let x = FpVar::new_witness(cs.clone(), || p.x.value())?;
+        let y = FpVar::new_witness(cs.clone(), || p.y.value())?;
+        x.enforce_equal(&p.x)?;
+        y.enforce_equal(&p.y)?;
+        Ok(NonZeroAffineVar::new(x, y))
+    };
+
+    let affine = base.to_affine()?;
+    let infinity = affine.infinity;
+    let x = infinity.select(&FpVar::constant(P::GENERATOR.x), &affine.x)?;
+    let y = infinity.select(&FpVar::constant(P::GENERATOR.y), &affine.y)?;
+    let mut power = NonZeroAffineVar::new(x, y);
+
+    // Start the accumulator at `base`, as if the low bit were set, and correct
+    // for it after the incomplete part.
+    let mut accumulator = power.clone();
+    let initial = accumulator.into_projective();
+    power = compact(power.double()?)?;
+
+    let split = (scalar_bits - 2).min(bits.len());
+    for bit in &bits[1..split] {
+        let sum = accumulator.add_unchecked(&power)?;
+        accumulator = bit.select(&sum, &accumulator)?;
+        power = compact(power.double()?)?;
+    }
+    let mut result = accumulator.into_projective() - bits[0].select(&Point::<P>::zero(), &initial)?;
+
+    for bit in &bits[split..] {
+        let sum = &result + &power.into_projective();
+        result = bit.select(&sum, &result)?;
+        power = compact(power.double()?)?;
+    }
+    infinity.select(&Point::<P>::zero(), &result)
+}
+
+/// GM17 verification of an MNT4-753 proof, as `GM17VerifierGadget` does it,
+/// except that the public-input sum uses [`scalar_mul_le_compact`]: with a
+/// witness VK, `query` is a witness, and the gadget's own sum was by far the
+/// densest part of this circuit.
+fn verify_gm17_mnt4(
+    pvk: &ark_gm17::constraints::PreparedVerifyingKeyVar<MNT4_753, MNT4PairingVar>,
+    inputs: &[Vec<Boolean<Fr6>>],
+    proof: &ProofVar<MNT4_753, MNT4PairingVar>,
+) -> Result<Boolean<Fr6>, SynthesisError> {
+    assert_eq!(inputs.len() + 1, pvk.query.len());
+    let mut g_psi = pvk.query[0].clone();
+    for (bits, base) in inputs.iter().zip(&pvk.query[1..]) {
+        g_psi += scalar_mul_le_compact(base, bits)?;
+    }
+
+    let test1_a_g_alpha = (proof.a.clone() + &pvk.g_alpha).negate()?;
+    let test1_b_h_beta = proof.b.clone() + &pvk.h_beta;
+    let test1 = MNT4PairingVar::final_exponentiation(&MNT4PairingVar::miller_loop(
+        &[
+            MNT4PairingVar::prepare_g1(&test1_a_g_alpha)?,
+            MNT4PairingVar::prepare_g1(&g_psi)?,
+            MNT4PairingVar::prepare_g1(&proof.c)?,
+            pvk.g_alpha_pc.clone(),
+        ],
+        &[
+            MNT4PairingVar::prepare_g2(&test1_b_h_beta)?,
+            pvk.h_gamma_pc.clone(),
+            pvk.h_pc.clone(),
+            pvk.h_beta_pc.clone(),
+        ],
+    )?)?;
+    let test2 = MNT4PairingVar::final_exponentiation(&MNT4PairingVar::miller_loop(
+        &[MNT4PairingVar::prepare_g1(&proof.a)?, pvk.g_gamma_pc.clone()],
+        &[pvk.h_gamma_pc.clone(), MNT4PairingVar::prepare_g2(&proof.b.negate()?)?],
+    )?)?;
+    let one = <MNT4PairingVar as PairingVar<MNT4_753>>::GTVar::one();
+    Ok(&test1.is_eq(&one)? & &test2.is_eq(&one)?)
 }
 
 /// Bits of the Poseidon digest kept as a VK's hash: few enough that the value
@@ -149,7 +266,6 @@ impl<const N: usize> ConstraintSynthesizer<Fr6> for WrapCircuit<N> {
                 .collect::<Result<_, _>>()?;
             per_value_bits.push(bits);
         }
-        let input_var = BooleanInputVar::<Fr4, Fr6>::new(per_value_bits.clone());
 
         // Recursive GM17 verification of the inner (Fr4/MNT4-753) proof,
         // under a VK pinned by the inner proof's own last public input. That
@@ -170,12 +286,7 @@ impl<const N: usize> ConstraintSynthesizer<Fr6> for WrapCircuit<N> {
         }
         let proof_var = ProofVar::<MNT4_753, MNT4PairingVar>::new_witness(cs.clone(), || opt(&self.inner_proof))?;
         let pvk = vk_var.prepare()?;
-        let ok = GM17VerifierGadget::<MNT4_753, MNT4PairingVar>::verify_with_processed_vk(
-            &pvk,
-            &input_var,
-            &proof_var,
-        )?;
-        ok.enforce_equal(&Boolean::TRUE)?;
+        verify_gm17_mnt4(&pvk, &per_value_bits, &proof_var)?.enforce_equal(&Boolean::TRUE)?;
 
         // Re-expose each value losslessly as small public Fr6 inputs — see
         // the module doc comment for why not `BooleanInputVar`'s own
@@ -282,7 +393,51 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ark_crypto_primitives::snark::BooleanInputVar;
     use ark_std::rand::{rngs::StdRng, SeedableRng};
+
+    /// Same results as the library's `scalar_mul_le`, on the scalars at the
+    /// edges of its incomplete additions and on a base at infinity, and stays
+    /// satisfiable throughout.
+    #[test]
+    fn compact_scalar_mul_matches_the_library() {
+        use ark_ec::{CurveGroup, PrimeGroup};
+        use ark_relations::r1cs::ConstraintSystem;
+        type G1Var = ark_mnt4_753::constraints::G1Var;
+        let n = <ark_mnt4_753::Fr as PrimeField>::MODULUS_BIT_SIZE as usize;
+        let scalar_bits = |x: ark_mnt4_753::Fr| x.into_bigint().to_bits_le()[..n].to_vec();
+        let mut cases: Vec<Vec<bool>> = vec![
+            vec![false; n],
+            vec![true; n],
+            scalar_bits(-ark_mnt4_753::Fr::from(1u64)),
+            scalar_bits(-ark_mnt4_753::Fr::from(2u64)),
+            scalar_bits(ark_mnt4_753::Fr::from(1u64)),
+            scalar_bits(ark_mnt4_753::Fr::from(2u64)),
+            scalar_bits(ark_mnt4_753::Fr::from(u64::MAX)),
+            vec![true],
+            vec![false, true],
+        ];
+        let mut top = vec![false; n];
+        top[n - 1] = true;
+        cases.push(top);
+
+        let bases = [
+            ark_mnt4_753::G1Projective::generator() * ark_mnt4_753::Fr::from(7u64),
+            ark_mnt4_753::G1Projective::default(), // infinity
+        ];
+        for base in bases {
+            for bits in &cases {
+                let cs = ConstraintSystem::<Fr6>::new_ref();
+                let base_var = G1Var::new_witness(cs.clone(), || Ok(base)).unwrap();
+                let bit_vars: Vec<Boolean<Fr6>> =
+                    bits.iter().map(|b| Boolean::new_witness(cs.clone(), || Ok(*b)).unwrap()).collect();
+                let ours = scalar_mul_le_compact(&base_var, &bit_vars).unwrap().value().unwrap();
+                let theirs = base_var.scalar_mul_le(bit_vars.iter()).unwrap().value().unwrap();
+                assert_eq!(ours.into_affine(), theirs.into_affine(), "{} bits", bits.len());
+                assert!(cs.is_satisfied().unwrap());
+            }
+        }
+    }
 
     /// Phase 4 spike, the other side of the cycle: what this circuit's MNT4
     /// verifier costs with the inner VK as a witness instead of a constant, for
@@ -400,7 +555,128 @@ mod tests {
         WrapCircuit::<8> { inner_vk: shaped_inner_vk(8), inner_proof: Some(dummy), inner_public_inputs: None }
             .generate_constraints(cs.clone())
             .unwrap();
-        println!("WrapCircuit<8>: {}", cs.num_constraints());
+        cs.finalize();
+        let m = cs.to_matrices().unwrap();
+        println!(
+            "WrapCircuit<8>: {} constraints, {} witness variables, nonzeros A {} B {} C {}",
+            cs.num_constraints(),
+            cs.num_witness_variables(),
+            m.a_num_non_zero,
+            m.b_num_non_zero,
+            m.c_num_non_zero,
+        );
+    }
+
+    /// Which part of the wrap circuit makes its matrices dense.
+    #[test]
+    fn report_wrap_density() {
+        use ark_ec::PrimeGroup;
+        use ark_relations::r1cs::{ConstraintSystem, SynthesisMode};
+        fn report(name: &str, build: impl FnOnce(ConstraintSystemRef<Fr6>)) {
+            let cs = ConstraintSystem::<Fr6>::new_ref();
+            cs.set_mode(SynthesisMode::Setup);
+            build(cs.clone());
+            cs.finalize();
+            let m = cs.to_matrices().unwrap();
+            println!(
+                "{name:<28} constraints {:>7}  nonzeros A {:>9} B {:>9} C {:>8}",
+                cs.num_constraints(),
+                m.a_num_non_zero,
+                m.b_num_non_zero,
+                m.c_num_non_zero
+            );
+        }
+        let witness_vk = |cs: ConstraintSystemRef<Fr6>| {
+            GM17VerifierGadget::<MNT4_753, MNT4PairingVar>::new_verification_key_unchecked(
+                cs,
+                || Ok(shaped_inner_vk(8)),
+                AllocationMode::Witness,
+            )
+            .unwrap()
+        };
+        report("poseidon, 60 elements", |cs| {
+            let xs: Vec<Fp6> = (0..60).map(|_| Fp6::new_witness(cs.clone(), || Ok(Fr6::from(1u64))).unwrap()).collect();
+            let mut sponge = PoseidonSpongeVar::new(cs, &poseidon_params::mnt6_753_fr_poseidon_config());
+            sponge.absorb(&xs).unwrap();
+            sponge.squeeze_field_elements(1).unwrap();
+        });
+        report("vk hash (to_affine + poseidon)", |cs| {
+            let vk = witness_vk(cs.clone());
+            inner_vk_hash_bits_var(cs, &vk).unwrap();
+        });
+        report("prepare witness vk", |cs| {
+            witness_vk(cs).prepare().unwrap();
+        });
+        report("input sum, witness query", |cs| {
+            let vk = witness_vk(cs.clone());
+            let mut g_psi = vk.query[0].clone();
+            for b in vk.query.iter().skip(1) {
+                let bits: Vec<Boolean<Fr6>> =
+                    (0..753).map(|_| Boolean::new_witness(cs.clone(), || Ok(false)).unwrap()).collect();
+                g_psi += b.scalar_mul_le(bits.iter()).unwrap();
+            }
+        });
+        report("input sum, constant query", |cs| {
+            let vk = ark_gm17::constraints::VerifyingKeyVar::<MNT4_753, MNT4PairingVar>::new_constant(
+                cs.clone(),
+                shaped_inner_vk(8),
+            )
+            .unwrap();
+            let mut g_psi = vk.query[0].clone();
+            for b in vk.query.iter().skip(1) {
+                let bits: Vec<Boolean<Fr6>> =
+                    (0..753).map(|_| Boolean::new_witness(cs.clone(), || Ok(false)).unwrap()).collect();
+                g_psi += b.scalar_mul_le(bits.iter()).unwrap();
+            }
+        });
+        report("miller+final exp, witness", |cs| {
+            use ark_r1cs_std::pairing::PairingVar;
+            let pvk = witness_vk(cs.clone()).prepare().unwrap();
+            let g1 = MNT4PairingVar::prepare_g1(&pvk.query[0]).unwrap();
+            let ml = MNT4PairingVar::miller_loop(&[g1], &[pvk.h_gamma_pc.clone()]).unwrap();
+            let _ = MNT4PairingVar::final_exponentiation(&ml).unwrap();
+        });
+        report("miller+final exp, constant", |cs| {
+            use ark_r1cs_std::pairing::PairingVar;
+            let vk = ark_gm17::constraints::VerifyingKeyVar::<MNT4_753, MNT4PairingVar>::new_constant(
+                cs.clone(),
+                shaped_inner_vk(8),
+            )
+            .unwrap();
+            let pvk = vk.prepare().unwrap();
+            let p = <MNT4PairingVar as PairingVar<MNT4_753>>::G1Var::new_witness(cs.clone(), || {
+                Ok(ark_mnt4_753::G1Projective::generator())
+            })
+            .unwrap();
+            let g1 = MNT4PairingVar::prepare_g1(&p).unwrap();
+            let ml = MNT4PairingVar::miller_loop(&[g1], &[pvk.h_gamma_pc.clone()]).unwrap();
+            let _ = MNT4PairingVar::final_exponentiation(&ml).unwrap();
+        });
+        report("verify, witness vk, ours", |cs| {
+            let pvk = witness_vk(cs.clone()).prepare().unwrap();
+            let bits: Vec<Vec<Boolean<Fr6>>> = (0..8)
+                .map(|_| (0..753).map(|_| Boolean::new_witness(cs.clone(), || Ok(false)).unwrap()).collect())
+                .collect();
+            let g1 = ark_mnt4_753::G1Affine::identity();
+            let dummy = Proof::<MNT4_753> { a: g1, b: ark_mnt4_753::G2Affine::identity(), c: g1 };
+            let proof = ProofVar::<MNT4_753, MNT4PairingVar>::new_witness(cs, || Ok(dummy)).unwrap();
+            let _ = verify_gm17_mnt4(&pvk, &bits, &proof).unwrap();
+        });
+        report("verify, witness vk, gadget", |cs| {
+            let pvk = witness_vk(cs.clone()).prepare().unwrap();
+            let bits: Vec<Vec<Boolean<Fr6>>> = (0..8)
+                .map(|_| (0..753).map(|_| Boolean::new_witness(cs.clone(), || Ok(false)).unwrap()).collect())
+                .collect();
+            let g1 = ark_mnt4_753::G1Affine::identity();
+            let dummy = Proof::<MNT4_753> { a: g1, b: ark_mnt4_753::G2Affine::identity(), c: g1 };
+            let proof = ProofVar::<MNT4_753, MNT4PairingVar>::new_witness(cs, || Ok(dummy)).unwrap();
+            let _ = GM17VerifierGadget::<MNT4_753, MNT4PairingVar>::verify_with_processed_vk(
+                &pvk,
+                &BooleanInputVar::<Fr4, Fr6>::new(bits),
+                &proof,
+            )
+            .unwrap();
+        });
     }
 
     #[test]

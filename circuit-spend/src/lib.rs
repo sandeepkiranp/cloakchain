@@ -18,8 +18,9 @@
 //! checking one must *evaluate to false*, never make the circuit unsatisfiable:
 //! otherwise a single junk copy could stop a coin from ever being spent. That's
 //! why signatures use challenge form (no attacker-supplied curve point to
-//! parse), and it relies on `scalar_mul_le` being complete for scalars of up to
-//! 753 bits. Its incomplete additions only cover the low 751 bits, where the
+//! parse), and it relies on scalar multiplication (`scalar_mul_le`, and
+//! `scalar_mul_le_compact` for witness bases, the same algorithm) being complete
+//! for scalars of up to 753 bits. Its incomplete additions only cover the low 751 bits, where the
 //! accumulator stays odd and below `2^i`, so it can never equal `±2^i` mod the
 //! group order; everything else goes through complete formulas.
 //!
@@ -65,7 +66,9 @@ use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisE
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_snark::SNARK;
 use ark_std::rand::{CryptoRng, RngCore};
-use cloakkchain_circuit_wrap::{chunks_per_value, combine_chunks_var, public_input_chunks, Fr6, CHUNK_BITS};
+use cloakkchain_circuit_wrap::{
+    chunks_per_value, combine_chunks_var, public_input_chunks, scalar_mul_le_compact, Fr6, CHUNK_BITS,
+};
 use cloakkchain_lib::{
     derive_coin_vpk, derive_nullifier, genesis_pk, hash_vpk, owner_pk_to_field_pair, poseidon_params, Anchor,
     Coin, CoinSignature, Fr, IndexedLeaf, LeafOpening, NonMembershipWitness, Occurrence, OwnerPk, OwnerScalar,
@@ -421,7 +424,9 @@ impl CoinSignatureVar {
         let c_bits = self.c.to_bits_le()?;
 
         let s_g = generator_var(cs.clone())?.scalar_mul_le(s_bits.iter())?;
-        let c_vpk = vpk.point.scalar_mul_le(c_bits.iter())?;
+        // `vpk` is a witness, so the library's scalar-mult would make these
+        // rows very dense; see `scalar_mul_le_compact`.
+        let c_vpk = scalar_mul_le_compact(&vpk.point, &c_bits)?;
         let r = (s_g - c_vpk).to_affine()?;
         let challenge = poseidon_hash_var(
             cs,
@@ -1727,6 +1732,41 @@ mod tests {
         println!("GenesisSpendCircuit:    {}", genesis_cs.num_constraints());
         println!("SpendStepCircuit:       {}", step_cs.num_constraints());
         println!("public inputs:          {SPEND_PUBLIC_INPUT_COUNT}");
+    }
+
+    /// Where the spend circuit's matrix nonzeros come from.
+    #[test]
+    fn report_spend_density() {
+        fn report(name: &str, build: impl FnOnce(ConstraintSystemRef<Fr>)) {
+            let cs = setup_mode_cs();
+            build(cs.clone());
+            cs.finalize();
+            let m = cs.to_matrices().unwrap();
+            println!(
+                "{name:<28} constraints {:>7}  nonzeros A {:>9} B {:>9} C {:>8}",
+                cs.num_constraints(),
+                m.a_num_non_zero,
+                m.b_num_non_zero,
+                m.c_num_non_zero
+            );
+        }
+        report("poseidon, 2 elements", |cs| {
+            let xs: Vec<Fp> = (0..2).map(|_| Fp::new_witness(cs.clone(), || Ok(Fr::from(1u64))).unwrap()).collect();
+            let _ = poseidon_hash_var(cs, &xs).unwrap();
+        });
+        report("GenesisSpendCircuit", |cs| GenesisSpendCircuit::default().generate_constraints(cs).unwrap());
+        report("SpendStepCircuit", |cs| {
+            SpendStepCircuit {
+                core: SpendCoreWitness::default(),
+                wrap_vk: shaped_wrap_vk(),
+                genesis_vk_hash: Fr::from(0u64),
+                input_parent_proofs: std::array::from_fn(|_| Some(SpendStepCircuit::dummy_wrap_proof())),
+                input_parents: std::array::from_fn(|_| None),
+                input_parent_vk_hashes: std::array::from_fn(|_| None),
+            }
+            .generate_constraints(cs)
+            .unwrap()
+        });
     }
 
     /// Phase 4 spike: what the recursive verifier costs with the wrap VK as a
