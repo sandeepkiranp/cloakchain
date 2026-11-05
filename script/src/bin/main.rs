@@ -46,7 +46,7 @@
 use std::time::Instant;
 
 use ark_ec::pairing::Pairing;
-use ark_gm17::{Proof, VerifyingKey};
+use cloakkchain_circuit_wrap::snark::{self, Proof, VerifyingKey};
 use ark_mnt4_753::MNT4_753;
 use ark_mnt6_753::MNT6_753;
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
@@ -344,7 +344,7 @@ fn fmt_mem_kb(kb: u64) -> String {
 fn print_prove_table(stats: &[ProveStats]) {
     let w = 122;
     println!("\n{}", "=".repeat(w));
-    println!("  Proof Statistics");
+    println!("  Proof Statistics ({})", snark::NAME);
     println!("{}", "=".repeat(w));
     println!(
         "{:<28} {:>5}  {:>11}  {:>9}  {:>10}  {:>11}  {:>11}  {:>11}",
@@ -446,7 +446,7 @@ fn run_execute(genesis: &Party, genesis_coin: &Coin, alice_coin: &Coin) {
     println!("  constraints: {}", cs.num_constraints());
     println!("  satisfied:   {satisfied}");
     assert!(satisfied);
-    println!("\nRun --prove for the full chain (real GM17 proofs; --copies sets how many folds Bob proves).");
+    println!("\nRun --prove for the full chain (real {} proofs; --copies sets how many folds Bob proves).", snark::NAME);
 }
 
 // ---- One step of the chain ---------------------------------------------------

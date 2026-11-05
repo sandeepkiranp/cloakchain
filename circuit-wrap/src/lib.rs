@@ -33,10 +33,9 @@ use ark_crypto_primitives::sponge::{
     CryptographicSponge, FieldBasedCryptographicSponge,
 };
 use ark_ff::{BigInteger, Field, PrimeField};
-use ark_gm17::{
-    constraints::{GM17VerifierGadget, ProofVar},
-    GM17, Proof, ProvingKey, VerifyingKey,
-};
+pub mod snark;
+
+use snark::{PreparedVerifyingKeyVar, Proof, ProofVar, ProvingKey, Snark, VerifierGadget, VerifyingKey};
 use ark_mnt4_753::MNT4_753;
 use ark_mnt6_753::MNT6_753;
 use ark_ec::short_weierstrass::SWCurveConfig;
@@ -145,12 +144,14 @@ where
     infinity.select(&Point::<P>::zero(), &result)
 }
 
-/// GM17 verification of an MNT4-753 proof, as `GM17VerifierGadget` does it,
+/// Verification of an MNT4-753 proof, as the proof system's own gadget does it,
 /// except that the public-input sum uses [`scalar_mul_le_compact`]: with a
-/// witness VK, `query` is a witness, and the gadget's own sum was by far the
-/// densest part of this circuit.
-fn verify_gm17_mnt4(
-    pvk: &ark_gm17::constraints::PreparedVerifyingKeyVar<MNT4_753, MNT4PairingVar>,
+/// witness VK, the input bases are witnesses, and the gadget's own sum was by
+/// far the densest part of this circuit. One version per proof system, since
+/// each follows its own verification equation.
+#[cfg(not(feature = "groth16"))]
+fn verify_mnt4(
+    pvk: &PreparedVerifyingKeyVar<MNT4_753, MNT4PairingVar>,
     inputs: &[Vec<Boolean<Fr6>>],
     proof: &ProofVar<MNT4_753, MNT4PairingVar>,
 ) -> Result<Boolean<Fr6>, SynthesisError> {
@@ -184,6 +185,30 @@ fn verify_gm17_mnt4(
     Ok(&test1.is_eq(&one)? & &test2.is_eq(&one)?)
 }
 
+/// See the GM17 version above. Groth16's single check:
+/// `e(A, B) · e(Σ xᵢ·γᵢ, −γ) · e(C, −δ) == e(α, β)`.
+#[cfg(feature = "groth16")]
+fn verify_mnt4(
+    pvk: &PreparedVerifyingKeyVar<MNT4_753, MNT4PairingVar>,
+    inputs: &[Vec<Boolean<Fr6>>],
+    proof: &ProofVar<MNT4_753, MNT4PairingVar>,
+) -> Result<Boolean<Fr6>, SynthesisError> {
+    assert_eq!(inputs.len() + 1, pvk.gamma_abc_g1.len());
+    let mut g_ic = pvk.gamma_abc_g1[0].clone();
+    for (bits, base) in inputs.iter().zip(&pvk.gamma_abc_g1[1..]) {
+        g_ic += scalar_mul_le_compact(base, bits)?;
+    }
+    let test = MNT4PairingVar::final_exponentiation(&MNT4PairingVar::miller_loop(
+        &[
+            MNT4PairingVar::prepare_g1(&proof.a)?,
+            MNT4PairingVar::prepare_g1(&g_ic)?,
+            MNT4PairingVar::prepare_g1(&proof.c)?,
+        ],
+        &[MNT4PairingVar::prepare_g2(&proof.b)?, pvk.gamma_g2_neg_pc.clone(), pvk.delta_g2_neg_pc.clone()],
+    )?)?;
+    test.is_eq(&pvk.alpha_g1_beta_g2)
+}
+
 /// Bits of the Poseidon digest kept as a VK's hash: few enough that the value
 /// fits below `Fr4`'s modulus, so it can be the inner proof's public input, and
 /// still 300-bit collision resistance.
@@ -194,11 +219,12 @@ pub const VK_HASH_BITS: usize = 600;
 /// `x, y`; `G2` points, over a quadratic extension, give `x.c0, x.c1, y.c0,
 /// y.c1`. The order is part of the hash's definition.
 fn vk_coordinates(vk: &VerifyingKey<MNT4_753>) -> Vec<Fr6> {
+    let (g1s, g2s) = snark::vk_points(vk);
     let mut out = Vec::new();
-    for g in [vk.g_alpha_g1, vk.g_gamma_g1].iter().chain(vk.query.iter()) {
+    for g in g1s {
         out.extend([g.x, g.y]);
     }
-    for g in [vk.h_g2, vk.h_beta_g2, vk.h_gamma_g2] {
+    for g in g2s {
         out.extend([g.x.c0, g.x.c1, g.y.c0, g.y.c1]);
     }
     out
@@ -217,14 +243,15 @@ pub fn inner_vk_hash(vk: &VerifyingKey<MNT4_753>) -> Fr4 {
 /// Mirrors [`inner_vk_hash`], returning the digest's low [`VK_HASH_BITS`] bits.
 fn inner_vk_hash_bits_var(
     cs: ConstraintSystemRef<Fr6>,
-    vk: &ark_gm17::constraints::VerifyingKeyVar<MNT4_753, MNT4PairingVar>,
+    vk: &snark::VerifyingKeyVar<MNT4_753, MNT4PairingVar>,
 ) -> Result<Vec<Boolean<Fr6>>, SynthesisError> {
+    let (g1s, g2s) = snark::vk_var_points(vk);
     let mut coordinates = Vec::new();
-    for g in [&vk.g_alpha_g1, &vk.g_gamma_g1].into_iter().chain(vk.query.iter()) {
+    for g in g1s {
         let affine = g.to_affine()?;
         coordinates.extend([affine.x, affine.y]);
     }
-    for g in [&vk.h_g2, &vk.h_beta_g2, &vk.h_gamma_g2] {
+    for g in g2s {
         let affine = g.to_affine()?;
         coordinates.extend([affine.x.c0, affine.x.c1, affine.y.c0, affine.y.c1]);
     }
@@ -271,7 +298,7 @@ impl<const N: usize> ConstraintSynthesizer<Fr6> for WrapCircuit<N> {
         // under a VK pinned by the inner proof's own last public input. That
         // input's bits must be exactly the hash's, high bits zero: so it's also
         // canonical, with no alias `v + p` to pass for it.
-        let vk_var = GM17VerifierGadget::<MNT4_753, MNT4PairingVar>::new_verification_key_unchecked(
+        let vk_var = VerifierGadget::<MNT4_753, MNT4PairingVar>::new_verification_key_unchecked(
             cs.clone(),
             || Ok(self.inner_vk.clone()),
             AllocationMode::Witness,
@@ -286,7 +313,7 @@ impl<const N: usize> ConstraintSynthesizer<Fr6> for WrapCircuit<N> {
         }
         let proof_var = ProofVar::<MNT4_753, MNT4PairingVar>::new_witness(cs.clone(), || opt(&self.inner_proof))?;
         let pvk = vk_var.prepare()?;
-        verify_gm17_mnt4(&pvk, &per_value_bits, &proof_var)?.enforce_equal(&Boolean::TRUE)?;
+        verify_mnt4(&pvk, &per_value_bits, &proof_var)?.enforce_equal(&Boolean::TRUE)?;
 
         // Re-expose each value losslessly as small public Fr6 inputs — see
         // the module doc comment for why not `BooleanInputVar`'s own
@@ -349,10 +376,7 @@ pub fn public_input_chunks(values: &[Fr4]) -> Vec<Fr6> {
 /// A verifying key of the shape an `N`-public-input inner circuit has. Setup
 /// only needs the shape, since the inner VK is a witness.
 pub fn shaped_inner_vk(n: usize) -> VerifyingKey<MNT4_753> {
-    use ark_ec::{CurveGroup, PrimeGroup};
-    let g1 = ark_mnt4_753::G1Projective::generator().into_affine();
-    let g2 = ark_mnt4_753::G2Projective::generator().into_affine();
-    VerifyingKey { h_g2: g2, g_alpha_g1: g1, h_beta_g2: g2, g_gamma_g1: g1, h_gamma_g2: g2, query: vec![g1; n + 1] }
+    snark::shaped_vk::<MNT4_753>(n)
 }
 
 /// One setup serves every inner circuit with `N` public inputs, of every
@@ -371,7 +395,7 @@ pub fn setup<const N: usize, R: RngCore + CryptoRng>(
         c: ark_mnt4_753::G1Affine::identity(),
     };
     let circuit = WrapCircuit::<N> { inner_vk: shaped_inner_vk(N), inner_proof: Some(dummy_proof), inner_public_inputs: None };
-    GM17::<MNT6_753>::circuit_specific_setup(circuit, rng)
+    Snark::<MNT6_753>::circuit_specific_setup(circuit, rng)
 }
 
 pub fn prove<const N: usize, R: RngCore + CryptoRng>(
@@ -379,7 +403,7 @@ pub fn prove<const N: usize, R: RngCore + CryptoRng>(
     circuit: WrapCircuit<N>,
     rng: &mut R,
 ) -> Result<Proof<MNT6_753>, SynthesisError> {
-    GM17::<MNT6_753>::prove(pk, circuit, rng)
+    Snark::<MNT6_753>::prove(pk, circuit, rng)
 }
 
 pub fn verify(
@@ -387,12 +411,13 @@ pub fn verify(
     public_inputs: &[Fr6],
     proof: &Proof<MNT6_753>,
 ) -> Result<bool, SynthesisError> {
-    GM17::<MNT6_753>::verify(vk, public_inputs, proof)
+    Snark::<MNT6_753>::verify(vk, public_inputs, proof)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "groth16"))]
     use ark_crypto_primitives::snark::BooleanInputVar;
     use ark_std::rand::{rngs::StdRng, SeedableRng};
 
@@ -443,6 +468,7 @@ mod tests {
     /// verifier costs with the inner VK as a witness instead of a constant, for
     /// `N` inner public inputs. `cargo test --release report_inner_verifier_costs
     /// -- --nocapture`. Setup-mode synthesis only.
+    #[cfg(not(feature = "groth16"))]
     #[test]
     fn report_inner_verifier_costs() {
         use ark_crypto_primitives::snark::SNARKGadget;
@@ -464,7 +490,7 @@ mod tests {
                 let cs = ConstraintSystem::<Fr6>::new_ref();
                 cs.set_mode(SynthesisMode::Setup);
                 let vk_var = if witness_vk {
-                    GM17VerifierGadget::<MNT4_753, MNT4PairingVar>::new_verification_key_unchecked(
+                    VerifierGadget::<MNT4_753, MNT4PairingVar>::new_verification_key_unchecked(
                         cs.clone(),
                         || Ok(vk.clone()),
                         AllocationMode::Witness,
@@ -488,7 +514,7 @@ mod tests {
                 let dummy = Proof::<MNT4_753> { a: g1, b: g2, c: g1 };
                 let proof = ProofVar::<MNT4_753, MNT4PairingVar>::new_witness(cs.clone(), || Ok(dummy)).unwrap();
                 let before_verify = cs.num_constraints();
-                let _ = GM17VerifierGadget::<MNT4_753, MNT4PairingVar>::verify_with_processed_vk(&pvk, &input, &proof)
+                let _ = VerifierGadget::<MNT4_753, MNT4PairingVar>::verify_with_processed_vk(&pvk, &input, &proof)
                     .unwrap();
                 println!(
                     "N={n} vk {:<8}: prepare {:>7}  verify {:>8}  verifier total {:>8}",
@@ -524,12 +550,12 @@ mod tests {
     /// A real toy proof carrying `claimed_hash`, and the VK it verifies under.
     fn toy_proof(claimed_hash: Option<Fr4>) -> (VerifyingKey<MNT4_753>, Proof<MNT4_753>, [Fr4; 2]) {
         let mut rng = StdRng::seed_from_u64(7);
-        let (pk, vk) = GM17::<MNT4_753>::circuit_specific_setup(Toy::default(), &mut rng).unwrap();
+        let (pk, vk) = Snark::<MNT4_753>::circuit_specific_setup(Toy::default(), &mut rng).unwrap();
         let a = Fr4::from(6u64);
         let vk_hash = claimed_hash.unwrap_or_else(|| inner_vk_hash(&vk));
         let circuit = Toy { a: Some(a), b: Some(Fr4::from(7u64)), c: Some(Fr4::from(42u64)), vk_hash: Some(vk_hash) };
-        let proof = GM17::<MNT4_753>::prove(&pk, circuit, &mut rng).unwrap();
-        assert!(GM17::<MNT4_753>::verify(&vk, &[a, vk_hash], &proof).unwrap());
+        let proof = Snark::<MNT4_753>::prove(&pk, circuit, &mut rng).unwrap();
+        assert!(Snark::<MNT4_753>::verify(&vk, &[a, vk_hash], &proof).unwrap());
         (vk, proof, [a, vk_hash])
     }
 
@@ -568,6 +594,7 @@ mod tests {
     }
 
     /// Which part of the wrap circuit makes its matrices dense.
+    #[cfg(not(feature = "groth16"))]
     #[test]
     fn report_wrap_density() {
         use ark_ec::PrimeGroup;
@@ -587,7 +614,7 @@ mod tests {
             );
         }
         let witness_vk = |cs: ConstraintSystemRef<Fr6>| {
-            GM17VerifierGadget::<MNT4_753, MNT4PairingVar>::new_verification_key_unchecked(
+            VerifierGadget::<MNT4_753, MNT4PairingVar>::new_verification_key_unchecked(
                 cs,
                 || Ok(shaped_inner_vk(8)),
                 AllocationMode::Witness,
@@ -660,7 +687,7 @@ mod tests {
             let g1 = ark_mnt4_753::G1Affine::identity();
             let dummy = Proof::<MNT4_753> { a: g1, b: ark_mnt4_753::G2Affine::identity(), c: g1 };
             let proof = ProofVar::<MNT4_753, MNT4PairingVar>::new_witness(cs, || Ok(dummy)).unwrap();
-            let _ = verify_gm17_mnt4(&pvk, &bits, &proof).unwrap();
+            let _ = verify_mnt4(&pvk, &bits, &proof).unwrap();
         });
         report("verify, witness vk, gadget", |cs| {
             let pvk = witness_vk(cs.clone()).prepare().unwrap();
@@ -670,7 +697,7 @@ mod tests {
             let g1 = ark_mnt4_753::G1Affine::identity();
             let dummy = Proof::<MNT4_753> { a: g1, b: ark_mnt4_753::G2Affine::identity(), c: g1 };
             let proof = ProofVar::<MNT4_753, MNT4PairingVar>::new_witness(cs, || Ok(dummy)).unwrap();
-            let _ = GM17VerifierGadget::<MNT4_753, MNT4PairingVar>::verify_with_processed_vk(
+            let _ = VerifierGadget::<MNT4_753, MNT4PairingVar>::verify_with_processed_vk(
                 &pvk,
                 &BooleanInputVar::<Fr4, Fr6>::new(bits),
                 &proof,
@@ -683,7 +710,7 @@ mod tests {
     fn vk_hash_gadget_matches_native() {
         let vk = toy_proof(None).0;
         let cs = ark_relations::r1cs::ConstraintSystem::<Fr6>::new_ref();
-        let vk_var = GM17VerifierGadget::<MNT4_753, MNT4PairingVar>::new_verification_key_unchecked(
+        let vk_var = VerifierGadget::<MNT4_753, MNT4PairingVar>::new_verification_key_unchecked(
             cs.clone(),
             || Ok(vk.clone()),
             AllocationMode::Witness,

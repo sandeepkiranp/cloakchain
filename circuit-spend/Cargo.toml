@@ -18,3 +18,7 @@ ark-r1cs-std = { workspace = true }
 ark-crypto-primitives = { workspace = true, features = ["r1cs", "sponge", "crh"] }
 ark-mnt4-753 = { workspace = true, features = ["r1cs", "curve"] }
 ark-mnt6-753 = { workspace = true, features = ["r1cs"] }
+
+[features]
+# Prove with Groth16 instead of GM17 — see `circuit-wrap/src/snark.rs`.
+groth16 = ["cloakkchain-circuit-wrap/groth16"]

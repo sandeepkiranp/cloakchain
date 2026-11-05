@@ -68,10 +68,7 @@ use ark_crypto_primitives::sponge::{
 };
 use ark_ec::{AffineRepr, CurveGroup, PrimeGroup};
 use ark_ff::{BigInteger, PrimeField};
-use ark_gm17::{
-    constraints::{GM17VerifierGadget, ProofVar, VerifyingKeyVar},
-    GM17, Proof, ProvingKey, VerifyingKey,
-};
+use cloakkchain_circuit_wrap::snark::{Proof, ProofVar, ProvingKey, Snark, VerifierGadget, VerifyingKey, VerifyingKeyVar};
 use ark_mnt4_753::MNT4_753;
 use ark_mnt6_753::MNT6_753;
 use ark_r1cs_std::{fields::fp::FpVar, prelude::*};
@@ -1058,7 +1055,7 @@ impl ConstraintSynthesizer<Fr> for SpendStepCircuit {
             let parent_proof_native = self.input_parent_proofs[i].clone().unwrap_or_else(Self::dummy_wrap_proof);
             let parent_proof_var =
                 ProofVar::<MNT6_753, MNT6PairingVar>::new_witness(cs.clone(), || Ok(parent_proof_native))?;
-            let parent_recursive_ok = GM17VerifierGadget::<MNT6_753, MNT6PairingVar>::verify_with_processed_vk(
+            let parent_recursive_ok = VerifierGadget::<MNT6_753, MNT6PairingVar>::verify_with_processed_vk(
                 &pvk,
                 &parent_input_var,
                 &parent_proof_var,
@@ -1123,7 +1120,7 @@ pub fn setup_non_genesis<R: RngCore + CryptoRng>(
         input_parent_statements: std::array::from_fn(|_| None),
         input_parents: std::array::from_fn(|_| None),
     };
-    GM17::<MNT4_753>::circuit_specific_setup(circuit, rng)
+    Snark::<MNT4_753>::circuit_specific_setup(circuit, rng)
 }
 
 pub fn prove_non_genesis<R: RngCore + CryptoRng>(
@@ -1131,7 +1128,7 @@ pub fn prove_non_genesis<R: RngCore + CryptoRng>(
     circuit: SpendStepCircuit,
     rng: &mut R,
 ) -> Result<Proof<MNT4_753>, SynthesisError> {
-    GM17::<MNT4_753>::prove(pk, circuit, rng)
+    Snark::<MNT4_753>::prove(pk, circuit, rng)
 }
 
 pub fn verify_non_genesis(
@@ -1139,13 +1136,13 @@ pub fn verify_non_genesis(
     public_inputs: &[Fr],
     proof: &Proof<MNT4_753>,
 ) -> Result<bool, SynthesisError> {
-    GM17::<MNT4_753>::verify(vk, public_inputs, proof)
+    Snark::<MNT4_753>::verify(vk, public_inputs, proof)
 }
 
 pub fn setup<R: RngCore + CryptoRng>(
     rng: &mut R,
 ) -> Result<(ProvingKey<MNT4_753>, VerifyingKey<MNT4_753>), SynthesisError> {
-    GM17::<MNT4_753>::circuit_specific_setup(GenesisSpendCircuit::default(), rng)
+    Snark::<MNT4_753>::circuit_specific_setup(GenesisSpendCircuit::default(), rng)
 }
 
 pub fn prove<R: RngCore + CryptoRng>(
@@ -1153,7 +1150,7 @@ pub fn prove<R: RngCore + CryptoRng>(
     circuit: GenesisSpendCircuit,
     rng: &mut R,
 ) -> Result<Proof<MNT4_753>, SynthesisError> {
-    GM17::<MNT4_753>::prove(pk, circuit, rng)
+    Snark::<MNT4_753>::prove(pk, circuit, rng)
 }
 
 pub fn verify(
@@ -1161,7 +1158,7 @@ pub fn verify(
     public_inputs: &[Fr],
     proof: &Proof<MNT4_753>,
 ) -> Result<bool, SynthesisError> {
-    GM17::<MNT4_753>::verify(vk, public_inputs, proof)
+    Snark::<MNT4_753>::verify(vk, public_inputs, proof)
 }
 
 /// Tests named `proving_*` run real GM17 setup and proving. They need far more
@@ -1874,16 +1871,7 @@ mod tests {
     /// A verifying key of the right shape. Synthesis only needs that, so the
     /// constraint count doesn't require any setup or proving.
     fn shaped_wrap_vk() -> VerifyingKey<MNT6_753> {
-        let g1 = ark_mnt6_753::G1Projective::generator().into_affine();
-        let g2 = ark_mnt6_753::G2Projective::generator().into_affine();
-        VerifyingKey {
-            h_g2: g2,
-            g_alpha_g1: g1,
-            h_beta_g2: g2,
-            g_gamma_g1: g1,
-            h_gamma_g2: g2,
-            query: vec![g1; SPEND_PUBLIC_INPUT_COUNT * chunks_per_value() + 1],
-        }
+        cloakkchain_circuit_wrap::snark::shaped_vk::<MNT6_753>(SPEND_PUBLIC_INPUT_COUNT * chunks_per_value())
     }
 
     fn step_circuit_for_counting() -> SpendStepCircuit {
@@ -2004,7 +1992,7 @@ mod tests {
             Ok(SpendStepCircuit::dummy_wrap_proof())
         })
         .unwrap();
-        let ok = GM17VerifierGadget::<MNT6_753, MNT6PairingVar>::verify_with_processed_vk(
+        let ok = VerifierGadget::<MNT6_753, MNT6PairingVar>::verify_with_processed_vk(
             &pvk,
             &BooleanInputVar::<Fr6, Fr>::new(bits.clone()),
             &proof,
@@ -2099,7 +2087,7 @@ mod tests {
             for bits_per_chunk in [Fr6::MODULUS_BIT_SIZE as usize, cloakkchain_circuit_wrap::CHUNK_BITS] {
                 let cs = setup_mode_cs();
                 let vk = if witness_vk {
-                    GM17VerifierGadget::<MNT6_753, MNT6PairingVar>::new_verification_key_unchecked(
+                    VerifierGadget::<MNT6_753, MNT6PairingVar>::new_verification_key_unchecked(
                         cs.clone(),
                         || Ok(shaped_wrap_vk()),
                         AllocationMode::Witness,
@@ -2120,7 +2108,7 @@ mod tests {
                 })
                 .unwrap();
                 let before_verify = cs.num_constraints();
-                let _ = GM17VerifierGadget::<MNT6_753, MNT6PairingVar>::verify_with_processed_vk(&pvk, &input, &proof)
+                let _ = VerifierGadget::<MNT6_753, MNT6PairingVar>::verify_with_processed_vk(&pvk, &input, &proof)
                     .unwrap();
                 println!(
                     "vk {:<8} {:>3}-bit chunks: alloc {:>7}  prepare {:>7}  verify {:>8}  total {:>8}",

@@ -13,7 +13,12 @@ ark-relations = { workspace = true }
 ark-serialize = { workspace = true }
 ark-snark = { workspace = true }
 ark-gm17 = { workspace = true, features = ["r1cs"] }
+ark-groth16 = { workspace = true, features = ["r1cs"], optional = true }
 ark-r1cs-std = { workspace = true }
 ark-crypto-primitives = { workspace = true, features = ["r1cs", "sponge", "crh"] }
 ark-mnt4-753 = { workspace = true, features = ["r1cs", "curve"] }
 ark-mnt6-753 = { workspace = true, features = ["r1cs"] }
+
+[features]
+# Prove with Groth16 instead of GM17 — see `src/snark.rs`.
+groth16 = ["dep:ark-groth16"]
