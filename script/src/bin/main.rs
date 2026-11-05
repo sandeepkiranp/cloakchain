@@ -961,8 +961,8 @@ fn run_prove(copies: u32) {
 // `run_prove`'s demo chain only ever exercises one compiled shape at a time
 // (the committed baseline); this function exists so the same measurement
 // methodology (real proving, subprocess-isolated memory) can be pointed at the
-// other cells of the grid by temporarily editing that crate's MAX_OUTPUTS const
-// (never committed) and rerunning `--grid-cell`. MAX_INPUTS stays 1 until
+// other cells of the grid: build with `--features single-output` for the
+// 1-output row (add `groth16` for Groth16). MAX_INPUTS stays 1 until
 // `BoardEntry` holds one serial number and signature per input: `circuit-spend`
 // refuses to compile otherwise.
 //

@@ -106,8 +106,12 @@ type MNT6PairingVar = ark_mnt6_753::constraints::PairingVar;
 /// Revisit raising this back to 2+ if/when multi-input spends are needed;
 /// nothing else about the padding/`is_active` design changes with `N`.
 pub const MAX_INPUTS: usize = 1;
-/// Up to this many real output coins per spend.
+/// Up to this many real output coins per spend. The `single-output` feature
+/// builds the 1-output shape, for measuring that row of the paper's table.
+#[cfg(not(feature = "single-output"))]
 pub const MAX_OUTPUTS: usize = 2;
+#[cfg(feature = "single-output")]
+pub const MAX_OUTPUTS: usize = 1;
 
 // More inputs need one serial number and signature per input on `BoardEntry`,
 // which holds one of each today: the leaf a parent check opens would only bind
@@ -1822,6 +1826,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "single-output"))]
     fn two_real_outputs_with_conservation_satisfies_constraints() {
         let (_, bob_pk) = owner(2);
         let outputs = [coin(4, 40, bob_pk), coin(6, 60, genesis_pk())];
@@ -1889,6 +1894,7 @@ mod tests {
     /// commitment used to be unconstrained, so a spender could publish any coin
     /// there without its value ever counting towards conservation.
     #[test]
+    #[cfg(not(feature = "single-output"))]
     fn phantom_commitment_in_an_inactive_output_slot_fails() {
         let mut c = genesis_circuit();
         assert!(c.core.output_coins[1].is_none());
