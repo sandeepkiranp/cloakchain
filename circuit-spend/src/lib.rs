@@ -1983,6 +1983,108 @@ mod tests {
         report("SpendStepCircuit", |cs| step_circuit_for_counting().generate_constraints(cs).unwrap());
     }
 
+    /// Measurement only, for choosing a batch size: a fold circuit with `b`
+    /// occurrence slots, built from the same pieces as `SpendStepCircuit`'s
+    /// fold mode (recursive verification, statement copy) but with the key,
+    /// the outputs hash and the statement shared across slots. Not used to
+    /// prove anything.
+    fn batched_fold_skeleton(cs: ConstraintSystemRef<Fr>, b: usize) {
+        let inputs: Vec<Fp> =
+            (0..SPEND_PUBLIC_INPUT_COUNT).map(|_| Fp::new_input(cs.clone(), || Ok(Fr::from(0u64))).unwrap()).collect();
+
+        let pvk = VerifyingKeyVar::<MNT6_753, MNT6PairingVar>::new_constant(cs.clone(), shaped_wrap_vk())
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let cpv = chunks_per_value();
+        let bits: Vec<Vec<Boolean<Fr>>> = (0..SPEND_PUBLIC_INPUT_COUNT * cpv)
+            .map(|_| (0..CHUNK_BITS).map(|_| Boolean::new_witness(cs.clone(), || Ok(false)).unwrap()).collect())
+            .collect();
+        let proof = ProofVar::<MNT6_753, MNT6PairingVar>::new_witness(cs.clone(), || {
+            Ok(SpendStepCircuit::dummy_wrap_proof())
+        })
+        .unwrap();
+        let ok = GM17VerifierGadget::<MNT6_753, MNT6PairingVar>::verify_with_processed_vk(
+            &pvk,
+            &BooleanInputVar::<Fr6, Fr>::new(bits.clone()),
+            &proof,
+        )
+        .unwrap();
+        ok.enforce_equal(&Boolean::TRUE).unwrap();
+        let group = |idx: usize| combine_chunks_var(&bits[idx * cpv..(idx + 1) * cpv]).unwrap();
+        let pv = ParentPublicVars {
+            output_commitments: (0..MAX_OUTPUTS).map(|j| group(PARENT_OUTPUT_COMMITMENTS_START + j)).collect(),
+            anchor_size: group(PARENT_ANCHOR_SIZE),
+            anchor_board_root: group(PARENT_ANCHOR_BOARD_ROOT),
+            anchor_nullifier_root: group(PARENT_ANCHOR_NULLIFIER_ROOT),
+            nullifier: group(PARENT_NULLIFIER),
+            vpk_hash: group(PARENT_VPK_HASH),
+            window_head: group(PARENT_WINDOW_HEAD),
+            vk_hash: group(PARENT_VK_HASH),
+        };
+        for (mine, theirs) in inputs.iter().zip(pv.statement()) {
+            mine.enforce_equal(&theirs).unwrap();
+        }
+
+        // Shared across slots.
+        let vpk = CoinKeyVar::new_witness(cs.clone(), None).unwrap();
+        vpk.hash(cs.clone()).unwrap().enforce_equal(&pv.vpk_hash).unwrap();
+        let outputs_hash = poseidon_hash_var(cs.clone(), &pv.output_commitments).unwrap();
+
+        // Per slot: a prefix of active slots, each linked and checked.
+        let mut head = pv.window_head.clone();
+        let mut previous_active = Boolean::TRUE;
+        for _ in 0..b {
+            let active = Boolean::new_witness(cs.clone(), || Ok(true)).unwrap();
+            (&!active.clone() | &previous_active).enforce_equal(&Boolean::TRUE).unwrap();
+            previous_active = active.clone();
+            let occ_outputs_hash = alloc_fp(cs.clone(), None).unwrap();
+            let occ_ciphertext = alloc_fp(cs.clone(), None).unwrap();
+            let occ_signature = CoinSignatureVar::new_witness(cs.clone(), None).unwrap();
+            let msg = signature_message_var(cs.clone(), &pv.nullifier, &occ_outputs_hash, &occ_ciphertext).unwrap();
+            let valid = occ_signature.verify(cs.clone(), &vpk, &msg).unwrap();
+            let harmless = &occ_outputs_hash.is_eq(&outputs_hash).unwrap() | &!valid;
+            gate(harmless, &active).enforce_equal(&Boolean::TRUE).unwrap();
+            let linked =
+                occurrence_link_var(cs.clone(), &head, &occ_outputs_hash, &occ_ciphertext, &occ_signature).unwrap();
+            head = Fp::conditionally_select(&active, &linked, &head).unwrap();
+        }
+        head.enforce_equal(&inputs[PARENT_WINDOW_HEAD]).unwrap();
+    }
+
+    /// `cargo test --release report_batched_fold_costs -- --nocapture`.
+    #[test]
+    fn report_batched_fold_costs() {
+        for b in [1usize, 2, 4, 8, 16, 32] {
+            let cs = setup_mode_cs();
+            batched_fold_skeleton(cs.clone(), b);
+            cs.finalize();
+            let m = cs.to_matrices().unwrap();
+            println!(
+                "B={b:<3} constraints {:>8}  nonzeros A {:>9} B {:>9} C {:>8}  total {:>9}",
+                cs.num_constraints(),
+                m.a_num_non_zero,
+                m.b_num_non_zero,
+                m.c_num_non_zero,
+                m.a_num_non_zero + m.b_num_non_zero + m.c_num_non_zero,
+            );
+        }
+        for (name, build) in [
+            ("GenesisSpendCircuit", Box::new(|cs: ConstraintSystemRef<Fr>| GenesisSpendCircuit::default().generate_constraints(cs).unwrap()) as Box<dyn Fn(ConstraintSystemRef<Fr>)>),
+            ("SpendStepCircuit", Box::new(|cs: ConstraintSystemRef<Fr>| step_circuit_for_counting().generate_constraints(cs).unwrap())),
+        ] {
+            let cs = setup_mode_cs();
+            build(cs.clone());
+            cs.finalize();
+            let m = cs.to_matrices().unwrap();
+            println!(
+                "{name:<20} constraints {:>8}  nonzeros total {:>9}",
+                cs.num_constraints(),
+                m.a_num_non_zero + m.b_num_non_zero + m.c_num_non_zero,
+            );
+        }
+    }
+
     /// Phase 4 spike: what the recursive verifier costs with the wrap VK as a
     /// witness (needed for a universal VK) instead of a constant, and with each
     /// public-input chunk fed in as its full width or only the 200 bits the wrap
