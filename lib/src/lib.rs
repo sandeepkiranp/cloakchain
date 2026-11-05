@@ -869,13 +869,6 @@ impl IncrementalTree {
 // comparisons must use `circuit-spend`'s own comparator: `ark-r1cs-std` 0.5's
 // slice comparison isn't numeric, see `bits_msb_is_lt`.
 
-/// The most occurrences of one nullifier a spend proof can open when checking
-/// its parent's window. **A stopgap**: `MAX_SN_OCCURRENCES + 1` copies landing
-/// between a spend's broadcast and its inclusion still brick the coin, since
-/// its recipient could never spend onward. The fix is a recursive "check one
-/// more occurrence" circuit with no cap, which is still to be built.
-pub const MAX_SN_OCCURRENCES: usize = 2;
-
 /// One leaf of the indexed nullifier tree.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, CanonicalSerialize, CanonicalDeserialize)]
 pub struct IndexedLeaf {
@@ -987,18 +980,19 @@ pub fn verify_occurrences(root: Fr, target: Fr, witness: &WindowWitness) -> bool
 }
 
 /// The window check: against `root` (the accumulator just before a parent's
-/// slot), the parent's nullifier has at most [`MAX_SN_OCCURRENCES`]
-/// occurrences and all are harmless to a spend of `outputs_hash`. Together
-/// with the parent's own proof that the nullifier was absent at its anchor,
-/// this covers everything between that anchor and the parent's slot.
+/// slot), every occurrence of the parent's nullifier is harmless to a spend of
+/// `outputs_hash`, however many there are. Together with the parent's own proof
+/// that the nullifier was absent at its anchor, this covers everything between
+/// that anchor and the parent's slot. In-circuit, the occurrences are checked
+/// one recursive "fold" step at a time (see `circuit-spend`), so copies cost
+/// their victim proving time but can't make a coin unspendable.
 pub fn check_window(root: Fr, nullifier: Fr, vpk: &OwnerPk, outputs_hash: Fr, witness: &WindowWitness) -> bool {
     if witness.occurrences.is_empty() {
         witness.leaf.value < nullifier
             && nullifier < witness.leaf.next_value
             && compute_root_from_path(witness.leaf.hash(), witness.leaf_index as usize, &witness.sibling_path) == root
     } else {
-        witness.occurrences.len() <= MAX_SN_OCCURRENCES
-            && verify_occurrences(root, nullifier, witness)
+        verify_occurrences(root, nullifier, witness)
             && witness.occurrences.iter().all(|o| o.is_harmless(nullifier, vpk, outputs_hash))
     }
 }
@@ -1375,9 +1369,6 @@ pub fn check_receipt(
     let window = history.occurrences_between(entry.nullifier, size, slot);
     if window.iter().any(|o| !o.occurrence().is_harmless(entry.nullifier, &tx.vpk, opening.outputs_hash)) {
         return Err("double-spend: a validly signed spend of different outputs came first");
-    }
-    if window.len() > MAX_SN_OCCURRENCES {
-        return Err("too many occurrences before the carrier: the coin could not be spent onward");
     }
 
     Ok(public_values)
@@ -2115,34 +2106,20 @@ mod tests {
         assert_eq!(err.err(), Some("parent's vpk does not match its proof"));
     }
 
-    // ---- the occurrence bound ------------------------------------------------
+    // ---- no cap on copies ----------------------------------------------------
 
+    /// No number of copies makes a coin unspendable; they only cost its next
+    /// spender one fold step each.
     #[test]
-    fn up_to_max_copies_are_tolerated() {
+    fn any_number_of_copies_is_tolerated() {
         let mut w = world();
         let alice = w.alice_spends(&w.bob_coin, 1, 1).unwrap();
-        for i in 0..MAX_SN_OCCURRENCES {
-            w.history.append(&junk_copy(w.alice_nullifier(), i as u8 + 1));
+        for i in 0..5 {
+            w.history.append(&junk_copy(w.alice_nullifier(), i + 1));
         }
         let slot = w.history.append(&alice.entry);
         w.receipt(slot, &alice).unwrap();
         w.bob_spends_onward(slot, &alice).unwrap();
-    }
-
-    /// The documented limitation of M, pending the recursive window check.
-    #[test]
-    fn more_than_max_copies_are_rejected() {
-        let mut w = world();
-        let alice = w.alice_spends(&w.bob_coin, 1, 1).unwrap();
-        for i in 0..=MAX_SN_OCCURRENCES {
-            w.history.append(&junk_copy(w.alice_nullifier(), i as u8 + 1));
-        }
-        let slot = w.history.append(&alice.entry);
-        assert_eq!(
-            w.receipt(slot, &alice).err(),
-            Some("too many occurrences before the carrier: the coin could not be spent onward"),
-        );
-        assert_eq!(w.bob_spends_onward(slot, &alice).err(), Some("parent's window is not clean"));
     }
 
     #[test]
@@ -2150,7 +2127,7 @@ mod tests {
         let mut w = world();
         let alice = w.alice_spends(&w.bob_coin, 1, 1).unwrap();
         let slot = w.history.append(&alice.entry);
-        for i in 0..=MAX_SN_OCCURRENCES {
+        for i in 0..3 {
             w.history.append(&junk_copy(w.alice_nullifier(), i as u8 + 1));
         }
         w.receipt(slot, &alice).unwrap();

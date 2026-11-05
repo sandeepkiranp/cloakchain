@@ -11,8 +11,21 @@
 //! from before it was posted, and never to the slot it lands at, so another
 //! entry landing first doesn't invalidate it. Serial numbers are public and
 //! copyable, so an occurrence of one doesn't prove anything by itself: the
-//! spender opens its parent's window and shows each occurrence there is either
-//! the same spend or carries an invalid signature. See [`parent_checks`].
+//! spender shows each occurrence in its parent's window is either the same spend
+//! or carries an invalid signature. See [`parent_checks`].
+//!
+//! **Folding, with no cap on copies.** `SpendStepCircuit` has a private mode
+//! bit. In *spend* mode it is the spend relation. In *fold* mode it verifies a
+//! proof `R` (a spend proof `P`, or an earlier fold over `P`), copies `R`'s
+//! statement as its own, and checks one more occurrence of `P`'s serial number is
+//! harmless ([`fold_step`]). Every proof publishes a `window_head`: `0` for a
+//! spend, the occurrence chain's head for a fold. A spend takes whatever proof it
+//! verifies as its parent's statement plus a certified window, and only has to
+//! show that head is exactly what `P`'s serial number has in the accumulator just
+//! before `P`'s slot. So `k` copies cost `P`'s next spender `k` fold steps, an
+//! honest spend with an empty window pays for none, and nothing can make a coin
+//! unspendable. Both modes are one circuit, so one VK, which is what lets folds
+//! verify each other.
 //!
 //! **Totality.** Window occurrences can be arbitrary junk posted by anyone. So
 //! checking one must *evaluate to false*, never make the circuit unsatisfiable:
@@ -72,8 +85,8 @@ use cloakkchain_circuit_wrap::{
 use cloakkchain_lib::{
     derive_coin_vpk, derive_nullifier, genesis_pk, hash_vpk, owner_pk_to_field_pair, poseidon_params, Anchor,
     Coin, CoinSignature, Fr, IndexedLeaf, LeafOpening, NonMembershipWitness, Occurrence, OwnerPk, OwnerScalar,
-    ParentWitness, SpendPublicValues, WindowWitness, MAX_SN_OCCURRENCES, SIG_CHALLENGE_DOMAIN, SIG_KEY_DOMAIN,
-    SIG_S_LO_BITS, TREE_DEPTH,
+    ParentWitness, SpendPublicValues, WindowWitness, SIG_CHALLENGE_DOMAIN, SIG_KEY_DOMAIN, SIG_S_LO_BITS,
+    TREE_DEPTH,
 };
 
 type Fp = FpVar<Fr>;
@@ -101,9 +114,10 @@ const _: () = assert!(MAX_INPUTS == 1, "multi-input spends need BoardEntry to ca
 /// (both share the same layout):
 /// `output_commitments[0..MAX_OUTPUTS], anchor.size, anchor.board_root,
 /// anchor.nullifier_root, nullifiers[0..MAX_INPUTS], vpk_hashes[0..MAX_INPUTS],
-/// vk_hash`. `vk_hash` must be last: that's where the wrap circuit looks for it.
-/// `pk_p` and `vpk` are private witnesses, not part of this vector.
-pub const SPEND_PUBLIC_INPUT_COUNT: usize = MAX_OUTPUTS + 4 + 2 * MAX_INPUTS;
+/// window_head, vk_hash`. `vk_hash` must be last: that's where the wrap circuit
+/// looks for it. `pk_p` and `vpk` are private witnesses, not part of this
+/// vector.
+pub const SPEND_PUBLIC_INPUT_COUNT: usize = MAX_OUTPUTS + 5 + 2 * MAX_INPUTS;
 
 /// Index, within a recursively-verified parent spend proof's public-input
 /// chunk groups, of each value — mirrors [`spend_public_inputs`]'s order.
@@ -113,6 +127,7 @@ const PARENT_ANCHOR_BOARD_ROOT: usize = MAX_OUTPUTS + 1;
 const PARENT_ANCHOR_NULLIFIER_ROOT: usize = MAX_OUTPUTS + 2;
 const PARENT_NULLIFIER: usize = MAX_OUTPUTS + 3;
 const PARENT_VPK_HASH: usize = MAX_OUTPUTS + 3 + MAX_INPUTS;
+const PARENT_WINDOW_HEAD: usize = SPEND_PUBLIC_INPUT_COUNT - 2;
 const PARENT_VK_HASH: usize = SPEND_PUBLIC_INPUT_COUNT - 1;
 
 /// Pads a variable-length list of real output commitments out to `MAX_OUTPUTS`
@@ -127,17 +142,41 @@ pub fn pad_outputs(real: &[Fr]) -> [Fr; MAX_OUTPUTS] {
     out
 }
 
+/// What a proof of either circuit claims: a spend's public values, the window
+/// head it certifies (`0` for a spend proof, see the module doc comment), and
+/// `circuit_wrap::inner_vk_hash` of the key it's for.
+#[derive(Clone, Debug, PartialEq, Eq, CanonicalSerialize, CanonicalDeserialize)]
+pub struct StepStatement {
+    pub public_values: SpendPublicValues,
+    pub window_head: Fr,
+    pub vk_hash: Fr,
+}
+
+impl StepStatement {
+    pub fn public_inputs(&self) -> [Fr; SPEND_PUBLIC_INPUT_COUNT] {
+        spend_public_inputs(&self.public_values, self.window_head, self.vk_hash)
+    }
+}
+
+/// What one fold step adds: an occurrence of the statement's serial number, and
+/// the per-coin key its harmlessness is judged under.
+#[derive(Clone, Debug, PartialEq, Eq, CanonicalSerialize, CanonicalDeserialize)]
+pub struct FoldWitness {
+    pub vpk: OwnerPk,
+    pub occurrence: Occurrence,
+}
+
 /// The GM17 public-input vector for a spend's public values, in the exact order
 /// [`synthesize_core`] allocates them. Single-input, per the `MAX_INPUTS`
-/// assertion above. `vk_hash` is `circuit_wrap::inner_vk_hash` of the key the
-/// proof is for.
-pub fn spend_public_inputs(pv: &SpendPublicValues, vk_hash: Fr) -> [Fr; SPEND_PUBLIC_INPUT_COUNT] {
+/// assertion above.
+pub fn spend_public_inputs(pv: &SpendPublicValues, window_head: Fr, vk_hash: Fr) -> [Fr; SPEND_PUBLIC_INPUT_COUNT] {
     let mut out = pad_outputs(&pv.output_commitments).to_vec();
     out.push(Fr::from(pv.anchor.size));
     out.push(pv.anchor.board_root);
     out.push(pv.anchor.nullifier_root);
     out.extend([pv.nullifier; MAX_INPUTS]);
     out.extend([pv.vpk_hash; MAX_INPUTS]);
+    out.push(window_head);
     out.push(vk_hash);
     out.try_into().expect("the layout above has SPEND_PUBLIC_INPUT_COUNT values")
 }
@@ -505,76 +544,81 @@ impl LeafOpeningVar {
     }
 }
 
-// ---- the window check ----------------------------------------------------------
+// ---- the window ------------------------------------------------------------------
 
-/// Mirrors `cloakkchain_lib::check_window`, with room for exactly
-/// [`MAX_SN_OCCURRENCES`] occurrences. An unused slot is a zeroed dummy that
-/// `active` keeps out of the chain.
-///
-/// A window with more occurrences than that has no accepting witness: no prefix
-/// of its chain folds to the head in the leaf. That's the bound working as
-/// intended, not a totality failure, because the check still evaluates to
-/// `false` rather than being unsatisfiable, and the caller's gate rejects it.
-fn check_window_var(
+/// Mirrors `Occurrence::link`.
+fn occurrence_link_var(
+    cs: ConstraintSystemRef<Fr>,
+    previous: &Fp,
+    outputs_hash: &Fp,
+    ciphertext_commitment: &Fp,
+    signature: &CoinSignatureVar,
+) -> Result<Fp, SynthesisError> {
+    poseidon_hash_var(
+        cs,
+        &[
+            previous.clone(),
+            outputs_hash.clone(),
+            ciphertext_commitment.clone(),
+            signature.c.clone(),
+            signature.s_lo.clone(),
+            signature.s_hi.clone(),
+        ],
+    )
+}
+
+/// The window, given a head that folds have certified: under `root`, the
+/// nullifier is absent if `head` is zero (a spend proof certifies no window),
+/// and otherwise its leaf holds exactly `head`. Exactly, so no occurrence can
+/// have been left out of the folds.
+fn window_opens(
     cs: ConstraintSystemRef<Fr>,
     root: &Fp,
     nullifier: &Fp,
-    vpk: &CoinKeyVar,
-    outputs_hash: &Fp,
+    head: &Fp,
     witness: Option<&WindowWitness>,
 ) -> Result<Boolean<Fr>, SynthesisError> {
     let leaf = IndexedLeafVar::new_witness(cs.clone(), witness.map(|w| &w.leaf))?;
     let index_bits = alloc_position_bits(cs.clone(), witness.map(|w| w.leaf_index))?;
     let path = alloc_path(cs.clone(), witness.map(|w| &w.sibling_path))?;
     let leaf_hash = leaf.hash(cs.clone())?;
-    let root_ok = compute_root_from_path_var(cs.clone(), &leaf_hash, &index_bits, &path)?.is_eq(root)?;
+    let root_ok = compute_root_from_path_var(cs, &leaf_hash, &index_bits, &path)?.is_eq(root)?;
 
-    let occurrences: &[Occurrence] = witness.map(|w| w.occurrences.as_slice()).unwrap_or(&[]);
-    let mut head = Fp::zero();
-    let mut all_harmless = Boolean::TRUE;
-    let mut any_active = Boolean::FALSE;
-    let mut active_prefix_ok = Boolean::TRUE;
-    let mut previous_active = Boolean::TRUE;
-    for k in 0..MAX_SN_OCCURRENCES {
-        let occurrence = occurrences.get(k);
-        let active = Boolean::new_witness(cs.clone(), || Ok(occurrence.is_some()))?;
-        active_prefix_ok = &active_prefix_ok & &(&!active.clone() | &previous_active);
-        previous_active = active.clone();
-        any_active = &any_active | &active;
+    // A prover can't claim the wrong case: a member can't be bracketed, and a
+    // non-member has no leaf to open.
+    let absent = leaf.brackets(nullifier)?;
+    let member = &leaf.value.is_eq(nullifier)? & &leaf.occ.is_eq(head)?;
+    let case_ok = Boolean::conditionally_select(&head.is_zero()?, &absent, &member)?;
+    Ok(&root_ok & &case_ok)
+}
 
-        let occ_outputs_hash = alloc_fp(cs.clone(), occurrence.map(|o| o.outputs_hash))?;
-        let occ_ciphertext = alloc_fp(cs.clone(), occurrence.map(|o| o.ciphertext_commitment))?;
-        let occ_signature = CoinSignatureVar::new_witness(cs.clone(), occurrence.map(|o| &o.signature))?;
+/// One fold step: mirrors `Occurrence::is_harmless` for one occurrence of the
+/// statement's serial number, under the key the statement names, and returns
+/// the next window head alongside the result.
+///
+/// Total, like everything that reads occurrences: junk evaluates to a valid
+/// fold, and a double-spend evaluates to `false`, never an unsatisfiable
+/// circuit.
+fn fold_step(
+    cs: ConstraintSystemRef<Fr>,
+    witness: Option<&FoldWitness>,
+    pv: &ParentPublicVars,
+) -> Result<(Boolean<Fr>, Fp), SynthesisError> {
+    let occurrence = witness.map(|w| &w.occurrence);
+    let vpk = CoinKeyVar::new_witness(cs.clone(), witness.map(|w| &w.vpk))?;
+    let key_ok = vpk.hash(cs.clone())?.is_eq(&pv.vpk_hash)?;
 
-        // Mirrors `Occurrence::link`.
-        let linked = poseidon_hash_var(
-            cs.clone(),
-            &[
-                head.clone(),
-                occ_outputs_hash.clone(),
-                occ_ciphertext.clone(),
-                occ_signature.c.clone(),
-                occ_signature.s_lo.clone(),
-                occ_signature.s_hi.clone(),
-            ],
-        )?;
-        head = Fp::conditionally_select(&active, &linked, &head)?;
+    let occ_outputs_hash = alloc_fp(cs.clone(), occurrence.map(|o| o.outputs_hash))?;
+    let occ_ciphertext = alloc_fp(cs.clone(), occurrence.map(|o| o.ciphertext_commitment))?;
+    let occ_signature = CoinSignatureVar::new_witness(cs.clone(), occurrence.map(|o| &o.signature))?;
 
-        // Mirrors `Occurrence::is_harmless`.
-        let msg = signature_message_var(cs.clone(), nullifier, &occ_outputs_hash, &occ_ciphertext)?;
-        let valid = occ_signature.verify(cs.clone(), vpk, &msg)?;
-        let harmless = &occ_outputs_hash.is_eq(outputs_hash)? | &!valid;
-        all_harmless = &all_harmless & &gate(harmless, &active);
-    }
+    let outputs_hash = poseidon_hash_var(cs.clone(), &pv.output_commitments)?;
+    let msg = signature_message_var(cs.clone(), &pv.nullifier, &occ_outputs_hash, &occ_ciphertext)?;
+    let valid = occ_signature.verify(cs.clone(), &vpk, &msg)?;
+    let harmless = &occ_outputs_hash.is_eq(&outputs_hash)? | &!valid;
 
-    // Occurrences mean `leaf` is the nullifier's own; none means it's the low
-    // leaf. A prover can't claim the wrong case: a member can't be bracketed,
-    // and a non-member has no leaf to open.
-    let member_ok = &leaf.value.is_eq(nullifier)? & &leaf.occ.is_eq(&head)?;
-    let absent_ok = leaf.brackets(nullifier)?;
-    let case_ok = Boolean::conditionally_select(&any_active, &member_ok, &absent_ok)?;
-
-    Boolean::kary_and(&[root_ok, active_prefix_ok, all_harmless, case_ok])
+    let next_head = occurrence_link_var(cs, &pv.window_head, &occ_outputs_hash, &occ_ciphertext, &occ_signature)?;
+    Ok((&key_ok & &harmless, next_head))
 }
 
 // ---- parent checks -------------------------------------------------------------
@@ -588,15 +632,32 @@ struct ParentPublicVars {
     anchor_nullifier_root: Fp,
     nullifier: Fp,
     vpk_hash: Fp,
+    window_head: Fp,
     vk_hash: Fp,
 }
 
+impl ParentPublicVars {
+    /// The spend statement, in the order [`SpendCoreVars::statement`] has it.
+    fn statement(&self) -> Vec<Fp> {
+        let mut out = self.output_commitments.clone();
+        out.extend([
+            self.anchor_size.clone(),
+            self.anchor_board_root.clone(),
+            self.anchor_nullifier_root.clone(),
+            self.nullifier.clone(),
+            self.vpk_hash.clone(),
+        ]);
+        out
+    }
+}
+
 /// Mirrors `cloakkchain_lib::check_parent`: everything about the entry that
-/// created an input coin, except for the recursive verification itself. All of
-/// it is opened against this spend's own anchor, so nothing depends on where
-/// this spend lands. Returns the result rather than enforcing it so that it
-/// can be gated — and kept separate from recursion so tests can reach it without
-/// a real proof.
+/// created an input coin, except for the recursive verification itself and the
+/// occurrences in its window, which folds have already checked: `pv.window_head`
+/// certifies them. All of it is opened against this spend's own anchor, so
+/// nothing depends on where this spend lands. Returns the result rather than
+/// enforcing it so that it can be gated — and kept separate from recursion so
+/// tests can reach it without a real proof.
 fn parent_checks(
     cs: ConstraintSystemRef<Fr>,
     witness: Option<&ParentWitness>,
@@ -634,14 +695,8 @@ fn parent_checks(
     let msg = signature_message_var(cs.clone(), &leaf.nullifier, &leaf.outputs_hash, &leaf.ciphertext_commitment)?;
     let signature_ok = leaf.signature.verify(cs.clone(), &vpk, &msg)?;
 
-    let window_ok = check_window_var(
-        cs,
-        &leaf.prev_nullifier_root,
-        &leaf.nullifier,
-        &vpk,
-        &leaf.outputs_hash,
-        witness.map(|w| &w.window),
-    )?;
+    let window_ok =
+        window_opens(cs, &leaf.prev_nullifier_root, &leaf.nullifier, &pv.window_head, witness.map(|w| &w.window))?;
 
     Boolean::kary_and(&[
         leaf_in_anchor,
@@ -666,6 +721,8 @@ pub struct SpendCoreWitness {
     pub anchor: Option<Anchor>,
     pub nullifiers: Option<[Fr; MAX_INPUTS]>,
     pub vpk_hashes: Option<[Fr; MAX_INPUTS]>,
+    /// `0` for a spend; a fold's is the occurrence chain head it certifies.
+    pub window_head: Option<Fr>,
     /// The hash of the VK this proof is for. Not constrained by the circuit
     /// itself — see the module doc comment for who checks it.
     pub vk_hash: Option<Fr>,
@@ -701,12 +758,29 @@ impl SpendCoreWitness {
             anchor: Some(anchor),
             nullifiers: Some([derive_nullifier(commitment, &sk); MAX_INPUTS]),
             vpk_hashes: Some([hash_vpk(&derive_coin_vpk(&sk, commitment)); MAX_INPUTS]),
+            window_head: Some(Fr::from(0u64)),
             vk_hash: Some(vk_hash),
             pk_p: Some(input_coin.owner_pk),
             sk_p: Some(sk),
             input_coins: std::array::from_fn(|i| (i == 0).then(|| input_coin.clone())),
             output_coins: std::array::from_fn(|i| output_coins.get(i).cloned()),
             own_nullifier_nonmembership: std::array::from_fn(|i| (i == 0).then(|| nonmembership.clone())),
+        }
+    }
+
+    /// A fold's public values: `previous`'s spend statement, with the window head
+    /// it leads to. Everything private stays empty, since fold mode doesn't
+    /// use it.
+    pub fn for_fold(previous: &StepStatement, window_head: Fr, vk_hash: Fr) -> Self {
+        let pv = &previous.public_values;
+        Self {
+            output_commitments: Some(pad_outputs(&pv.output_commitments)),
+            anchor: Some(pv.anchor.clone()),
+            nullifiers: Some([pv.nullifier; MAX_INPUTS]),
+            vpk_hashes: Some([pv.vpk_hash; MAX_INPUTS]),
+            window_head: Some(window_head),
+            vk_hash: Some(vk_hash),
+            ..Self::default()
         }
     }
 
@@ -724,6 +798,10 @@ impl SpendCoreWitness {
 /// What [`SpendStepCircuit`] needs back from [`synthesize_core`], and
 /// [`GenesisSpendCircuit`] for its fixed-key check.
 struct SpendCoreVars {
+    /// The public spend statement, in [`spend_public_inputs`]' order up to
+    /// `window_head`. In fold mode these must equal the folded statement's.
+    statement: Vec<Fp>,
+    window_head: Fp,
     vk_hash: Fp,
     pk_p_x: Fp,
     pk_p_y: Fp,
@@ -734,14 +812,20 @@ struct SpendCoreVars {
 
 /// Everything in `check_spend` but the parent: allocates the public inputs in
 /// their fixed order, then ownership, freshness at the anchor, the derivation of
-/// `SN` and `vpk`, and value conservation.
-fn synthesize_core(cs: ConstraintSystemRef<Fr>, w: &SpendCoreWitness) -> Result<SpendCoreVars, SynthesisError> {
+/// `SN` and `vpk`, and value conservation. All of it applies only when
+/// `spend_mode` holds: in fold mode the public values are another proof's
+/// statement, and the private witnesses are empty.
+fn synthesize_core(
+    cs: ConstraintSystemRef<Fr>,
+    w: &SpendCoreWitness,
+    spend_mode: &Boolean<Fr>,
+) -> Result<SpendCoreVars, SynthesisError> {
     // --- public inputs, in the fixed order `spend_public_inputs` matches ---
     let output_commitments: Vec<Fp> = (0..MAX_OUTPUTS)
         .map(|i| Fp::new_input(cs.clone(), || opt(&w.output_commitments.map(|a| a[i]))))
         .collect::<Result<_, _>>()?;
     let anchor = w.anchor.as_ref();
-    let _anchor_size = Fp::new_input(cs.clone(), || opt(&anchor.map(|a| Fr::from(a.size))))?;
+    let anchor_size = Fp::new_input(cs.clone(), || opt(&anchor.map(|a| Fr::from(a.size))))?;
     let anchor_board_root = Fp::new_input(cs.clone(), || opt(&anchor.map(|a| a.board_root)))?;
     let anchor_nullifier_root = Fp::new_input(cs.clone(), || opt(&anchor.map(|a| a.nullifier_root)))?;
     let nullifiers: Vec<Fp> = (0..MAX_INPUTS)
@@ -750,7 +834,16 @@ fn synthesize_core(cs: ConstraintSystemRef<Fr>, w: &SpendCoreWitness) -> Result<
     let vpk_hashes: Vec<Fp> = (0..MAX_INPUTS)
         .map(|i| Fp::new_input(cs.clone(), || opt(&w.vpk_hashes.map(|a| a[i]))))
         .collect::<Result<_, _>>()?;
+    let window_head = Fp::new_input(cs.clone(), || opt(&w.window_head))?;
     let vk_hash = Fp::new_input(cs.clone(), || opt(&w.vk_hash))?;
+
+    // A spend certifies no window; only folds do.
+    gate(window_head.is_zero()?, spend_mode).enforce_equal(&Boolean::TRUE)?;
+
+    let mut statement = output_commitments.clone();
+    statement.extend([anchor_size, anchor_board_root.clone(), anchor_nullifier_root.clone()]);
+    statement.extend(nullifiers.iter().cloned());
+    statement.extend(vpk_hashes.iter().cloned());
 
     // --- pk_p is a private witness, not a public input: nothing downstream
     // ever needs to read it back out of a spend proof, and its own uses here
@@ -760,11 +853,12 @@ fn synthesize_core(cs: ConstraintSystemRef<Fr>, w: &SpendCoreWitness) -> Result<
     let pk_p_x = alloc_fp(cs.clone(), pk_xy.map(|(x, _)| x))?;
     let pk_p_y = alloc_fp(cs.clone(), pk_xy.map(|(_, y)| y))?;
 
-    // --- sk_p / pk_p ---
-    let sk_bit_values: Option<Vec<bool>> = w.sk_p.map(|sk| sk.into_bigint().to_bits_le());
+    // --- sk_p / pk_p (zero in fold mode, where `pk_p` is zero too, as
+    // `0·G` is the point at infinity) ---
+    let sk_bit_values: Vec<bool> = w.sk_p.unwrap_or(OwnerScalar::from(0u64)).into_bigint().to_bits_le();
     let sk_bit_len = OwnerScalar::MODULUS_BIT_SIZE as usize;
     let sk_bits: Vec<Boolean<Fr>> = (0..sk_bit_len)
-        .map(|i| Boolean::new_witness(cs.clone(), || opt(&sk_bit_values.as_ref().map(|b| b[i]))))
+        .map(|i| Boolean::new_witness(cs.clone(), || Ok(sk_bit_values[i])))
         .collect::<Result<_, _>>()?;
     // Canonicity: sk_bits, as an integer, must be < OwnerScalar's modulus
     // — otherwise two different bit patterns could represent the same
@@ -782,7 +876,10 @@ fn synthesize_core(cs: ConstraintSystemRef<Fr>, w: &SpendCoreWitness) -> Result<
 
     // --- input slots ---
     let input_present: [bool; MAX_INPUTS] = std::array::from_fn(|i| w.input_coins[i].is_some());
-    let input_active = alloc_active_flags(cs.clone(), &input_present)?;
+    let mut input_active = alloc_active_flags(cs.clone(), &input_present)?;
+    for active in input_active.iter_mut() {
+        *active = &*active & spend_mode;
+    }
     let mut input_commitments = Vec::with_capacity(MAX_INPUTS);
     let mut total_in = Fp::zero();
     for i in 0..MAX_INPUTS {
@@ -828,14 +925,14 @@ fn synthesize_core(cs: ConstraintSystemRef<Fr>, w: &SpendCoreWitness) -> Result<
     for j in 0..MAX_OUTPUTS {
         let coin = CoinVar::new_witness(cs.clone(), &w.output_coins[j])?;
         let expected = Fp::conditionally_select(&output_active[j], &coin.commitment(cs.clone())?, &Fp::zero())?;
-        expected.enforce_equal(&output_commitments[j])?;
+        gate(expected.is_eq(&output_commitments[j])?, spend_mode).enforce_equal(&Boolean::TRUE)?;
         total_out += coin.value_or_zero(&output_active[j])?;
     }
 
     // --- value conservation: Σ active inputs == Σ active outputs ---
     total_in.enforce_equal(&total_out)?;
 
-    Ok(SpendCoreVars { vk_hash, pk_p_x, pk_p_y, anchor_board_root, input_commitments, input_active })
+    Ok(SpendCoreVars { statement, window_head, vk_hash, pk_p_x, pk_p_y, anchor_board_root, input_commitments, input_active })
 }
 
 // ---- the circuits --------------------------------------------------------------
@@ -851,7 +948,7 @@ pub struct GenesisSpendCircuit {
 
 impl ConstraintSynthesizer<Fr> for GenesisSpendCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
-        let core = synthesize_core(cs, &self.core)?;
+        let core = synthesize_core(cs, &self.core, &Boolean::TRUE)?;
 
         // --- genesis: pk_p must be the fixed, well-known genesis key ---
         let (genesis_x, genesis_y) = owner_pk_to_field_pair(&genesis_pk());
@@ -861,21 +958,22 @@ impl ConstraintSynthesizer<Fr> for GenesisSpendCircuit {
     }
 }
 
-/// The non-genesis variant of the spend relation: everything
-/// [`GenesisSpendCircuit`] checks, plus, per active input slot, a recursive
-/// verification of the parent spend proof that created this input coin,
-/// directly (`GenesisSpendCircuit`/`SpendStepCircuit`, wrapped via
-/// `circuit-wrap` — no separate receipt-proof layer), plus [`parent_checks`]
-/// against that proof's own public values.
+/// The non-genesis variant of the spend relation, and the fold step (see the
+/// module doc comment), selected by `fold`.
 ///
-/// Currently fixed to recursively verify wrapped parent-spend proofs from
-/// one specific deployment (all active input slots share the same
-/// `wrap_vk` — mixing parents of different "generations"/shapes within one
-/// spend isn't supported; this is the same deferred arbitrary-depth
-/// VK-selection limitation as before, just relocated here).
+/// Spend mode: everything [`GenesisSpendCircuit`] checks, plus, per active input
+/// slot, a recursive verification of the proof describing the entry that
+/// created the input coin — its spend proof, or a fold over it — wrapped via
+/// `circuit-wrap`, plus [`parent_checks`] against that proof's statement.
+///
+/// Fold mode: verifies one such proof, publishes its statement unchanged, and
+/// advances its window head by one harmless occurrence ([`fold_step`]).
 #[derive(Clone, CanonicalSerialize, CanonicalDeserialize)]
 pub struct SpendStepCircuit {
+    /// The spend in spend mode; [`SpendCoreWitness::for_fold`] in fold mode.
     pub core: SpendCoreWitness,
+    /// `Some` selects fold mode.
+    pub fold: Option<FoldWitness>,
 
     /// Fixed per deployment — not `Option`, a verifying key isn't secret.
     pub wrap_vk: VerifyingKey<MNT6_753>,
@@ -887,13 +985,12 @@ pub struct SpendStepCircuit {
     /// needs *a* structurally-valid dummy proof — see `circuit-wrap::setup`'s
     /// doc comment for why).
     pub input_parent_proofs: [Option<Proof<MNT6_753>>; MAX_INPUTS],
-    /// The parent's public values, its entry, and the openings against this
-    /// spend's anchor. `ParentWitness::public_values` is what's fed to the
-    /// recursive verification.
+    /// What each of those proofs claims. Its `vk_hash` must be
+    /// `genesis_vk_hash` or this proof's own.
+    pub input_parent_statements: [Option<StepStatement>; MAX_INPUTS],
+    /// Spend mode only: the parent's entry, and the openings against this
+    /// spend's anchor.
     pub input_parents: [Option<ParentWitness>; MAX_INPUTS],
-    /// The `vk_hash` each parent's proof carries: `genesis_vk_hash` or this
-    /// spend's own.
-    pub input_parent_vk_hashes: [Option<Fr>; MAX_INPUTS],
 }
 
 impl SpendStepCircuit {
@@ -919,7 +1016,9 @@ impl SpendStepCircuit {
 
 impl ConstraintSynthesizer<Fr> for SpendStepCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
-        let core = synthesize_core(cs.clone(), &self.core)?;
+        let is_fold = Boolean::new_witness(cs.clone(), || Ok(self.fold.is_some()))?;
+        let spend_mode = !is_fold.clone();
+        let core = synthesize_core(cs.clone(), &self.core, &spend_mode)?;
 
         // --- wrap VK (shared by every active input slot's parent proof) ---
         let wrap_vk_var = VerifyingKeyVar::<MNT6_753, MNT6PairingVar>::new_constant(cs.clone(), &self.wrap_vk)?;
@@ -929,12 +1028,13 @@ impl ConstraintSynthesizer<Fr> for SpendStepCircuit {
 
         for i in 0..MAX_INPUTS {
             let is_active = &core.input_active[i];
-            let parent = self.input_parents[i].as_ref();
+            // A fold verifies slot 0's proof too, so that one is always checked.
+            let recursion_active = if i == 0 { Boolean::TRUE } else { is_active.clone() };
 
-            // --- recursively verify the parent spend proof that created this
-            // input coin, directly (no separate receipt-proof layer). A padding
-            // slot has no real parent — fall back to all-zero chunks (never
-            // checked, since every check below is gated by `is_active`; see the
+            // --- recursively verify the proof describing the entry that
+            // created this input coin, directly (no separate receipt-proof
+            // layer). A padding slot has no real parent — fall back to all-zero
+            // chunks (never checked, since every check below is gated; see the
             // module doc comment).
             //
             // Each chunk goes in as only the `CHUNK_BITS` the wrap circuit
@@ -942,9 +1042,9 @@ impl ConstraintSynthesizer<Fr> for SpendStepCircuit {
             // the verifier reads the bits mod the wrap field's modulus `r`, so
             // `x + r` would pass for chunk `x`, while `combine_chunks_var`
             // would read its low bits as something else.
-            let parent_chunks: Vec<Fr6> = parent
-                .zip(self.input_parent_vk_hashes[i])
-                .map(|(p, vk_hash)| public_input_chunks(&spend_public_inputs(&p.public_values, vk_hash)))
+            let parent_chunks: Vec<Fr6> = self.input_parent_statements[i]
+                .as_ref()
+                .map(|statement| public_input_chunks(&statement.public_inputs()))
                 .unwrap_or_else(|| vec![Fr6::from(0u64); parent_public_len]);
             let mut parent_per_chunk_bits: Vec<Vec<Boolean<Fr>>> = Vec::with_capacity(parent_public_len);
             for k in 0..parent_public_len {
@@ -963,9 +1063,9 @@ impl ConstraintSynthesizer<Fr> for SpendStepCircuit {
                 &parent_input_var,
                 &parent_proof_var,
             )?;
-            gate(parent_recursive_ok, is_active).enforce_equal(&Boolean::TRUE)?;
+            gate(parent_recursive_ok, &recursion_active).enforce_equal(&Boolean::TRUE)?;
 
-            // --- the parent's public values, as just recursively verified ---
+            // --- what that proof claims, as just recursively verified ---
             let pgroup = |idx: usize| combine_chunks_var(&parent_per_chunk_bits[idx * cpv..(idx + 1) * cpv]);
             let pv = ParentPublicVars {
                 output_commitments: (0..MAX_OUTPUTS)
@@ -976,16 +1076,29 @@ impl ConstraintSynthesizer<Fr> for SpendStepCircuit {
                 anchor_nullifier_root: pgroup(PARENT_ANCHOR_NULLIFIER_ROOT)?,
                 nullifier: pgroup(PARENT_NULLIFIER)?,
                 vpk_hash: pgroup(PARENT_VPK_HASH)?,
+                window_head: pgroup(PARENT_WINDOW_HEAD)?,
                 vk_hash: pgroup(PARENT_VK_HASH)?,
             };
 
-            // The wrap circuit guarantees the parent's proof verifies under
-            // the VK its `vk_hash` names; this pins which VKs those may be.
+            // The wrap circuit guarantees that proof verifies under the VK its
+            // `vk_hash` names; this pins which VKs those may be.
             let parent_vk_ok = &pv.vk_hash.is_eq(&Fp::constant(self.genesis_vk_hash))? | &pv.vk_hash.is_eq(&core.vk_hash)?;
-            gate(parent_vk_ok, is_active).enforce_equal(&Boolean::TRUE)?;
+            gate(parent_vk_ok, &recursion_active).enforce_equal(&Boolean::TRUE)?;
 
-            let parent_ok = parent_checks(cs.clone(), parent, &pv, &core.input_commitments[i], &core.anchor_board_root)?;
+            // --- spend mode ---
+            let parent_ok =
+                parent_checks(cs.clone(), self.input_parents[i].as_ref(), &pv, &core.input_commitments[i], &core.anchor_board_root)?;
             gate(parent_ok, is_active).enforce_equal(&Boolean::TRUE)?;
+
+            // --- fold mode: same statement, one more harmless occurrence ---
+            if i == 0 {
+                let (harmless, next_head) = fold_step(cs.clone(), self.fold.as_ref(), &pv)?;
+                let mut fold_ok = vec![harmless, core.window_head.is_eq(&next_head)?];
+                for (mine, theirs) in core.statement.iter().zip(pv.statement()) {
+                    fold_ok.push(mine.is_eq(&theirs)?);
+                }
+                gate(Boolean::kary_and(&fold_ok)?, &is_fold).enforce_equal(&Boolean::TRUE)?;
+            }
         }
 
         Ok(())
@@ -1000,14 +1113,15 @@ pub fn setup_non_genesis<R: RngCore + CryptoRng>(
 ) -> Result<(ProvingKey<MNT4_753>, VerifyingKey<MNT4_753>), SynthesisError> {
     let circuit = SpendStepCircuit {
         core: SpendCoreWitness::default(),
+        fold: None,
         wrap_vk,
         genesis_vk_hash,
         // See circuit-wrap's `setup` for why every slot needs *some*
         // structurally-valid dummy proof rather than `None` — `ProofVar`'s
         // `AllocVar` impl calls its value closure unconditionally.
         input_parent_proofs: std::array::from_fn(|_| Some(SpendStepCircuit::dummy_wrap_proof())),
+        input_parent_statements: std::array::from_fn(|_| None),
         input_parents: std::array::from_fn(|_| None),
-        input_parent_vk_hashes: std::array::from_fn(|_| None),
     };
     GM17::<MNT4_753>::circuit_specific_setup(circuit, rng)
 }
@@ -1159,26 +1273,68 @@ mod tests {
         }
     }
 
-    /// Evaluate `parent_checks` on a witness. Checks totality on the way: the
-    /// circuit must stay satisfiable whatever the answer is.
-    fn parent_checks_result(witness: &ParentWitness, commitment: Fr, anchor_board_root: Fr) -> bool {
-        let cs = ConstraintSystem::<Fr>::new_ref();
-        let inputs = spend_public_inputs(&witness.public_values, Fr::from(0u64));
-        let vars: Vec<Fp> = inputs.iter().map(|v| Fp::new_witness(cs.clone(), || Ok(*v)).unwrap()).collect();
-        let pv = ParentPublicVars {
+    /// The window head honest folds over this window would certify: zero if
+    /// it's empty, else the chain head in the parent's leaf.
+    fn certified_head(witness: &ParentWitness) -> Fr {
+        if witness.window.occurrences.is_empty() { Fr::from(0u64) } else { witness.window.leaf.occ }
+    }
+
+    fn parent_public_vars(cs: ConstraintSystemRef<Fr>, statement: &StepStatement) -> ParentPublicVars {
+        let vars: Vec<Fp> =
+            statement.public_inputs().iter().map(|v| Fp::new_witness(cs.clone(), || Ok(*v)).unwrap()).collect();
+        ParentPublicVars {
             output_commitments: vars[PARENT_OUTPUT_COMMITMENTS_START..MAX_OUTPUTS].to_vec(),
             anchor_size: vars[PARENT_ANCHOR_SIZE].clone(),
             anchor_board_root: vars[PARENT_ANCHOR_BOARD_ROOT].clone(),
             anchor_nullifier_root: vars[PARENT_ANCHOR_NULLIFIER_ROOT].clone(),
             nullifier: vars[PARENT_NULLIFIER].clone(),
             vpk_hash: vars[PARENT_VPK_HASH].clone(),
+            window_head: vars[PARENT_WINDOW_HEAD].clone(),
             vk_hash: vars[PARENT_VK_HASH].clone(),
-        };
+        }
+    }
+
+    /// Evaluate `parent_checks` on a witness, with the window head honest folds
+    /// would certify. Checks totality on the way: the circuit must stay
+    /// satisfiable whatever the answer is.
+    fn parent_checks_result(witness: &ParentWitness, commitment: Fr, anchor_board_root: Fr) -> bool {
+        parent_checks_with_head(witness, certified_head(witness), commitment, anchor_board_root)
+    }
+
+    fn parent_checks_with_head(witness: &ParentWitness, head: Fr, commitment: Fr, anchor_board_root: Fr) -> bool {
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        let statement = StepStatement { public_values: witness.public_values.clone(), window_head: head, vk_hash: Fr::from(0u64) };
+        let pv = parent_public_vars(cs.clone(), &statement);
         let commitment = Fp::new_witness(cs.clone(), || Ok(commitment)).unwrap();
         let root = Fp::new_witness(cs.clone(), || Ok(anchor_board_root)).unwrap();
         let ok = parent_checks(cs.clone(), Some(witness), &pv, &commitment, &root).unwrap();
         assert!(cs.is_satisfied().unwrap(), "must evaluate to false, never become unsatisfiable");
         ok.value().unwrap()
+    }
+
+    /// Evaluate one fold step over `statement`. Returns whether it holds, and
+    /// the head it leads to; checks totality like `parent_checks_with_head`.
+    fn fold_result(statement: &StepStatement, fold: &FoldWitness) -> (bool, Fr) {
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        let pv = parent_public_vars(cs.clone(), statement);
+        let (ok, head) = fold_step(cs.clone(), Some(fold), &pv).unwrap();
+        assert!(cs.is_satisfied().unwrap(), "must evaluate to false, never become unsatisfiable");
+        (ok.value().unwrap(), head.value().unwrap())
+    }
+
+    /// Fold every occurrence in `witness`'s window, as the next spender would.
+    /// Returns whether every step held, and the final head.
+    fn fold_window(witness: &ParentWitness) -> (bool, Fr) {
+        let mut statement =
+            StepStatement { public_values: witness.public_values.clone(), window_head: Fr::from(0u64), vk_hash: Fr::from(0u64) };
+        let mut all_ok = true;
+        for occurrence in &witness.window.occurrences {
+            let (ok, head) = fold_result(&statement, &FoldWitness { vpk: witness.vpk, occurrence: occurrence.clone() });
+            assert_eq!(head, occurrence.link(statement.window_head), "gadget and native links must agree");
+            all_ok &= ok;
+            statement.window_head = head;
+        }
+        (all_ok, statement.window_head)
     }
 
     // ---- ordering ----------------------------------------------------------
@@ -1336,7 +1492,7 @@ mod tests {
         assert_eq!(key.hash(cs).unwrap().value().unwrap(), hash_vpk(&vpk));
     }
 
-    // ---- parent checks, against the native oracle's scenarios ----------------
+    // ---- parent checks and folds, against the native oracle's scenarios ------
 
     #[test]
     fn clean_parent_passes_with_an_empty_window() {
@@ -1348,35 +1504,40 @@ mod tests {
         assert!(parent_checks_result(&witness, w.bob_coin.commitment(), root));
     }
 
-    /// The reviewers' attack, in-circuit: copies must not stop Bob spending.
+    /// The reviewers' attack, in-circuit, past the old bound of 2: copies cost
+    /// one fold each and never stop Bob spending.
     #[test]
-    fn junk_copies_up_to_the_bound_are_harmless() {
-        for copies in 1..=MAX_SN_OCCURRENCES as u64 {
-            let mut w = world();
-            let alice = w.alice_spends(&w.bob_coin, 1);
-            for seed in 0..copies {
-                w.history.append(&junk_copy(w.alice_nullifier(), seed + 1));
-            }
-            let slot = w.history.append(&alice.entry);
-            let (witness, root) = w.witness_for(slot, &alice);
-            assert_eq!(witness.window.occurrences.len(), copies as usize);
-            assert!(parent_checks_result(&witness, w.bob_coin.commitment(), root), "{copies} copies");
+    fn any_number_of_junk_copies_folds_and_passes() {
+        let mut w = world();
+        let alice = w.alice_spends(&w.bob_coin, 1);
+        for seed in 0..5 {
+            w.history.append(&junk_copy(w.alice_nullifier(), seed + 1));
         }
+        let slot = w.history.append(&alice.entry);
+        let (witness, root) = w.witness_for(slot, &alice);
+        assert_eq!(witness.window.occurrences.len(), 5);
+        let (folds_ok, head) = fold_window(&witness);
+        assert!(folds_ok);
+        assert_eq!(head, witness.window.leaf.occ);
+        assert!(parent_checks_result(&witness, w.bob_coin.commitment(), root));
     }
 
     #[test]
-    fn honest_re_prove_in_the_window_is_harmless() {
+    fn honest_re_prove_in_the_window_folds() {
         let mut w = world();
         let first = w.alice_spends(&w.bob_coin, 1);
         let second = w.alice_spends(&w.bob_coin, 2);
         w.history.append(&first.entry);
         let slot = w.history.append(&second.entry);
         let (witness, root) = w.witness_for(slot, &second);
+        assert!(fold_window(&witness).0);
         assert!(parent_checks_result(&witness, w.bob_coin.commitment(), root));
     }
 
+    /// The first validly signed spend wins: its window is empty, and the second
+    /// one's can't be folded.
     #[test]
-    fn validly_signed_spend_in_the_window_fails() {
+    fn validly_signed_spend_in_the_window_cannot_be_folded() {
         let mut w = world();
         let (_, carol_pk) = owner(3);
         let carol_coin = coin(4, 100, carol_pk);
@@ -1387,41 +1548,69 @@ mod tests {
 
         let (witness, root) = w.witness_for(bob_slot, &to_bob);
         assert!(parent_checks_result(&witness, w.bob_coin.commitment(), root), "the first spend stands");
-        let (witness, root) = w.witness_for(carol_slot, &to_carol);
-        assert!(!parent_checks_result(&witness, carol_coin.commitment(), root), "the second doesn't");
+        let (witness, _) = w.witness_for(carol_slot, &to_carol);
+        assert!(!fold_window(&witness).0, "the second's window holds a double-spend");
     }
 
     #[test]
-    fn more_copies_than_the_bound_fail() {
-        let mut w = world();
-        let alice = w.alice_spends(&w.bob_coin, 1);
-        for seed in 0..=MAX_SN_OCCURRENCES as u64 {
-            w.history.append(&junk_copy(w.alice_nullifier(), seed + 1));
-        }
-        let slot = w.history.append(&alice.entry);
-        let (witness, root) = w.witness_for(slot, &alice);
-        assert!(!parent_checks_result(&witness, w.bob_coin.commitment(), root));
-    }
-
-    #[test]
-    fn hiding_a_window_occurrence_fails() {
+    fn fold_needs_the_parents_own_key() {
         let mut w = world();
         let alice = w.alice_spends(&w.bob_coin, 1);
         w.history.append(&junk_copy(w.alice_nullifier(), 1));
         let slot = w.history.append(&alice.entry);
-        let (parent, root) = w.witness_for(slot, &alice);
+        let (witness, _) = w.witness_for(slot, &alice);
+        let statement =
+            StepStatement { public_values: witness.public_values.clone(), window_head: Fr::from(0u64), vk_hash: Fr::from(0u64) };
+        let occurrence = witness.window.occurrences[0].clone();
+        assert!(fold_result(&statement, &FoldWitness { vpk: witness.vpk, occurrence: occurrence.clone() }).0);
+        // Under some other key every signature is "invalid", so a double-spend
+        // would look like junk. The statement's `vpk_hash` rules that out.
+        assert!(!fold_result(&statement, &FoldWitness { vpk: owner(7).1, occurrence }).0);
+    }
+
+    /// Junk signatures at the scalar edges, inside a fold: the step evaluates,
+    /// it never becomes unsatisfiable.
+    #[test]
+    fn fold_is_total_on_junk() {
+        let w = world();
+        let alice = w.alice_spends(&w.bob_coin, 1);
+        let statement = StepStatement { public_values: alice.pv.clone(), window_head: Fr::from(0u64), vk_hash: Fr::from(0u64) };
+        for (c, s) in [
+            (Fr::from(0u64), OwnerScalar::from(0u64)),
+            (-Fr::from(1u64), -OwnerScalar::from(1u64)),
+            (Fr::from(1u64), OwnerScalar::from(1u64)),
+        ] {
+            let occurrence = LeafOpening::new(
+                0,
+                &BoardEntry { signature: CoinSignature { c, s }, ..junk_copy(w.alice_nullifier(), 1) },
+                Fr::from(0u64),
+                Fr::from(0u64),
+            )
+            .occurrence();
+            assert!(fold_result(&statement, &FoldWitness { vpk: alice.vpk, occurrence }).0);
+        }
+    }
+
+    #[test]
+    fn window_head_must_cover_every_occurrence() {
+        let mut w = world();
+        let alice = w.alice_spends(&w.bob_coin, 1);
+        w.history.append(&junk_copy(w.alice_nullifier(), 1));
+        w.history.append(&junk_copy(w.alice_nullifier(), 2));
+        let slot = w.history.append(&alice.entry);
+        let (witness, root) = w.witness_for(slot, &alice);
         let commitment = w.bob_coin.commitment();
-        assert!(parent_checks_result(&parent, commitment, root));
+        assert!(parent_checks_result(&witness, commitment, root));
 
-        // Claiming an empty window, using the tree from before the copy.
-        let mut hiding = parent.clone();
+        // Claiming no window at all, using the tree from before the copies.
+        let mut hiding = witness.clone();
         hiding.window = w.history.nullifier_tree_at(1).prove_window(w.alice_nullifier());
-        assert!(!parent_checks_result(&hiding, commitment, root));
-
-        // Keeping the current leaf but dropping the copy from the chain.
-        let mut dropping = parent;
-        dropping.window.occurrences.clear();
-        assert!(!parent_checks_result(&dropping, commitment, root));
+        assert!(!parent_checks_with_head(&hiding, Fr::from(0u64), commitment, root));
+        // Claiming no window against the real leaf.
+        assert!(!parent_checks_with_head(&witness, Fr::from(0u64), commitment, root));
+        // Folding only the first copy.
+        let partial = witness.window.occurrences[0].link(Fr::from(0u64));
+        assert!(!parent_checks_with_head(&witness, partial, commitment, root));
     }
 
     #[test]
@@ -1612,40 +1801,42 @@ mod tests {
     // ---- circuit shape ---------------------------------------------------------
 
     /// GM17 keys are generated from setup mode, so the constraint system must
-    /// have the same shape whatever the witness says: an empty window, a full
-    /// one, an over-full one, and no witness at all.
+    /// have the same shape whatever the witness says: spend mode or fold mode,
+    /// an empty window or a full one, and no witness at all.
     #[test]
     fn constraint_shape_does_not_depend_on_the_witness() {
-        fn count(witness: Option<&ParentWitness>, setup: bool) -> usize {
+        let count = |circuit: SpendStepCircuit, setup: bool| {
             let cs = if setup { setup_mode_cs() } else { ConstraintSystem::<Fr>::new_ref() };
-            let inputs = witness
-                .map(|w| spend_public_inputs(&w.public_values, Fr::from(0u64)))
-                .unwrap_or([Fr::from(0u64); SPEND_PUBLIC_INPUT_COUNT]);
-            let vars: Vec<Fp> = inputs.iter().map(|v| Fp::new_witness(cs.clone(), || Ok(*v)).unwrap()).collect();
-            let pv = ParentPublicVars {
-                output_commitments: vars[..MAX_OUTPUTS].to_vec(),
-                anchor_size: vars[PARENT_ANCHOR_SIZE].clone(),
-                anchor_board_root: vars[PARENT_ANCHOR_BOARD_ROOT].clone(),
-                anchor_nullifier_root: vars[PARENT_ANCHOR_NULLIFIER_ROOT].clone(),
-                nullifier: vars[PARENT_NULLIFIER].clone(),
-                vpk_hash: vars[PARENT_VPK_HASH].clone(),
-                vk_hash: vars[PARENT_VK_HASH].clone(),
-            };
-            let _ = parent_checks(cs.clone(), witness, &pv, &vars[0], &vars[1]).unwrap();
+            circuit.generate_constraints(cs.clone()).unwrap();
             cs.num_constraints()
-        }
+        };
+        let expected = count(step_circuit_for_counting(), true);
 
-        let expected = count(None, true);
-        for copies in [0, MAX_SN_OCCURRENCES as u64, MAX_SN_OCCURRENCES as u64 + 1] {
-            let mut w = world();
-            let alice = w.alice_spends(&w.bob_coin, 1);
-            for seed in 0..copies {
-                w.history.append(&junk_copy(w.alice_nullifier(), seed + 1));
-            }
-            let slot = w.history.append(&alice.entry);
-            let (witness, _) = w.witness_for(slot, &alice);
-            assert_eq!(count(Some(&witness), false), expected, "{copies} copies");
+        let mut w = world();
+        let alice = w.alice_spends(&w.bob_coin, 1);
+        for seed in 0..2 {
+            w.history.append(&junk_copy(w.alice_nullifier(), seed + 1));
         }
+        let slot = w.history.append(&alice.entry);
+        let (witness, _) = w.witness_for(slot, &alice);
+        let previous = StepStatement { public_values: alice.pv.clone(), window_head: Fr::from(0u64), vk_hash: Fr::from(0u64) };
+        let occurrence = witness.window.occurrences[0].clone();
+
+        // Dummy proofs: unsatisfied, but the shape is what's being compared.
+        let spend = SpendStepCircuit {
+            core: alice.core.clone(),
+            input_parent_statements: [Some(previous.clone())],
+            input_parents: [Some(witness.clone())],
+            ..step_circuit_for_counting()
+        };
+        let fold = SpendStepCircuit {
+            core: SpendCoreWitness::for_fold(&previous, occurrence.link(Fr::from(0u64)), Fr::from(0u64)),
+            fold: Some(FoldWitness { vpk: alice.vpk, occurrence }),
+            input_parent_statements: [Some(previous)],
+            ..step_circuit_for_counting()
+        };
+        assert_eq!(count(spend, false), expected, "spend mode");
+        assert_eq!(count(fold, false), expected, "fold mode");
 
         let genesis = |circuit: GenesisSpendCircuit, cs: ConstraintSystemRef<Fr>| {
             circuit.generate_constraints(cs.clone()).unwrap();
@@ -1655,6 +1846,27 @@ mod tests {
             genesis(genesis_circuit(), ConstraintSystem::<Fr>::new_ref()),
             genesis(GenesisSpendCircuit::default(), setup_mode_cs()),
         );
+    }
+
+    /// Fold mode switches every spend check off, so its public values can be
+    /// someone else's statement: here the core alone, as fold mode runs it, is
+    /// satisfied with nothing but that statement.
+    #[test]
+    fn core_is_satisfiable_in_fold_mode() {
+        let w = world();
+        let alice = w.alice_spends(&w.bob_coin, 1);
+        let previous = StepStatement { public_values: alice.pv.clone(), window_head: Fr::from(0u64), vk_hash: Fr::from(0u64) };
+        let core = SpendCoreWitness::for_fold(&previous, Fr::from(5u64), Fr::from(0u64));
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        synthesize_core(cs.clone(), &core, &Boolean::FALSE).unwrap();
+        assert!(cs.is_satisfied().unwrap());
+
+        // Whereas spend mode refuses a non-zero window head.
+        let mut spend = alice.core.clone();
+        spend.window_head = Some(Fr::from(5u64));
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        synthesize_core(cs.clone(), &spend, &Boolean::TRUE).unwrap();
+        assert!(!cs.is_satisfied().unwrap());
     }
 
     // ---- costs -----------------------------------------------------------------
@@ -1671,6 +1883,18 @@ mod tests {
             g_gamma_g1: g1,
             h_gamma_g2: g2,
             query: vec![g1; SPEND_PUBLIC_INPUT_COUNT * chunks_per_value() + 1],
+        }
+    }
+
+    fn step_circuit_for_counting() -> SpendStepCircuit {
+        SpendStepCircuit {
+            core: SpendCoreWitness::default(),
+            fold: None,
+            wrap_vk: shaped_wrap_vk(),
+            genesis_vk_hash: Fr::from(0u64),
+            input_parent_proofs: std::array::from_fn(|_| Some(SpendStepCircuit::dummy_wrap_proof())),
+            input_parent_statements: std::array::from_fn(|_| None),
+            input_parents: std::array::from_fn(|_| None),
         }
     }
 
@@ -1691,21 +1915,30 @@ mod tests {
         let _ = CoinSignatureVar::new_witness(cs.clone(), None).unwrap().verify(cs.clone(), &vpk, &msg).unwrap();
         let signature = cs.num_constraints() - before;
 
+        let zero_pv = |cs: &ConstraintSystemRef<Fr>| {
+            let zero = || Fp::new_witness(cs.clone(), || Ok(Fr::from(0u64))).unwrap();
+            ParentPublicVars {
+                output_commitments: (0..MAX_OUTPUTS).map(|_| zero()).collect(),
+                anchor_size: zero(),
+                anchor_board_root: zero(),
+                anchor_nullifier_root: zero(),
+                nullifier: zero(),
+                vpk_hash: zero(),
+                window_head: zero(),
+                vk_hash: zero(),
+            }
+        };
+        let fold_pv = zero_pv(&cs);
         let before = cs.num_constraints();
-        let _ = check_window_var(cs.clone(), &msg, &msg, &vpk, &msg, None).unwrap();
+        let _ = fold_step(cs.clone(), None, &fold_pv).unwrap();
+        let fold = cs.num_constraints() - before;
+        let before = cs.num_constraints();
+        let _ = window_opens(cs.clone(), &msg, &msg, &msg, None).unwrap();
         let window = cs.num_constraints() - before;
 
         let parent_cs = setup_mode_cs();
+        let pv = zero_pv(&parent_cs);
         let zero = || Fp::new_witness(parent_cs.clone(), || Ok(Fr::from(0u64))).unwrap();
-        let pv = ParentPublicVars {
-            output_commitments: (0..MAX_OUTPUTS).map(|_| zero()).collect(),
-            anchor_size: zero(),
-            anchor_board_root: zero(),
-            anchor_nullifier_root: zero(),
-            nullifier: zero(),
-            vpk_hash: zero(),
-            vk_hash: zero(),
-        };
         let root = zero();
         let before = parent_cs.num_constraints();
         let _ = parent_checks(parent_cs.clone(), None, &pv, &root, &root).unwrap();
@@ -1715,19 +1948,11 @@ mod tests {
         GenesisSpendCircuit::default().generate_constraints(genesis_cs.clone()).unwrap();
 
         let step_cs = setup_mode_cs();
-        SpendStepCircuit {
-            core: SpendCoreWitness::default(),
-            wrap_vk: shaped_wrap_vk(),
-            genesis_vk_hash: Fr::from(0u64),
-            input_parent_proofs: std::array::from_fn(|_| Some(SpendStepCircuit::dummy_wrap_proof())),
-            input_parents: std::array::from_fn(|_| None),
-            input_parent_vk_hashes: std::array::from_fn(|_| None),
-        }
-        .generate_constraints(step_cs.clone())
-        .unwrap();
+        step_circuit_for_counting().generate_constraints(step_cs.clone()).unwrap();
 
         println!("one signature check:    {signature}");
-        println!("window check (M = {MAX_SN_OCCURRENCES}):   {window}");
+        println!("one fold step:          {fold}");
+        println!("window opening:         {window}");
         println!("parent checks in total: {parent}");
         println!("GenesisSpendCircuit:    {}", genesis_cs.num_constraints());
         println!("SpendStepCircuit:       {}", step_cs.num_constraints());
@@ -1755,18 +1980,7 @@ mod tests {
             let _ = poseidon_hash_var(cs, &xs).unwrap();
         });
         report("GenesisSpendCircuit", |cs| GenesisSpendCircuit::default().generate_constraints(cs).unwrap());
-        report("SpendStepCircuit", |cs| {
-            SpendStepCircuit {
-                core: SpendCoreWitness::default(),
-                wrap_vk: shaped_wrap_vk(),
-                genesis_vk_hash: Fr::from(0u64),
-                input_parent_proofs: std::array::from_fn(|_| Some(SpendStepCircuit::dummy_wrap_proof())),
-                input_parents: std::array::from_fn(|_| None),
-                input_parent_vk_hashes: std::array::from_fn(|_| None),
-            }
-            .generate_constraints(cs)
-            .unwrap()
-        });
+        report("SpendStepCircuit", |cs| step_circuit_for_counting().generate_constraints(cs).unwrap());
     }
 
     /// Phase 4 spike: what the recursive verifier costs with the wrap VK as a
@@ -1855,7 +2069,7 @@ mod tests {
         let (pk, vk) = setup(&mut rng).unwrap();
 
         let c = genesis_circuit();
-        let public_inputs = spend_public_inputs(&c.core.public_values().unwrap(), Fr::from(0u64));
+        let public_inputs = spend_public_inputs(&c.core.public_values().unwrap(), Fr::from(0u64), Fr::from(0u64));
         let proof = prove(&pk, c, &mut rng).unwrap();
         assert!(verify(&vk, &public_inputs, &proof).unwrap(), "a genuinely valid genesis-mint proof must verify");
 
@@ -1864,17 +2078,17 @@ mod tests {
         assert!(!verify(&vk, &tampered, &proof).unwrap(), "a proof must not verify against the wrong public inputs");
     }
 
-    /// Full chain, real GM17 proofs end to end, under the reviewers' attack:
-    /// genesis mints to Alice, a copy of Alice's serial number lands before her
-    /// carrier, and Bob still spends onward to Carol, recursively verifying
-    /// Alice's proof at an anchor that predates the copy.
+    /// Full chain, real GM17 proofs end to end, under the reviewers' attack
+    /// past the old bound: three copies of Alice's serial number land before
+    /// her carrier, and Bob folds each of them before spending onward to Carol.
     ///
-    /// One setup of each circuit for the whole chain: Alice's spend and Bob's
-    /// share a proving key, and Bob's verifies a proof made under that same key.
+    /// One setup of each circuit for the whole chain: spends and folds share a
+    /// proving key, and each verifies proofs made under that same key.
     #[test]
-    fn proving_chain_survives_a_copied_serial_number() {
+    fn proving_chain_survives_copied_serial_numbers() {
         use ark_std::rand::{rngs::StdRng, SeedableRng};
         use cloakkchain_circuit_wrap::inner_vk_hash;
+        const COPIES: u64 = 3;
         let mut rng = StdRng::seed_from_u64(20260919);
 
         let (genesis_pk_data, genesis_vk) = setup(&mut rng).unwrap();
@@ -1883,80 +2097,113 @@ mod tests {
         let (step_pk, step_vk) = setup_non_genesis(wrap_vk.clone(), genesis_vk_hash, &mut rng).unwrap();
         let step_vk_hash = inner_vk_hash(&step_vk);
 
+        let satisfied = |circuit: &SpendStepCircuit| {
+            let cs = ConstraintSystem::<Fr>::new_ref();
+            circuit.clone().generate_constraints(cs.clone()).unwrap();
+            cs.is_satisfied().unwrap()
+        };
+        // Prove a step-circuit witness, check it, and wrap it for the next step.
+        let prove_step = |circuit: SpendStepCircuit, statement: &StepStatement, rng: &mut StdRng| {
+            assert!(satisfied(&circuit), "witness must satisfy every constraint");
+            let proof = prove_non_genesis(&step_pk, circuit, rng).unwrap();
+            assert!(verify_non_genesis(&step_vk, &statement.public_inputs(), &proof).unwrap());
+            wrap(&wrap_pk, step_vk.clone(), proof, statement.public_inputs(), rng)
+        };
+
         let mut w = world();
         let mut genesis_core = w.genesis.core.clone();
         genesis_core.vk_hash = Some(genesis_vk_hash);
-        let genesis_inputs = spend_public_inputs(&w.genesis.pv, genesis_vk_hash);
+        let genesis_statement =
+            StepStatement { public_values: w.genesis.pv.clone(), window_head: Fr::from(0u64), vk_hash: genesis_vk_hash };
         let genesis_proof = prove(&genesis_pk_data, GenesisSpendCircuit { core: genesis_core }, &mut rng).unwrap();
-        assert!(verify(&genesis_vk, &genesis_inputs, &genesis_proof).unwrap());
-        let wrap_genesis = wrap(&wrap_pk, genesis_vk, genesis_proof, genesis_inputs, &mut rng);
-        assert!(cloakkchain_circuit_wrap::verify(&wrap_vk, &public_input_chunks(&genesis_inputs), &wrap_genesis.proof).unwrap());
+        assert!(verify(&genesis_vk, &genesis_statement.public_inputs(), &genesis_proof).unwrap());
+        let wrap_genesis = wrap(&wrap_pk, genesis_vk, genesis_proof, genesis_statement.public_inputs(), &mut rng);
+        assert!(cloakkchain_circuit_wrap::verify(
+            &wrap_vk,
+            &public_input_chunks(&genesis_statement.public_inputs()),
+            &wrap_genesis.proof
+        )
+        .unwrap());
 
-        // Alice proves at anchor 1, then a copy of her SN gets ordered first.
+        // Alice proves at anchor 1, then copies of her SN get ordered first.
         let alice = w.alice_spends(&w.bob_coin, 1);
         let mut alice_core = alice.core.clone();
         alice_core.vk_hash = Some(step_vk_hash);
+        let alice_statement =
+            StepStatement { public_values: alice.pv.clone(), window_head: Fr::from(0u64), vk_hash: step_vk_hash };
         let alice_circuit = SpendStepCircuit {
             core: alice_core,
+            fold: None,
             wrap_vk: wrap_vk.clone(),
             genesis_vk_hash,
             input_parent_proofs: [Some(wrap_genesis.proof.clone())],
+            input_parent_statements: [Some(genesis_statement)],
             input_parents: [Some(w.history.parent_witness(0, &w.genesis.pv, &w.genesis.vpk, 1))],
-            input_parent_vk_hashes: [Some(genesis_vk_hash)],
         };
-        let cs = ConstraintSystem::<Fr>::new_ref();
-        alice_circuit.clone().generate_constraints(cs.clone()).unwrap();
-        assert!(cs.is_satisfied().unwrap(), "Alice's witness should satisfy every constraint");
 
         // A spend can't treat a parent's VK as acceptable unless it's genesis's
         // or its own.
         let mut wrong_genesis = alice_circuit.clone();
         wrong_genesis.genesis_vk_hash += Fr::from(1u64);
-        let cs = ConstraintSystem::<Fr>::new_ref();
-        wrong_genesis.generate_constraints(cs.clone()).unwrap();
-        assert!(!cs.is_satisfied().unwrap(), "a parent under an unexpected VK must fail");
+        assert!(!satisfied(&wrong_genesis), "a parent under an unexpected VK must fail");
 
-        let alice_inputs = spend_public_inputs(&alice.pv, step_vk_hash);
-        let alice_proof = prove_non_genesis(&step_pk, alice_circuit, &mut rng).unwrap();
-        assert!(verify_non_genesis(&step_vk, &alice_inputs, &alice_proof).unwrap());
-        let wrap_alice = wrap(&wrap_pk, step_vk.clone(), alice_proof, alice_inputs, &mut rng);
+        let mut latest = prove_step(alice_circuit, &alice_statement, &mut rng);
+        let mut latest_statement = alice_statement;
 
-        w.history.append(&junk_copy(w.alice_nullifier(), 1));
+        for seed in 0..COPIES {
+            w.history.append(&junk_copy(w.alice_nullifier(), seed + 1));
+        }
         let slot = w.history.append(&alice.entry);
-
-        // Bob spends onward to Carol under the same key, opening the copy in
-        // Alice's window.
-        let (_, carol_pk) = owner(3);
         let size = w.history.len();
         let parent = w.history.parent_witness(slot, &alice.pv, &alice.vpk, size);
-        assert_eq!(parent.window.occurrences.len(), 1);
+        assert_eq!(parent.window.occurrences.len() as u64, COPIES);
+
+        // Bob folds each copy into Alice's statement, one proof per copy.
+        for occurrence in &parent.window.occurrences {
+            let next = StepStatement {
+                window_head: occurrence.link(latest_statement.window_head),
+                ..latest_statement.clone()
+            };
+            let fold = SpendStepCircuit {
+                core: SpendCoreWitness::for_fold(&latest_statement, next.window_head, step_vk_hash),
+                fold: Some(FoldWitness { vpk: alice.vpk, occurrence: occurrence.clone() }),
+                wrap_vk: wrap_vk.clone(),
+                genesis_vk_hash,
+                input_parent_proofs: [Some(latest.proof.clone())],
+                input_parent_statements: [Some(latest_statement.clone())],
+                input_parents: [None],
+            };
+            latest = prove_step(fold, &next, &mut rng);
+            latest_statement = next;
+        }
+        assert_eq!(latest_statement.window_head, parent.window.leaf.occ);
+
+        // Bob spends onward to Carol, verifying the last fold.
+        let (_, carol_pk) = owner(3);
         let bob = post(&w.history, w.bob_sk, &w.bob_coin, &[coin(4, 100, carol_pk)], size, Some(&parent), 2);
         let mut bob_core = bob.core.clone();
         bob_core.vk_hash = Some(step_vk_hash);
+        let bob_statement = StepStatement { public_values: bob.pv.clone(), window_head: Fr::from(0u64), vk_hash: step_vk_hash };
         let bob_circuit = SpendStepCircuit {
             core: bob_core,
+            fold: None,
             wrap_vk,
             genesis_vk_hash,
-            input_parent_proofs: [Some(wrap_alice.proof.clone())],
+            input_parent_proofs: [Some(latest.proof.clone())],
+            input_parent_statements: [Some(latest_statement.clone())],
             input_parents: [Some(parent.clone())],
-            input_parent_vk_hashes: [Some(step_vk_hash)],
         };
-        let cs = ConstraintSystem::<Fr>::new_ref();
-        bob_circuit.clone().generate_constraints(cs.clone()).unwrap();
-        assert!(cs.is_satisfied().unwrap(), "Bob's witness should satisfy every constraint");
-        let bob_inputs = spend_public_inputs(&bob.pv, step_vk_hash);
-        let bob_proof = prove_non_genesis(&step_pk, bob_circuit.clone(), &mut rng).unwrap();
-        assert!(verify_non_genesis(&step_vk, &bob_inputs, &bob_proof).unwrap());
-        let mut tampered = bob_inputs;
+
+        // Skipping the last fold doesn't work: the head must cover every copy.
+        let mut unfolded = bob_circuit.clone();
+        unfolded.input_parent_statements[0].as_mut().unwrap().window_head = Fr::from(0u64);
+        assert!(!satisfied(&unfolded), "a window head that misses copies must fail");
+
+        assert!(satisfied(&bob_circuit), "Bob's witness should satisfy every constraint");
+        let bob_proof = prove_non_genesis(&step_pk, bob_circuit, &mut rng).unwrap();
+        assert!(verify_non_genesis(&step_vk, &bob_statement.public_inputs(), &bob_proof).unwrap());
+        let mut tampered = bob_statement.public_inputs();
         tampered[0] += Fr::from(1u64);
         assert!(!verify_non_genesis(&step_vk, &tampered, &bob_proof).unwrap());
-
-        // The recursion is really binding: the public values Bob's circuit
-        // reads back must be the ones Alice's proof was made for.
-        let mut lying = bob_circuit;
-        lying.input_parents[0].as_mut().unwrap().public_values.anchor.nullifier_root += Fr::from(1u64);
-        let cs = ConstraintSystem::<Fr>::new_ref();
-        lying.generate_constraints(cs.clone()).unwrap();
-        assert!(!cs.is_satisfied().unwrap(), "public values Alice's proof wasn't made for must fail");
     }
 }
