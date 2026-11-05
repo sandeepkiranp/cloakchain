@@ -865,11 +865,9 @@ impl IncrementalTree {
 //
 // Ordering is over `Fr`'s canonical integer representative (`Fr: Ord`,
 // comparing values in `0..p`) rather than byte-lexicographic order — any
-// consistent total order works for the accumulator's soundness, and
-// comparisons on `Fr` are confirmed safe to do in-circuit on this stack
-// (unlike gnark/Sunspot, which the `sunspot_groth16_experiment` finding
-// showed breaks on Field ordering comparisons — arkworks does not share that
-// bug).
+// consistent total order works for the accumulator's soundness. In-circuit,
+// comparisons must use `circuit-spend`'s own comparator: `ark-r1cs-std` 0.5's
+// slice comparison isn't numeric, see `bits_msb_is_lt`.
 
 /// The most occurrences of one nullifier a spend proof can open when checking
 /// its parent's window. **A stopgap**: `MAX_SN_OCCURRENCES + 1` copies landing
@@ -963,9 +961,12 @@ pub fn verify_nonmembership(root: Fr, target: Fr, witness: &NonMembershipWitness
     compute_root_from_path(leaf_hash, witness.low_leaf_index as usize, &witness.sibling_path) == root
 }
 
-/// A membership proof that also opens the leaf's whole occurrence chain.
+/// What a spender shows about a nullifier's occurrences under some root: one
+/// opened leaf and its chain. A non-empty `occurrences` claims `leaf` is the
+/// nullifier's own leaf; an empty one claims `leaf` is its low leaf, i.e. that
+/// the nullifier is absent. One shape for both because the circuit is fixed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, CanonicalSerialize, CanonicalDeserialize)]
-pub struct OccurrenceWitness {
+pub struct WindowWitness {
     pub leaf: IndexedLeaf,
     pub leaf_index: u64,
     #[serde(with = "field_serde")]
@@ -977,19 +978,12 @@ pub struct OccurrenceWitness {
 /// Verify that `witness.occurrences` is `target`'s complete occurrence chain
 /// under `root`. Complete because the chain must re-fold from zero to exactly
 /// the head in the leaf, so nothing can be dropped from either end.
-pub fn verify_occurrences(root: Fr, target: Fr, witness: &OccurrenceWitness) -> bool {
+pub fn verify_occurrences(root: Fr, target: Fr, witness: &WindowWitness) -> bool {
     let occ = witness.occurrences.iter().fold(Fr::from(0u64), |prev, o| o.link(prev));
-    witness.leaf.value == target
+    !witness.occurrences.is_empty()
+        && witness.leaf.value == target
         && witness.leaf.occ == occ
         && compute_root_from_path(witness.leaf.hash(), witness.leaf_index as usize, &witness.sibling_path) == root
-}
-
-/// What a spender shows about its parent's window: the nullifier was either
-/// absent before the parent's slot, or present with an opened chain.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WindowWitness {
-    Empty(NonMembershipWitness),
-    Occurrences(OccurrenceWitness),
 }
 
 /// The window check: against `root` (the accumulator just before a parent's
@@ -998,13 +992,14 @@ pub enum WindowWitness {
 /// with the parent's own proof that the nullifier was absent at its anchor,
 /// this covers everything between that anchor and the parent's slot.
 pub fn check_window(root: Fr, nullifier: Fr, vpk: &OwnerPk, outputs_hash: Fr, witness: &WindowWitness) -> bool {
-    match witness {
-        WindowWitness::Empty(w) => verify_nonmembership(root, nullifier, w),
-        WindowWitness::Occurrences(w) => {
-            w.occurrences.len() <= MAX_SN_OCCURRENCES
-                && verify_occurrences(root, nullifier, w)
-                && w.occurrences.iter().all(|o| o.is_harmless(nullifier, vpk, outputs_hash))
-        }
+    if witness.occurrences.is_empty() {
+        witness.leaf.value < nullifier
+            && nullifier < witness.leaf.next_value
+            && compute_root_from_path(witness.leaf.hash(), witness.leaf_index as usize, &witness.sibling_path) == root
+    } else {
+        witness.occurrences.len() <= MAX_SN_OCCURRENCES
+            && verify_occurrences(root, nullifier, witness)
+            && witness.occurrences.iter().all(|o| o.is_harmless(nullifier, vpk, outputs_hash))
     }
 }
 
@@ -1114,9 +1109,9 @@ impl NullifierTree {
     }
 
     /// Open `target`'s leaf and occurrence chain, if it's a member.
-    pub fn prove_occurrences(&self, target: Fr) -> Option<OccurrenceWitness> {
+    pub fn prove_occurrences(&self, target: Fr) -> Option<WindowWitness> {
         let idx = *self.index_of.get(&target)?;
-        Some(OccurrenceWitness {
+        Some(WindowWitness {
             leaf: self.leaves[idx].clone(),
             leaf_index: idx as u64,
             sibling_path: self.tree.path_for(idx),
@@ -1125,12 +1120,17 @@ impl NullifierTree {
     }
 
     /// The witness for [`check_window`]: the chain if `target` is a member,
-    /// otherwise its non-membership.
+    /// otherwise its low leaf with an empty chain.
     pub fn prove_window(&self, target: Fr) -> WindowWitness {
-        match self.prove_occurrences(target) {
-            Some(w) => WindowWitness::Occurrences(w),
-            None => WindowWitness::Empty(self.prove_non_membership(target)),
-        }
+        self.prove_occurrences(target).unwrap_or_else(|| {
+            let low_idx = self.find_low_leaf_index(target);
+            WindowWitness {
+                leaf: self.leaves[low_idx].clone(),
+                leaf_index: low_idx as u64,
+                sibling_path: self.tree.path_for(low_idx),
+                occurrences: Vec::new(),
+            }
+        })
     }
 }
 
@@ -1313,7 +1313,7 @@ impl Default for History {
 /// equality-checking. `vpk_hash` is what ties `vsk` to the coin, so a spender
 /// can't hand a recipient a fake `vpk` under which their double-spend would
 /// pass for junk.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, CanonicalSerialize, CanonicalDeserialize)]
 pub struct SpendPublicValues {
     #[serde(with = "field_serde")]
     pub output_commitments: Vec<Fr>,
@@ -1387,7 +1387,7 @@ pub fn check_receipt(
 
 /// What a spend shows about the entry that created its input coin, its
 /// "parent": all of it opened against the spend's own anchor.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, CanonicalSerialize, CanonicalDeserialize)]
 pub struct ParentWitness {
     /// The parent proof's public values. Stands in for its recursive
     /// verification, which is `circuit-spend`'s job.
@@ -1440,13 +1440,19 @@ pub fn check_spend(
         return Err("nullifier is already present at this anchor");
     }
 
-    if output_coins.len() != output_commitments.len() {
-        return Err("output_coins length does not match output_commitments");
+    if output_coins.len() > output_commitments.len() {
+        return Err("more output_coins than output_commitments");
     }
     for (coin, cn) in output_coins.iter().zip(output_commitments.iter()) {
         if &coin.commitment() != cn {
             return Err("output coin does not match its commitment");
         }
+    }
+    // Commitments past the real coins are padding. They must be zero, because
+    // their value isn't counted below: anything else would be a spendable coin
+    // conjured from nothing.
+    if output_commitments[output_coins.len()..].iter().any(|cn| *cn != Fr::from(0u64)) {
+        return Err("unused output slots must hold a zero commitment");
     }
 
     // Value conservation: Σ inputs == Σ outputs (no minting, no burning).
@@ -1910,7 +1916,7 @@ mod tests {
 
         // Neither end of the chain can be dropped, or the order changed.
         for occurrences in [vec![second.clone()], vec![first.clone()], vec![second, first], vec![]] {
-            let lying = OccurrenceWitness { occurrences, ..w2.clone() };
+            let lying = WindowWitness { occurrences, ..w2.clone() };
             assert!(!verify_occurrences(root2, sn, &lying));
         }
         assert!(!verify_occurrences(root2, sn + Fr::from(1u64), &w2));
@@ -2169,13 +2175,13 @@ mod tests {
 
         // Hiding the copy: claim an empty window using the pre-copy tree.
         let mut hiding = parent.clone();
-        hiding.window = WindowWitness::Empty(w.history.nullifier_tree_at(1).prove_non_membership(w.alice_nullifier()));
+        hiding.window = w.history.nullifier_tree_at(1).prove_window(w.alice_nullifier());
         assert_eq!(onward(&hiding), Some("parent's window is not clean"));
 
         // Dropping the copy from the opened chain.
         let mut dropping = parent;
-        let WindowWitness::Occurrences(chain) = &mut dropping.window else { panic!("expected the copy") };
-        chain.occurrences.clear();
+        assert!(!dropping.window.occurrences.is_empty());
+        dropping.window.occurrences.clear();
         assert_eq!(onward(&dropping), Some("parent's window is not clean"));
     }
 
@@ -2289,6 +2295,30 @@ mod tests {
         let w = world();
         let err = spend(&w.history, w.alice_sk, &w.alice_coin, &[w.bob_coin.clone()], 1, None, 1);
         assert_eq!(err.err(), Some("only the genesis key may mint without provenance"));
+    }
+
+    /// A commitment in a slot with no coin behind it would be spendable later
+    /// without ever having counted towards conservation.
+    #[test]
+    fn rejects_a_phantom_commitment_in_an_unused_output_slot() {
+        let w = world();
+        let anchor = w.history.anchor_at(1).unwrap();
+        let commitment = w.alice_coin.commitment();
+        let nonmembership = w.history.nullifier_tree_at(1).prove_non_membership(w.alice_nullifier());
+        let parent = w.parent_is_genesis(1);
+        let check = |padding: Fr| {
+            check_spend(
+                &w.alice_sk,
+                &w.alice_coin,
+                std::slice::from_ref(&w.bob_coin),
+                &[w.bob_coin.commitment(), padding],
+                &anchor,
+                &nonmembership,
+                Some(&parent),
+            )
+        };
+        assert!(check(Fr::from(0u64)).is_ok());
+        assert_eq!(check(commitment).err(), Some("unused output slots must hold a zero commitment"));
     }
 
     #[test]
