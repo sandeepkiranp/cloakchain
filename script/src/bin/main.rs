@@ -15,38 +15,40 @@
 //! The chain runs under the reviewers' attack: after Alice has proved but before
 //! her carrier lands, a third party gets `--copies` copies of her serial number
 //! ordered first. Her proof stays valid, since it's anchored before them; Bob
-//! accepts her carrier regardless, folds each copy into her proof's statement
-//! (one fold proof per copy, no cap), and spends onward from the last fold.
+//! accepts her carrier regardless, folds the copies into her proof's statement
+//! (one fold proof per `FOLD_BATCH` copies, no cap), and spends onward from the
+//! last fold.
 //!
 //! Every wallet's view is a [`History`] replayed blindly from the board: the
 //! roots a leaf embeds are computed there, and are never posted.
 //!
-//! One setup per circuit serves the whole chain: Alice's and Bob's spends share
-//! a key, and each recipient checks the proof's `vk_hash` against it. Each step's
-//! subprocess re-runs its setup from the same seed, which reproduces the same
-//! keys; that's what lets the peak-memory column stay per step.
+//! One setup per circuit serves the whole chain, and it runs once, up front, in
+//! its own subprocess: that subprocess keeps the proving key on disk and hands
+//! back only the verifying key. Every key hash is therefore known before any
+//! witness is built, and each recipient checks its proof's `vk_hash` against the
+//! deployment's.
 //!
-//! `--prove` still builds the whole chain once, in order, in this process
-//! (exactly like a non-isolated driver would) — but each step's actual
-//! `setup`+`prove` call is farmed out to a fresh subprocess
-//! (`--internal-kind`/`--internal-witness`/`--internal-output`, hidden
-//! flags), so the peak-memory column reflects that step's own footprint
+//! `--prove` builds the whole chain once, in order, in this process — but each
+//! proof is farmed out to a fresh subprocess (`--internal-kind`/
+//! `--internal-witness`/`--internal-output`, hidden flags) that loads its proving
+//! key and proves, so the peak-memory column reflects that step's own footprint
 //! via the kernel's `VmHWM` tracker rather than a same-process running
-//! high-water mark. Only the small, already-`CanonicalSerialize`-able
-//! witness circuit struct crosses into the subprocess and only the
-//! resulting `(VerifyingKey, Proof)` crosses back — the parent still holds
-//! every other piece of state (board entries, history, prior proofs) exactly
-//! as it always did, so nothing is ever recomputed twice.
+//! high-water mark. The Prove column is timed inside that subprocess, around
+//! proving alone: setup and loading the key are excluded. Only the small,
+//! already-`CanonicalSerialize`-able witness crosses into the subprocess and only
+//! the proof crosses back — the parent holds every other piece of state (board
+//! entries, history, prior proofs), so nothing is ever recomputed twice.
 //!
 //! ```shell
 //! RUST_LOG=info cargo run --release -- --execute   # genesis circuit's constraint check only, no proving
-//! RUST_LOG=info cargo run --release -- --prove     # full chain; --copies N for N folds (default 1)
+//! RUST_LOG=info cargo run --release -- --prove     # full chain; --copies N copies to fold (default 1)
+//! RUST_LOG=info cargo run --release --features groth16 -- --prove   # the same, with Groth16
 //! ```
 
 use std::time::Instant;
 
 use ark_ec::pairing::Pairing;
-use cloakkchain_circuit_wrap::snark::{self, Proof, VerifyingKey};
+use cloakkchain_circuit_wrap::snark::{self, Proof, ProvingKey, VerifyingKey};
 use ark_mnt4_753::MNT4_753;
 use ark_mnt6_753::MNT6_753;
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
@@ -54,8 +56,8 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::{rngs::StdRng, SeedableRng};
 use clap::Parser;
 use cloakkchain_circuit_spend::{
-    spend_public_inputs, FoldWitness, GenesisSpendCircuit, SpendCoreWitness, SpendStepCircuit, StepStatement,
-    MAX_INPUTS, MAX_OUTPUTS, SPEND_PUBLIC_INPUT_COUNT,
+    spend_public_inputs, FoldCircuit, GenesisSpendCircuit, SpendCoreWitness, SpendStepCircuit, StepStatement,
+    FOLD_BATCH, MAX_INPUTS, MAX_OUTPUTS, SPEND_PUBLIC_INPUT_COUNT,
 };
 use cloakkchain_circuit_wrap::{inner_vk_hash, WrapCircuit};
 use cloakkchain_lib::{
@@ -73,26 +75,30 @@ struct Args {
     execute: bool,
     #[arg(long)]
     prove: bool,
-    /// Ad hoc: real GM17 setup+prove+verify at whichever MAX_INPUTS/
+    /// Ad hoc: real setup+prove+verify at whichever MAX_INPUTS/
     /// MAX_OUTPUTS shape circuit-spend is currently compiled with — for
     /// filling in the paper's 2x2 grid cells. See `run_prove_grid_cell`'s
     /// doc comment. Not part of the normal demo.
     #[arg(long)]
     grid_cell: bool,
     /// How many copies of Alice's serial number the `--prove` attacker gets
-    /// ordered ahead of her carrier. Bob folds each one, so each adds a fold
-    /// proof and a wrap.
+    /// ordered ahead of her carrier. Bob folds them, `FOLD_BATCH` per fold
+    /// proof (plus its wrap).
     #[arg(long, default_value_t = 1)]
-    copies: u8,
-    /// Hidden: re-invokes this binary as a single setup+prove subprocess
-    /// (see the module doc comment). One of "genesis", "spend_non_genesis",
-    /// "wrap". Not for direct use.
+    copies: u32,
+    /// Hidden: re-invokes this binary as a single setup or proving subprocess
+    /// (see the module doc comment). One of "genesis", "wrap", "fold",
+    /// "spend". Not for direct use.
     #[arg(long, hide = true)]
     internal_kind: Option<String>,
-    /// Hidden: path to the serialized witness circuit struct.
+    /// Hidden: run that circuit's setup rather than prove with it.
+    #[arg(long, hide = true)]
+    internal_setup: bool,
+    /// Hidden: path to the serialized witness circuit struct, or the setup's
+    /// parameters.
     #[arg(long, hide = true)]
     internal_witness: Option<String>,
-    /// Hidden: where to write the resulting (VerifyingKey, Proof) pair.
+    /// Hidden: where to write the proof, or the verifying key.
     #[arg(long, hide = true)]
     internal_output: Option<String>,
 }
@@ -164,13 +170,13 @@ fn make_tx(
 
 // ---- Subprocess isolation + peak-memory tracking -----------------------------
 //
-// Each step's `setup`+`prove` call runs in a fresh child process so its
-// peak-memory reading reflects only that step's own working set, not a
-// same-process running high-water mark carried over from earlier steps.
-// Only the witness circuit struct crosses into the child and only the
-// resulting `(VerifyingKey, Proof)` crosses back — everything else (board
-// state, history, prior proofs) stays in this parent process for the
-// whole run, so no step is ever computed twice.
+// Each setup and each proof runs in a fresh child process, so its peak-memory
+// reading reflects only that step's own working set, not a same-process running
+// high-water mark carried over from earlier steps. Setup children write the
+// proving key to a file and hand back the verifying key; proving children load
+// that file, prove, and report their own proving time. Everything else (board
+// state, history, prior proofs) stays in this parent process for the whole run,
+// so no step is ever computed twice.
 
 /// Poll `/proc/<pid>/status` for `VmHWM` (the kernel's own running peak
 /// resident-set-size tracker) while `child` runs, returning the highest
@@ -197,10 +203,9 @@ fn wait_tracking_peak_memory(mut child: std::process::Child) -> (std::process::E
 }
 
 /// Synthesizes `circuit` on a fresh `ConstraintSystem` in the same
-/// `SynthesisMode::Setup` mode `GM17::circuit_specific_setup` itself
-/// uses, and returns the resulting constraint count. Cheap — synthesis
-/// alone is native field arithmetic (no FFTs/pairings/proving), so this
-/// runs in a few seconds even for the ~600K-constraint spend circuit.
+/// `SynthesisMode::Setup` mode setup itself uses, and returns the resulting
+/// constraint count. Cheap — synthesis alone is native field arithmetic (no
+/// FFTs/pairings/proving).
 fn count_constraints<F: ark_ff::Field, C: ConstraintSynthesizer<F> + Clone>(circuit: &C) -> usize {
     let cs = ConstraintSystem::<F>::new_ref();
     cs.set_mode(ark_relations::r1cs::SynthesisMode::Setup);
@@ -208,99 +213,233 @@ fn count_constraints<F: ark_ff::Field, C: ConstraintSynthesizer<F> + Clone>(circ
     cs.num_constraints()
 }
 
-fn write_vk_proof<E: Pairing>(vk: &VerifyingKey<E>, proof: &Proof<E>, path: &std::path::Path) {
+fn temp_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("cloakkchain_{name}.bin"))
+}
+
+/// Where `kind`'s proving key lives between its setup and its proofs.
+fn pk_path(kind: &str) -> std::path::PathBuf {
+    temp_path(&format!("{kind}_pk"))
+}
+
+/// Uncompressed and unchecked on the way back in: only ever this binary's own
+/// output, and proving keys are large enough for point decompression and
+/// subgroup checks to cost noticeable time.
+fn write_bin<T: CanonicalSerialize>(path: &std::path::Path, value: &T) {
     let mut buf = Vec::new();
-    vk.serialize_compressed(&mut buf).expect("serialize verifying key");
-    proof.serialize_compressed(&mut buf).expect("serialize proof");
-    std::fs::write(path, buf).expect("write output file");
+    value.serialize_uncompressed(&mut buf).expect("serialize");
+    std::fs::write(path, buf).expect("write file");
 }
 
-fn read_vk_proof<E: Pairing>(path: &std::path::Path) -> (VerifyingKey<E>, Proof<E>) {
-    let bytes = std::fs::read(path).expect("read output file");
-    let mut cursor = &bytes[..];
-    let vk = VerifyingKey::<E>::deserialize_compressed(&mut cursor).expect("deserialize verifying key");
-    let proof = Proof::<E>::deserialize_compressed(&mut cursor).expect("deserialize proof");
-    (vk, proof)
+fn read_bin<T: CanonicalDeserialize>(path: &std::path::Path) -> T {
+    let bytes = std::fs::read(path).expect("read file");
+    T::deserialize_uncompressed_unchecked(&bytes[..]).expect("deserialize")
 }
 
-/// Spawn a fresh copy of this binary to run one step's `setup`+`prove` in
-/// isolation. `circuit` is serialized to a temp file, the child deserializes
-/// it, calls the appropriate crate's `setup`/`prove` (dispatched by `kind`
-/// in `main`'s hidden-flag branch below), and writes back `(VerifyingKey,
-/// Proof)`. Returns that pair plus the wall-clock time and peak RSS of the
-/// whole subprocess.
-fn run_step_subprocess<C: CanonicalSerialize, E: Pairing>(
-    kind: &str,
-    circuit: &C,
-) -> (VerifyingKey<E>, Proof<E>, f64, u64) {
-    let witness_path = std::env::temp_dir().join(format!("cloakkchain_{kind}_witness.bin"));
-    let output_path = std::env::temp_dir().join(format!("cloakkchain_{kind}_output.bin"));
-
-    let mut witness_buf = Vec::new();
-    circuit.serialize_compressed(&mut witness_buf).expect("serialize witness");
-    std::fs::write(&witness_path, witness_buf).expect("write witness file");
-
+/// Run this binary as a child with `args`, returning its peak memory.
+fn run_child(args: &[&str]) -> u64 {
     let exe = std::env::current_exe().expect("current_exe");
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.args([
+    let child = std::process::Command::new(&exe).args(args).spawn().expect("spawn subprocess");
+    let (status, peak_mem_kb) = wait_tracking_peak_memory(child);
+    assert!(status.success(), "subprocess {args:?} exited with {status}");
+    peak_mem_kb.unwrap_or(0)
+}
+
+/// Run `kind`'s setup in a child, which keeps the proving key at
+/// [`pk_path`]. Returns the verifying key, the wall-clock time and the peak
+/// memory.
+fn setup_subprocess<E: Pairing>(kind: &str, params: &impl CanonicalSerialize) -> (VerifyingKey<E>, f64, u64) {
+    let input = temp_path(&format!("{kind}_setup_input"));
+    let output = temp_path(&format!("{kind}_vk"));
+    write_bin(&input, params);
+    let t = Instant::now();
+    let peak_mem_kb = run_child(&[
+        "--internal-kind",
+        kind,
+        "--internal-setup",
+        "--internal-witness",
+        input.to_str().expect("temp path is valid UTF-8"),
+        "--internal-output",
+        output.to_str().expect("temp path is valid UTF-8"),
+    ]);
+    let secs = t.elapsed().as_secs_f64();
+    let vk = read_bin(&output);
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&output);
+    (vk, secs, peak_mem_kb)
+}
+
+/// Prove `circuit` with `kind`'s proving key in a child. Returns the proof, the
+/// proving time as the child measured it, and the peak memory.
+fn prove_subprocess<C: CanonicalSerialize, E: Pairing>(kind: &str, circuit: &C) -> (Proof<E>, f64, u64) {
+    let input = temp_path(&format!("{kind}_witness"));
+    let output = temp_path(&format!("{kind}_proof"));
+    write_bin(&input, circuit);
+    let peak_mem_kb = run_child(&[
         "--internal-kind",
         kind,
         "--internal-witness",
-        witness_path.to_str().expect("temp path is valid UTF-8"),
+        input.to_str().expect("temp path is valid UTF-8"),
         "--internal-output",
-        output_path.to_str().expect("temp path is valid UTF-8"),
+        output.to_str().expect("temp path is valid UTF-8"),
     ]);
-
-    let t = Instant::now();
-    let child = cmd.spawn().expect("spawn proving subprocess");
-    let (status, peak_mem_kb) = wait_tracking_peak_memory(child);
-    let prove_secs = t.elapsed().as_secs_f64();
-    assert!(status.success(), "subprocess for {kind} exited with {status}");
-
-    let (vk, proof) = read_vk_proof::<E>(&output_path);
-    let _ = std::fs::remove_file(&witness_path);
-    let _ = std::fs::remove_file(&output_path);
-    (vk, proof, prove_secs, peak_mem_kb.unwrap_or(0))
+    let (proof, prove_secs): (Proof<E>, u64) = read_bin(&output);
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&output);
+    (proof, prove_secs as f64 / 1e9, peak_mem_kb)
 }
 
 /// Entry point when this binary is re-invoked as a `--internal-kind`
-/// subprocess: deserialize the witness, run the matching crate's
-/// `setup`+`prove`, write back `(VerifyingKey, Proof)`. Each circuit
-/// already carries whatever "setup key" it needs (`wrap_vk`/`inner_vk`) as
-/// one of its own fields, so no separate parameter needs to travel
-/// alongside the witness.
-fn run_internal_step(kind: &str, witness_path: &str, output_path: &str) {
-    let witness_bytes = std::fs::read(witness_path).expect("read witness file");
+/// subprocess.
+fn run_internal_step(kind: &str, setup: bool, input: &str, output: &str) {
     let mut rng = StdRng::seed_from_u64(0x636c6f616b);
-    let output_path = std::path::Path::new(output_path);
+    let (input, output) = (std::path::Path::new(input), std::path::Path::new(output));
+    if setup {
+        match kind {
+            "genesis" => {
+                let (pk, vk) = cloakkchain_circuit_spend::setup(&mut rng).unwrap();
+                write_bin(&pk_path(kind), &pk);
+                write_bin(output, &vk);
+            }
+            "wrap" => {
+                let (pk, vk) = cloakkchain_circuit_wrap::setup::<SPEND_PUBLIC_INPUT_COUNT, _>(&mut rng).unwrap();
+                write_bin(&pk_path(kind), &pk);
+                write_bin(output, &vk);
+            }
+            "fold" => {
+                let wrap_vk: VerifyingKey<MNT6_753> = read_bin(input);
+                let (pk, vk) = cloakkchain_circuit_spend::setup_fold(wrap_vk, &mut rng).unwrap();
+                write_bin(&pk_path(kind), &pk);
+                write_bin(output, &vk);
+            }
+            "spend" => {
+                let (wrap_vk, genesis_vk_hash, fold_vk_hash): (VerifyingKey<MNT6_753>, Fr, Fr) = read_bin(input);
+                let (pk, vk) =
+                    cloakkchain_circuit_spend::setup_non_genesis(wrap_vk, genesis_vk_hash, fold_vk_hash, &mut rng)
+                        .unwrap();
+                write_bin(&pk_path(kind), &pk);
+                write_bin(output, &vk);
+            }
+            other => panic!("unknown --internal-kind {other}"),
+        }
+        return;
+    }
 
-    // A proof's `vk_hash` names its own VK, which only exists after setup, so
-    // it's filled in here rather than by the parent process.
+    /// Load the key and the witness, then time proving alone.
+    fn prove_timed<E: Pairing, C: CanonicalDeserialize>(
+        kind: &str,
+        input: &std::path::Path,
+        output: &std::path::Path,
+        rng: &mut StdRng,
+        prove: impl FnOnce(&ProvingKey<E>, C, &mut StdRng) -> Proof<E>,
+    ) {
+        let pk: ProvingKey<E> = read_bin(&pk_path(kind));
+        let circuit: C = read_bin(input);
+        let t = Instant::now();
+        let proof = prove(&pk, circuit, rng);
+        let nanos = t.elapsed().as_nanos() as u64;
+        write_bin(output, &(proof, nanos));
+    }
     match kind {
-        "genesis" => {
-            let mut circuit = GenesisSpendCircuit::deserialize_compressed(&witness_bytes[..]).expect("deserialize witness");
-            let (pk, vk) = cloakkchain_circuit_spend::setup(&mut rng).unwrap();
-            circuit.core.vk_hash = Some(inner_vk_hash(&vk));
-            let proof = cloakkchain_circuit_spend::prove(&pk, circuit, &mut rng).unwrap();
-            write_vk_proof::<MNT4_753>(&vk, &proof, output_path);
-        }
-        "spend_non_genesis" => {
-            let mut circuit = SpendStepCircuit::deserialize_compressed(&witness_bytes[..]).expect("deserialize witness");
-            let (pk, vk) =
-                cloakkchain_circuit_spend::setup_non_genesis(circuit.wrap_vk.clone(), circuit.genesis_vk_hash, &mut rng)
-                    .unwrap();
-            circuit.core.vk_hash = Some(inner_vk_hash(&vk));
-            let proof = cloakkchain_circuit_spend::prove_non_genesis(&pk, circuit, &mut rng).unwrap();
-            write_vk_proof::<MNT4_753>(&vk, &proof, output_path);
-        }
-        "wrap" => {
-            let circuit = WrapCircuit::<SPEND_PUBLIC_INPUT_COUNT>::deserialize_compressed(&witness_bytes[..])
-                .expect("deserialize witness");
-            let (pk, vk) = cloakkchain_circuit_wrap::setup::<SPEND_PUBLIC_INPUT_COUNT, _>(&mut rng).unwrap();
-            let proof = cloakkchain_circuit_wrap::prove::<SPEND_PUBLIC_INPUT_COUNT, _>(&pk, circuit, &mut rng).unwrap();
-            write_vk_proof::<MNT6_753>(&vk, &proof, output_path);
-        }
+        "genesis" => prove_timed::<MNT4_753, GenesisSpendCircuit>(kind, input, output, &mut rng, |pk, c, rng| {
+            cloakkchain_circuit_spend::prove(pk, c, rng).unwrap()
+        }),
+        "spend" => prove_timed::<MNT4_753, SpendStepCircuit>(kind, input, output, &mut rng, |pk, c, rng| {
+            cloakkchain_circuit_spend::prove_non_genesis(pk, c, rng).unwrap()
+        }),
+        "fold" => prove_timed::<MNT4_753, FoldCircuit>(kind, input, output, &mut rng, |pk, c, rng| {
+            cloakkchain_circuit_spend::prove_fold(pk, c, rng).unwrap()
+        }),
+        "wrap" => prove_timed::<MNT6_753, WrapCircuit<SPEND_PUBLIC_INPUT_COUNT>>(kind, input, output, &mut rng, |pk, c, rng| {
+            cloakkchain_circuit_wrap::prove::<SPEND_PUBLIC_INPUT_COUNT, _>(pk, c, rng).unwrap()
+        }),
         other => panic!("unknown --internal-kind {other}"),
+    }
+}
+
+// ---- The deployment's keys -----------------------------------------------------
+
+/// One key per circuit, set up once for the whole deployment, in dependency
+/// order: genesis and wrap need nothing, fold needs the wrap key, spend needs
+/// the wrap key and the genesis and fold keys' hashes.
+struct Keys {
+    genesis: VerifyingKey<MNT4_753>,
+    wrap: VerifyingKey<MNT6_753>,
+    fold: VerifyingKey<MNT4_753>,
+    spend: VerifyingKey<MNT4_753>,
+    genesis_hash: Fr,
+    fold_hash: Fr,
+    spend_hash: Fr,
+}
+
+impl Keys {
+    fn setup(stats: &mut Vec<SetupStats>) -> Self {
+        println!("--- Setup: one key per circuit, once per deployment ---");
+        let mut record = |name: &str, constraints: usize, secs: f64, peak_mem_kb: u64| {
+            println!("  {name}: {secs:.1}s");
+            stats.push(SetupStats { name: name.into(), constraints, secs, peak_mem_kb });
+        };
+
+        let (genesis, secs, mem) = setup_subprocess::<MNT4_753>("genesis", &Vec::<u8>::new());
+        record("GenesisSpendCircuit", count_constraints(&GenesisSpendCircuit::default()), secs, mem);
+
+        let (wrap, secs, mem) = setup_subprocess::<MNT6_753>("wrap", &Vec::<u8>::new());
+        let wrap_shape = WrapCircuit::<SPEND_PUBLIC_INPUT_COUNT> {
+            inner_vk: cloakkchain_circuit_wrap::shaped_inner_vk(SPEND_PUBLIC_INPUT_COUNT),
+            inner_proof: Some(Proof { a: genesis.g1_point(), b: genesis.g2_point(), c: genesis.g1_point() }),
+            inner_public_inputs: None,
+        };
+        record("WrapCircuit", count_constraints(&wrap_shape), secs, mem);
+
+        let (fold, secs, mem) = setup_subprocess::<MNT4_753>("fold", &wrap);
+        let fold_shape = FoldCircuit {
+            wrap_vk: wrap.clone(),
+            previous: None,
+            previous_proof: Some(SpendStepCircuit::dummy_wrap_proof()),
+            vpk: None,
+            occurrences: Vec::new(),
+            vk_hash: None,
+        };
+        record(&format!("FoldCircuit ({FOLD_BATCH} slots)"), count_constraints(&fold_shape), secs, mem);
+
+        let genesis_hash = inner_vk_hash(&genesis);
+        let fold_hash = inner_vk_hash(&fold);
+        let (spend, secs, mem) = setup_subprocess::<MNT4_753>("spend", &(wrap.clone(), genesis_hash, fold_hash));
+        let spend_shape = SpendStepCircuit {
+            core: SpendCoreWitness::default(),
+            wrap_vk: wrap.clone(),
+            genesis_vk_hash: genesis_hash,
+            fold_vk_hash: fold_hash,
+            input_parent_proofs: [Some(SpendStepCircuit::dummy_wrap_proof())],
+            input_parent_statements: [None],
+            input_parents: [None],
+        };
+        record("SpendStepCircuit", count_constraints(&spend_shape), secs, mem);
+
+        let spend_hash = inner_vk_hash(&spend);
+        Keys { genesis, wrap, fold, spend, genesis_hash, fold_hash, spend_hash }
+    }
+
+    fn remove_proving_keys() {
+        for kind in ["genesis", "wrap", "fold", "spend"] {
+            let _ = std::fs::remove_file(pk_path(kind));
+        }
+    }
+}
+
+/// Points for a structurally valid dummy proof, which `ProofVar` needs even
+/// when nothing about it is checked: any of the VK's own points will do.
+trait DummyPoints {
+    fn g1_point(&self) -> ark_mnt4_753::G1Affine;
+    fn g2_point(&self) -> ark_mnt4_753::G2Affine;
+}
+
+impl DummyPoints for VerifyingKey<MNT4_753> {
+    fn g1_point(&self) -> ark_mnt4_753::G1Affine {
+        snark::vk_points(self).0[0]
+    }
+    fn g2_point(&self) -> ark_mnt4_753::G2Affine {
+        snark::vk_points(self).1[0]
     }
 }
 
@@ -315,6 +454,32 @@ struct ProveStats {
     proof_bytes: usize,
     entry_bytes: Option<usize>,
     peak_mem_kb: u64,
+}
+
+struct SetupStats {
+    name: String,
+    constraints: usize,
+    secs: f64,
+    peak_mem_kb: u64,
+}
+
+fn print_setup_table(stats: &[SetupStats]) {
+    let w = 72;
+    println!("\n{}", "=".repeat(w));
+    println!("  Setup, once per deployment ({})", snark::NAME);
+    println!("{}", "=".repeat(w));
+    println!("{:<28}  {:>11}  {:>11}  {:>11}", "Circuit", "Constraints", "Setup", "Peak Mem");
+    println!("{}", "-".repeat(w));
+    for s in stats {
+        println!(
+            "{:<28}  {:>11}  {:>9.1} s  {:>11}",
+            s.name,
+            fmt_constraints(s.constraints),
+            s.secs,
+            fmt_mem_kb(s.peak_mem_kb)
+        );
+    }
+    println!("{}", "=".repeat(w));
 }
 
 fn fmt_constraints(c: usize) -> String {
@@ -344,7 +509,7 @@ fn fmt_mem_kb(kb: u64) -> String {
 fn print_prove_table(stats: &[ProveStats]) {
     let w = 122;
     println!("\n{}", "=".repeat(w));
-    println!("  Proof Statistics ({})", snark::NAME);
+    println!("  Proof Statistics ({}; Prove excludes setup and loading the key)", snark::NAME);
     println!("{}", "=".repeat(w));
     println!(
         "{:<28} {:>5}  {:>11}  {:>9}  {:>10}  {:>11}  {:>11}  {:>11}",
@@ -396,7 +561,7 @@ fn main() {
     if let Some(kind) = args.internal_kind {
         let witness_path = args.internal_witness.expect("--internal-witness required with --internal-kind");
         let output_path = args.internal_output.expect("--internal-output required with --internal-kind");
-        run_internal_step(&kind, &witness_path, &output_path);
+        run_internal_step(&kind, args.internal_setup, &witness_path, &output_path);
         return;
     }
 
@@ -437,7 +602,7 @@ fn run_execute(genesis: &Party, genesis_coin: &Coin, alice_coin: &Coin) {
 
     let history = History::new();
     let circuit = GenesisSpendCircuit {
-        core: core_witness(&history, genesis, genesis_coin, std::slice::from_ref(alice_coin)),
+        core: core_witness(&history, genesis, genesis_coin, std::slice::from_ref(alice_coin), Fr::from(0u64)),
     };
 
     let cs = ConstraintSystem::<Fr>::new_ref();
@@ -446,12 +611,12 @@ fn run_execute(genesis: &Party, genesis_coin: &Coin, alice_coin: &Coin) {
     println!("  constraints: {}", cs.num_constraints());
     println!("  satisfied:   {satisfied}");
     assert!(satisfied);
-    println!("\nRun --prove for the full chain (real {} proofs; --copies sets how many folds Bob proves).", snark::NAME);
+    println!("\nRun --prove for the full chain (real {} proofs; --copies sets how many copies Bob has to fold).", snark::NAME);
 }
 
 // ---- One step of the chain ---------------------------------------------------
 
-/// A proof of either step circuit, with what it claims.
+/// A proof of any of the circuits, with what it claims and the key it's for.
 #[derive(Clone)]
 struct Proven {
     statement: StepStatement,
@@ -466,9 +631,9 @@ struct ProvenSpend {
     proven: Proven,
 }
 
-/// A proof re-proved on the other curve, for the next step to verify.
+/// A proof re-proved on the other curve, under the deployment's wrap key, for
+/// the next step to verify.
 struct WrappedSpend {
-    vk: VerifyingKey<MNT6_753>,
     proof: Proof<MNT6_753>,
 }
 
@@ -480,12 +645,11 @@ struct Parent<'a> {
     slot: usize,
     latest: &'a Proven,
     wrapped: &'a WrappedSpend,
-    genesis_vk_hash: Fr,
 }
 
-/// The spend relation's witness, anchored at `history`'s current state. Its
-/// `vk_hash` is a placeholder until the proving subprocess has run setup.
-fn core_witness(history: &History, sender: &Party, input: &Coin, outputs: &[Coin]) -> SpendCoreWitness {
+/// The spend relation's witness, anchored at `history`'s current state, for
+/// the circuit whose key hashes to `vk_hash`.
+fn core_witness(history: &History, sender: &Party, input: &Coin, outputs: &[Coin], vk_hash: Fr) -> SpendCoreWitness {
     let size = history.len();
     let nullifier = derive_nullifier(input.commitment(), &sender.sk_p);
     SpendCoreWitness::new(
@@ -494,7 +658,7 @@ fn core_witness(history: &History, sender: &Party, input: &Coin, outputs: &[Coin
         outputs,
         history.anchor_at(size).expect("the current state exists"),
         history.nullifier_tree_at(size).prove_non_membership(nullifier),
-        Fr::from(0u64),
+        vk_hash,
     )
 }
 
@@ -502,8 +666,10 @@ fn core_witness(history: &History, sender: &Party, input: &Coin, outputs: &[Coin
 /// without posting it: nothing here depends on where it ends up landing.
 /// `parent` is `None` for a genesis mint. Construction order matters: prove,
 /// encrypt the proof into the ciphertext, then sign last (inside `encrypt_tx`).
+#[allow(clippy::too_many_arguments)]
 fn prove_spend(
     name: &str,
+    keys: &Keys,
     history: &History,
     sender: &Party,
     input: &Coin,
@@ -512,34 +678,37 @@ fn prove_spend(
     stats: &mut Vec<ProveStats>,
 ) -> ProvenSpend {
     let output_coins: Vec<Coin> = outputs.iter().map(|(c, _)| c.clone()).collect();
-    let core = core_witness(history, sender, input, &output_coins);
-    let public_values = core.public_values().expect("core_witness sets every public value");
+    let (vk, vk_hash) = match parent {
+        None => (&keys.genesis, keys.genesis_hash),
+        Some(_) => (&keys.spend, keys.spend_hash),
+    };
+    let core = core_witness(history, sender, input, &output_coins, vk_hash);
+    let statement = StepStatement::of_spend(core.public_values().expect("core_witness sets every public value"), vk_hash);
 
-    let (vk, proof, prove_secs, peak_mem_kb, constraints) = match parent {
+    let (proof, prove_secs, peak_mem_kb, constraints) = match parent {
         None => {
             let circuit = GenesisSpendCircuit { core };
-            let (vk, proof, secs, mem) = run_step_subprocess::<_, MNT4_753>("genesis", &circuit);
-            (vk, proof, secs, mem, count_constraints(&circuit))
+            let (proof, secs, mem) = prove_subprocess::<_, MNT4_753>("genesis", &circuit);
+            (proof, secs, mem, count_constraints(&circuit))
         }
         Some(parent) => {
             let created_by = &parent.spend.proven.statement.public_values;
             let witness = history.parent_witness(parent.slot, created_by, &parent.spend.tx.vpk, history.len());
             let circuit = SpendStepCircuit {
                 core,
-                fold: None,
-                wrap_vk: parent.wrapped.vk.clone(),
-                genesis_vk_hash: parent.genesis_vk_hash,
+                wrap_vk: keys.wrap.clone(),
+                genesis_vk_hash: keys.genesis_hash,
+                fold_vk_hash: keys.fold_hash,
                 input_parent_proofs: [Some(parent.wrapped.proof.clone())],
                 input_parent_statements: [Some(parent.latest.statement.clone())],
                 input_parents: [Some(witness)],
             };
-            let (vk, proof, secs, mem) = run_step_subprocess::<_, MNT4_753>("spend_non_genesis", &circuit);
-            (vk, proof, secs, mem, count_constraints(&circuit))
+            let (proof, secs, mem) = prove_subprocess::<_, MNT4_753>("spend", &circuit);
+            (proof, secs, mem, count_constraints(&circuit))
         }
     };
-    let statement = StepStatement { public_values, window_head: Fr::from(0u64), vk_hash: inner_vk_hash(&vk) };
     let t = Instant::now();
-    assert!(cloakkchain_circuit_spend::verify(&vk, &statement.public_inputs(), &proof).unwrap());
+    assert!(cloakkchain_circuit_spend::verify(vk, &statement.public_inputs(), &proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
     println!("  Proved in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
 
@@ -564,55 +733,57 @@ fn prove_spend(
         entry_bytes: bincode::serialize(&entry).map(|v| v.len()).ok(),
         peak_mem_kb,
     });
-    ProvenSpend { entry, tx, proven: Proven { statement, vk, proof } }
+    ProvenSpend { entry, tx, proven: Proven { statement, vk: vk.clone(), proof } }
 }
 
 /// Fold every occurrence in the window of `parent`'s entry into the statement of
-/// its spend proof, one fold proof (and wrap) per occurrence, as the next
-/// spender must before spending. Returns the last fold and its wrap, or the
-/// spend's own when the window is empty.
+/// its spend proof, `FOLD_BATCH` at a time — one fold proof and one wrap per
+/// batch — as the next spender must before spending. Returns the last fold and
+/// its wrap, or the spend's own when the window is empty.
 fn fold_window(
+    keys: &Keys,
     history: &History,
     parent: &ProvenSpend,
     slot: usize,
     wrapped: WrappedSpend,
-    genesis_vk_hash: Fr,
     stats: &mut Vec<ProveStats>,
 ) -> (Proven, WrappedSpend) {
     let created_by = &parent.proven.statement.public_values;
     let window = history.parent_witness(slot, created_by, &parent.tx.vpk, history.len()).window;
     let mut latest = parent.proven.clone();
     let mut wrapped = wrapped;
-    for (k, occurrence) in window.occurrences.iter().enumerate() {
-        println!("  Folding occurrence {} of {} into the spend's statement.", k + 1, window.occurrences.len());
-        let window_head = occurrence.link(latest.statement.window_head);
-        let circuit = SpendStepCircuit {
-            core: SpendCoreWitness::for_fold(&latest.statement, window_head, Fr::from(0u64)),
-            fold: Some(FoldWitness { vpk: parent.tx.vpk, occurrence: occurrence.clone() }),
-            wrap_vk: wrapped.vk.clone(),
-            genesis_vk_hash,
-            input_parent_proofs: [Some(wrapped.proof.clone())],
-            input_parent_statements: [Some(latest.statement.clone())],
-            input_parents: [None],
+    let mut folded = 0;
+    for batch in window.occurrences.chunks(FOLD_BATCH) {
+        let range = format!("{}-{}", folded + 1, folded + batch.len());
+        println!("  Folding occurrences {range} of {} into the spend's statement.", window.occurrences.len());
+        let circuit = FoldCircuit {
+            wrap_vk: keys.wrap.clone(),
+            previous: Some(latest.statement.clone()),
+            previous_proof: Some(wrapped.proof.clone()),
+            vpk: Some(parent.tx.vpk),
+            occurrences: batch.to_vec(),
+            vk_hash: Some(keys.fold_hash),
         };
-        let (vk, proof, prove_secs, peak_mem_kb) = run_step_subprocess::<_, MNT4_753>("spend_non_genesis", &circuit);
-        let statement = StepStatement { window_head, vk_hash: inner_vk_hash(&vk), ..latest.statement.clone() };
+        let statement = circuit.statement().expect("every field is set");
+        let constraints = count_constraints(&circuit);
+        let (proof, prove_secs, peak_mem_kb) = prove_subprocess::<_, MNT4_753>("fold", &circuit);
         let t = Instant::now();
-        assert!(cloakkchain_circuit_spend::verify(&vk, &statement.public_inputs(), &proof).unwrap());
+        assert!(cloakkchain_circuit_spend::verify(&keys.fold, &statement.public_inputs(), &proof).unwrap());
         let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
         println!("  Folded in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
         stats.push(ProveStats {
-            name: format!("Fold copy {}", k + 1),
+            name: format!("Fold copies {range}"),
             board_size: history.len(),
-            constraints: count_constraints(&circuit),
+            constraints,
             prove_secs,
             verify_ms,
             proof_bytes: ark_serialize_len(&proof),
             entry_bytes: None,
             peak_mem_kb,
         });
-        latest = Proven { statement, vk, proof };
-        wrapped = wrap_spend(&format!("Wrap fold {}", k + 1), &latest, history, stats);
+        latest = Proven { statement, vk: keys.fold.clone(), proof };
+        wrapped = wrap_spend(&format!("Wrap fold {range}"), keys, &latest, history, stats);
+        folded += batch.len();
     }
     assert_eq!(latest.statement.window_head, if window.occurrences.is_empty() { Fr::from(0u64) } else { window.leaf.occ });
     (latest, wrapped)
@@ -620,17 +791,17 @@ fn fold_window(
 
 /// Wrap a proof so the next step, back on MNT4-753, can recursively verify it
 /// directly — no receipt layer.
-fn wrap_spend(name: &str, proven: &Proven, history: &History, stats: &mut Vec<ProveStats>) -> WrappedSpend {
+fn wrap_spend(name: &str, keys: &Keys, proven: &Proven, history: &History, stats: &mut Vec<ProveStats>) -> WrappedSpend {
     let public_inputs = proven.statement.public_inputs();
     let circuit = WrapCircuit::<SPEND_PUBLIC_INPUT_COUNT> {
         inner_vk: proven.vk.clone(),
         inner_proof: Some(proven.proof.clone()),
         inner_public_inputs: Some(public_inputs),
     };
-    let (vk, proof, prove_secs, peak_mem_kb) = run_step_subprocess::<_, MNT6_753>("wrap", &circuit);
+    let (proof, prove_secs, peak_mem_kb) = prove_subprocess::<_, MNT6_753>("wrap", &circuit);
     let chunks = cloakkchain_circuit_wrap::public_input_chunks(&public_inputs);
     let t = Instant::now();
-    assert!(cloakkchain_circuit_wrap::verify(&vk, &chunks, &proof).unwrap());
+    assert!(cloakkchain_circuit_wrap::verify(&keys.wrap, &chunks, &proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
     println!("  Wrapped in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
     stats.push(ProveStats {
@@ -643,13 +814,14 @@ fn wrap_spend(name: &str, proven: &Proven, history: &History, stats: &mut Vec<Pr
         entry_bytes: None,
         peak_mem_kb,
     });
-    WrappedSpend { vk, proof }
+    WrappedSpend { proof }
 }
 
 /// `recipient` finds its coin in the carrier at `slot` and runs the off-circuit
-/// acceptance check against its own replay, verifying the real proof under
-/// `vk` with `vk_hash` naming it — which, by induction, pins every step back to
-/// genesis — and with a zero window head, so that only a spend proof passes.
+/// acceptance check against its own replay, verifying the real proof under the
+/// deployment's key, with `vk_hash` naming it — which, by induction, pins every
+/// step back to genesis — and with a zero window head and origin, so that only a
+/// spend proof passes.
 fn receive(recipient: &Party, coin: &Coin, spend: &ProvenSpend, slot: usize, history: &History) {
     let vk = &spend.proven.vk;
     println!("\n--- {} scans slot {slot} ---", recipient.name);
@@ -657,7 +829,7 @@ fn receive(recipient: &Party, coin: &Coin, spend: &ProvenSpend, slot: usize, his
     assert!(tx.receives_coin(&coin.commitment()), "the carrier must transfer the recipient's coin");
     check_receipt(history, slot, &spend.entry, &tx, |public_values, proof_bytes| {
         let proof = Proof::<MNT4_753>::deserialize_compressed(proof_bytes).expect("deserialize proof");
-        let inputs = spend_public_inputs(public_values, Fr::from(0u64), inner_vk_hash(vk));
+        let inputs = spend_public_inputs(public_values, Fr::from(0u64), Fr::from(0u64), inner_vk_hash(vk));
         cloakkchain_circuit_spend::verify(vk, &inputs, &proof).unwrap()
     })
     .expect("the recipient must accept its carrier");
@@ -666,18 +838,22 @@ fn receive(recipient: &Party, coin: &Coin, spend: &ProvenSpend, slot: usize, his
 
 /// What the reviewers' attack posts: someone else's serial number on an entry
 /// of the attacker's own. Needs no secrets, and every wallet inserts it blindly.
-fn copy_of_serial_number(nullifier: Fr, seed: u8) -> BoardEntry {
+fn copy_of_serial_number(nullifier: Fr, seed: u32) -> BoardEntry {
+    let byte = seed as u8;
     BoardEntry {
-        ciphertext: vec![seed; 64],
-        ek_pk: [seed; 32],
-        key_encs: vec![[seed; 32]],
+        ciphertext: vec![byte; 64],
+        ek_pk: [byte; 32],
+        key_encs: vec![[byte; 32]],
         nullifier,
         output_commitments: vec![Fr::from(999u64 + seed as u64)],
-        signature: CoinSignature { c: Fr::from(seed as u64), s: OwnerScalar::from(seed as u64) },
+        signature: CoinSignature { c: Fr::from(seed as u64 + 1), s: OwnerScalar::from(seed as u64 + 1) },
     }
 }
 
-fn run_prove(copies: u8) {
+fn run_prove(copies: u32) {
+    let mut setup_stats: Vec<SetupStats> = Vec::new();
+    let keys = Keys::setup(&mut setup_stats);
+
     let mut stats: Vec<ProveStats> = Vec::new();
     let mut history = History::new();
 
@@ -689,12 +865,13 @@ fn run_prove(copies: u8) {
     // =========================================================================
     // Slot 0: genesis mints 100 units to Alice
     // =========================================================================
-    println!("--- Slot 0: Genesis mints 100 units to Alice ---");
+    println!("\n--- Slot 0: Genesis mints 100 units to Alice ---");
     println!("  Proving: pk_p is the fixed genesis key, the mint's serial number and per-coin key are correctly derived, and the serial number is absent at the anchor.");
     let genesis_coin = coin(0xA1, 100, genesis.pk_p);
     let alice_coin = coin(0xA2, 100, alice.pk_p);
     let mint = prove_spend(
         "Genesis mint",
+        &keys,
         &history,
         &genesis,
         &genesis_coin,
@@ -705,8 +882,7 @@ fn run_prove(copies: u8) {
     let mint_slot = history.append(&mint.entry);
 
     println!("  Wrapping the genesis proof: re-verifies it on the other curve (MNT6-753) and re-exposes its public inputs as small chunks, so Alice's spend circuit (back on MNT4-753) can recursively check it.");
-    let wrapped_mint = wrap_spend("Wrap genesis proof", &mint.proven, &history, &mut stats);
-    let genesis_vk_hash = mint.proven.statement.vk_hash;
+    let wrapped_mint = wrap_spend("Wrap genesis proof", &keys, &mint.proven, &history, &mut stats);
     receive(&alice, &alice_coin, &mint, mint_slot, &history);
 
     // =========================================================================
@@ -718,78 +894,72 @@ fn run_prove(copies: u8) {
     let change_coin = coin(0xB2, 60, alice.pk_p);
     let alice_spend = prove_spend(
         "Alice -> Bob + change",
+        &keys,
         &history,
         &alice,
         &alice_coin,
         &[(bob_coin.clone(), bob.enc_pk), (change_coin.clone(), alice.enc_pk)],
-        Some(Parent {
-            spend: &mint,
-            slot: mint_slot,
-            latest: &mint.proven,
-            wrapped: &wrapped_mint,
-            genesis_vk_hash,
-        }),
+        Some(Parent { spend: &mint, slot: mint_slot, latest: &mint.proven, wrapped: &wrapped_mint }),
         &mut stats,
     );
 
     // =========================================================================
     // The reviewers' attack: copies of Alice's serial number get ordered first
     // =========================================================================
-    for seed in 0..copies {
-        let copy_slot = history.append(&copy_of_serial_number(alice_spend.entry.nullifier, 0xC0 + seed));
-        println!("\n--- Slot {copy_slot}: a third party posts a copy of Alice's serial number ---");
-    }
     if copies > 0 {
+        let first = history.len();
+        for seed in 0..copies {
+            history.append(&copy_of_serial_number(alice_spend.entry.nullifier, seed));
+        }
+        println!(
+            "\n--- Slots {first}-{}: a third party posts {copies} copies of Alice's serial number ---",
+            history.len() - 1
+        );
         println!("  All ahead of Alice's carrier. Her proof doesn't need redoing: it's anchored before them.");
     }
 
     let alice_slot = history.append(&alice_spend.entry);
     println!("\n--- Slot {alice_slot}: Alice's carrier lands ---");
     println!("  Wrapping Alice's spend so the next step (back on MNT4-753) can recursively verify it.");
-    let wrapped_alice = wrap_spend("Wrap Alice's spend", &alice_spend.proven, &history, &mut stats);
+    let wrapped_alice = wrap_spend("Wrap Alice's spend", &keys, &alice_spend.proven, &history, &mut stats);
     receive(&bob, &bob_coin, &alice_spend, alice_slot, &history);
 
     // =========================================================================
     // Bob folds the copies, then spends his 40 units to Carol
     // =========================================================================
-    println!("\n--- Bob folds each copy in Alice's window into her spend's statement ---");
-    println!("  Proving, per copy: the previous proof verifies, its statement carries over unchanged, and the copy is harmless (its signature fails under Alice's per-coin key).");
-    let (latest_alice, wrapped_latest) = fold_window(&history, &alice_spend, alice_slot, wrapped_alice, genesis_vk_hash, &mut stats);
+    println!("\n--- Bob folds the copies in Alice's window into her spend's statement, {FOLD_BATCH} per fold ---");
+    println!("  Proving, per fold: the previous proof verifies, its statement carries over unchanged, and every copy in the batch is harmless (its signature fails under Alice's per-coin key).");
+    let (latest_alice, wrapped_latest) = fold_window(&keys, &history, &alice_spend, alice_slot, wrapped_alice, &mut stats);
 
     println!("\n--- Slot {}: Bob spends his 40 units to Carol ---", history.len());
     println!("  Proving: Bob owns the input coin, its serial number is absent at his anchor, value conservation holds (40 in = 40 out), and Alice's spend under his anchor is genuine, its window covered exactly by the folds.");
     let carol_coin = coin(0xC1, 40, carol.pk_p);
     let bob_spend = prove_spend(
         "Bob -> Carol",
+        &keys,
         &history,
         &bob,
         &bob_coin,
         &[(carol_coin.clone(), carol.enc_pk)],
-        Some(Parent {
-            spend: &alice_spend,
-            slot: alice_slot,
-            latest: &latest_alice,
-            wrapped: &wrapped_latest,
-            genesis_vk_hash,
-        }),
+        Some(Parent { spend: &alice_spend, slot: alice_slot, latest: &latest_alice, wrapped: &wrapped_latest }),
         &mut stats,
     );
-    assert_eq!(bob_spend.proven.statement.vk_hash, alice_spend.proven.statement.vk_hash, "one spend key for every generation");
-    assert!(wrapped_latest.vk == wrapped_mint.vk, "one wrap key for every generation");
     let bob_slot = history.append(&bob_spend.entry);
     receive(&carol, &carol_coin, &bob_spend, bob_slot, &history);
     println!("  End of chain.");
 
+    print_setup_table(&setup_stats);
     print_prove_table(&stats);
+    Keys::remove_proving_keys();
 }
 
 // ---- Grid-cell diagnostic (paper results) ------------------------------------
 //
-// Ad hoc scenario for measuring *real* GM17 proving stats (constraints,
-// prove time, verify time, proof size, subprocess-isolated peak memory) at
-// whichever MAX_OUTPUTS shape circuit-spend currently happens to be compiled
-// with. `run_prove`'s demo chain only ever exercises one compiled shape at a
-// time (the committed baseline); this function exists so the same measurement
+// Ad hoc scenario for measuring *real* proving stats (constraints, prove time,
+// verify time, proof size, subprocess-isolated peak memory) at whichever
+// MAX_OUTPUTS shape circuit-spend currently happens to be compiled with.
+// `run_prove`'s demo chain only ever exercises one compiled shape at a time
+// (the committed baseline); this function exists so the same measurement
 // methodology (real proving, subprocess-isolated memory) can be pointed at the
 // other cells of the grid by temporarily editing that crate's MAX_OUTPUTS const
 // (never committed) and rerunning `--grid-cell`. MAX_INPUTS stays 1 until
@@ -804,6 +974,8 @@ fn run_prove(copies: u8) {
 fn run_prove_grid_cell() {
     println!("=== Grid cell: MAX_INPUTS={MAX_INPUTS} MAX_OUTPUTS={MAX_OUTPUTS} ===");
 
+    let mut setup_stats: Vec<SetupStats> = Vec::new();
+    let keys = Keys::setup(&mut setup_stats);
     let mut stats: Vec<ProveStats> = Vec::new();
     let mut history = History::new();
 
@@ -815,6 +987,7 @@ fn run_prove_grid_cell() {
     let alice_coin = coin(0xB0, 100, alice.pk_p);
     let mint = prove_spend(
         "Genesis mint",
+        &keys,
         &history,
         &genesis,
         &coin(0xA0, 100, genesis.pk_p),
@@ -823,7 +996,7 @@ fn run_prove_grid_cell() {
         &mut stats,
     );
     let mint_slot = history.append(&mint.entry);
-    let wrapped_mint = wrap_spend("Wrap genesis mint", &mint.proven, &history, &mut stats);
+    let wrapped_mint = wrap_spend("Wrap genesis mint", &keys, &mint.proven, &history, &mut stats);
 
     println!("\n--- Alice spends {MAX_INPUTS} input(s) into {MAX_OUTPUTS} output(s) ---");
     let bob_val = if MAX_OUTPUTS > 1 { 40 } else { 100 };
@@ -833,20 +1006,17 @@ fn run_prove_grid_cell() {
     }
     prove_spend(
         &format!("Alice's spend ({MAX_INPUTS}-in-{MAX_OUTPUTS}-out)"),
+        &keys,
         &history,
         &alice,
         &alice_coin,
         &outputs,
-        Some(Parent {
-            spend: &mint,
-            slot: mint_slot,
-            latest: &mint.proven,
-            wrapped: &wrapped_mint,
-            genesis_vk_hash: mint.proven.statement.vk_hash,
-        }),
+        Some(Parent { spend: &mint, slot: mint_slot, latest: &mint.proven, wrapped: &wrapped_mint }),
         &mut stats,
     );
 
+    print_setup_table(&setup_stats);
     print_prove_table(&stats);
+    Keys::remove_proving_keys();
     println!("\n=== Grid cell done: MAX_INPUTS={MAX_INPUTS} MAX_OUTPUTS={MAX_OUTPUTS} ===");
 }

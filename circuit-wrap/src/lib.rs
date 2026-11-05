@@ -83,13 +83,7 @@ fn opt<T: Clone>(o: &Option<T>) -> Result<T, SynthesisError> {
 /// For a witness base it made the wrap circuit's matrices 25 times denser than
 /// its constraint count suggests, and prover time and memory follow nonzeros.
 /// Here each doubled point is re-allocated, at one constraint per coordinate.
-///
-/// Otherwise it's the library algorithm step for step, so its completeness
-/// argument carries over: incomplete affine additions on the low
-/// `MODULUS_BIT_SIZE − 2` bits, where the accumulator `k·a` has `2 ≤ k < p − 1`
-/// and so never equals `±` the point being added; complete projective additions
-/// after that; and the base at infinity handled by substituting the generator
-/// and selecting zero at the end. Takes at most `MODULUS_BIT_SIZE` bits.
+/// Takes at most `MODULUS_BIT_SIZE` bits.
 pub fn scalar_mul_le_compact<P: SWCurveConfig>(
     base: &ProjectiveVar<P, FpVar<P::BaseField>>,
     bits: &[Boolean<P::BaseField>],
@@ -97,51 +91,86 @@ pub fn scalar_mul_le_compact<P: SWCurveConfig>(
 where
     P::BaseField: PrimeField,
 {
-    type Point<P> = ProjectiveVar<P, FpVar<<P as ark_ec::CurveConfig>::BaseField>>;
-    let scalar_bits = <P::ScalarField as PrimeField>::MODULUS_BIT_SIZE as usize;
-    assert!(bits.len() <= scalar_bits, "one chunk of scalar bits at most");
-    if bits.is_empty() {
-        return Ok(Point::<P>::zero());
-    }
+    PowersOfTwo::new(base, bits.len())?.scalar_mul_le(bits)
+}
 
-    let cs = base.cs();
-    let compact = |p: NonZeroAffineVar<P, FpVar<P::BaseField>>| -> Result<_, SynthesisError> {
-        if p.x.is_constant() && p.y.is_constant() {
-            return Ok(p);
+/// `2^i · base` for `i < n`, computed once so that several scalar
+/// multiplications of one base share the doublings: a fold checks every
+/// occurrence's signature under the same key.
+///
+/// [`PowersOfTwo::scalar_mul_le`] is `ark-r1cs-std`'s algorithm step for step,
+/// only reading the doublings from this table, so its completeness argument
+/// carries over: incomplete affine additions on the low `MODULUS_BIT_SIZE − 2`
+/// bits, where the accumulator `k·a` has `2 ≤ k < p − 1` and so never equals
+/// `±` the point being added; complete projective additions after that; and the
+/// base at infinity handled by substituting the generator and selecting zero at
+/// the end.
+pub struct PowersOfTwo<P: SWCurveConfig>
+where
+    P::BaseField: PrimeField,
+{
+    infinity: Boolean<P::BaseField>,
+    powers: Vec<NonZeroAffineVar<P, FpVar<P::BaseField>>>,
+}
+
+impl<P: SWCurveConfig> PowersOfTwo<P>
+where
+    P::BaseField: PrimeField,
+{
+    pub fn new(base: &ProjectiveVar<P, FpVar<P::BaseField>>, n: usize) -> Result<Self, SynthesisError> {
+        let cs = base.cs();
+        let compact = |p: NonZeroAffineVar<P, FpVar<P::BaseField>>| -> Result<_, SynthesisError> {
+            if p.x.is_constant() && p.y.is_constant() {
+                return Ok(p);
+            }
+            let x = FpVar::new_witness(cs.clone(), || p.x.value())?;
+            let y = FpVar::new_witness(cs.clone(), || p.y.value())?;
+            x.enforce_equal(&p.x)?;
+            y.enforce_equal(&p.y)?;
+            Ok(NonZeroAffineVar::new(x, y))
+        };
+
+        let affine = base.to_affine()?;
+        let infinity = affine.infinity;
+        let x = infinity.select(&FpVar::constant(P::GENERATOR.x), &affine.x)?;
+        let y = infinity.select(&FpVar::constant(P::GENERATOR.y), &affine.y)?;
+        let mut powers = Vec::with_capacity(n);
+        if n > 0 {
+            powers.push(NonZeroAffineVar::new(x, y));
         }
-        let x = FpVar::new_witness(cs.clone(), || p.x.value())?;
-        let y = FpVar::new_witness(cs.clone(), || p.y.value())?;
-        x.enforce_equal(&p.x)?;
-        y.enforce_equal(&p.y)?;
-        Ok(NonZeroAffineVar::new(x, y))
-    };
-
-    let affine = base.to_affine()?;
-    let infinity = affine.infinity;
-    let x = infinity.select(&FpVar::constant(P::GENERATOR.x), &affine.x)?;
-    let y = infinity.select(&FpVar::constant(P::GENERATOR.y), &affine.y)?;
-    let mut power = NonZeroAffineVar::new(x, y);
-
-    // Start the accumulator at `base`, as if the low bit were set, and correct
-    // for it after the incomplete part.
-    let mut accumulator = power.clone();
-    let initial = accumulator.into_projective();
-    power = compact(power.double()?)?;
-
-    let split = (scalar_bits - 2).min(bits.len());
-    for bit in &bits[1..split] {
-        let sum = accumulator.add_unchecked(&power)?;
-        accumulator = bit.select(&sum, &accumulator)?;
-        power = compact(power.double()?)?;
+        while powers.len() < n {
+            let next = compact(powers.last().expect("nonempty").double()?)?;
+            powers.push(next);
+        }
+        Ok(Self { infinity, powers })
     }
-    let mut result = accumulator.into_projective() - bits[0].select(&Point::<P>::zero(), &initial)?;
 
-    for bit in &bits[split..] {
-        let sum = &result + &power.into_projective();
-        result = bit.select(&sum, &result)?;
-        power = compact(power.double()?)?;
+    /// `bits · base`, for at most as many bits as the table has powers.
+    pub fn scalar_mul_le(&self, bits: &[Boolean<P::BaseField>]) -> Result<ProjectiveVar<P, FpVar<P::BaseField>>, SynthesisError> {
+        type Point<P> = ProjectiveVar<P, FpVar<<P as ark_ec::CurveConfig>::BaseField>>;
+        let scalar_bits = <P::ScalarField as PrimeField>::MODULUS_BIT_SIZE as usize;
+        assert!(bits.len() <= scalar_bits, "one chunk of scalar bits at most");
+        assert!(bits.len() <= self.powers.len(), "not enough precomputed powers");
+        if bits.is_empty() {
+            return Ok(Point::<P>::zero());
+        }
+
+        // Start the accumulator at `base`, as if the low bit were set, and
+        // correct for it after the incomplete part.
+        let mut accumulator = self.powers[0].clone();
+        let initial = accumulator.into_projective();
+        let split = (scalar_bits - 2).min(bits.len());
+        for (bit, power) in bits[1..split].iter().zip(&self.powers[1..split]) {
+            let sum = accumulator.add_unchecked(power)?;
+            accumulator = bit.select(&sum, &accumulator)?;
+        }
+        let mut result = accumulator.into_projective() - bits[0].select(&Point::<P>::zero(), &initial)?;
+        for (bit, power) in bits[split..].iter().zip(&self.powers[split..]) {
+            let sum = &result + &power.into_projective();
+            result = bit.select(&sum, &result)?;
+        }
+        self.infinity.select(&Point::<P>::zero(), &result)
     }
-    infinity.select(&Point::<P>::zero(), &result)
 }
 
 /// Verification of an MNT4-753 proof, as the proof system's own gadget does it,
