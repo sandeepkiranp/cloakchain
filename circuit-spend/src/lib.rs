@@ -23,6 +23,15 @@
 //! accumulator stays odd and below `2^i`, so it can never equal `±2^i` mod the
 //! group order; everything else goes through complete formulas.
 //!
+//! **One verifying key for every generation.** `SpendStepCircuit` embeds the
+//! wrap circuit's VK as a constant, and that circuit takes the VK it verifies as
+//! a witness, pinned by the inner proof's last public input, `vk_hash` (see
+//! `circuit-wrap`). So the two keys don't depend on each other circularly, and a
+//! single setup of each serves chains of any depth. A spend checks that its
+//! parent's `vk_hash` is the genesis circuit's (a constant: genesis depends on
+//! nothing) or its own; whoever verifies the final proof checks its own
+//! `vk_hash` against the deployment's, which pins every step by induction.
+//!
 //! Both support up to [`MAX_INPUTS`] input coins and [`MAX_OUTPUTS`] output
 //! coins (slot 0 of each is mandatory; the rest are optional, gated by an
 //! explicit `is_active` witness per slot — see the module's padding notes
@@ -56,7 +65,7 @@ use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisE
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_snark::SNARK;
 use ark_std::rand::{CryptoRng, RngCore};
-use cloakkchain_circuit_wrap::{chunks_per_value, combine_chunks_var, public_input_chunks, Fr6};
+use cloakkchain_circuit_wrap::{chunks_per_value, combine_chunks_var, public_input_chunks, Fr6, CHUNK_BITS};
 use cloakkchain_lib::{
     derive_coin_vpk, derive_nullifier, genesis_pk, hash_vpk, owner_pk_to_field_pair, poseidon_params, Anchor,
     Coin, CoinSignature, Fr, IndexedLeaf, LeafOpening, NonMembershipWitness, Occurrence, OwnerPk, OwnerScalar,
@@ -88,9 +97,10 @@ const _: () = assert!(MAX_INPUTS == 1, "multi-input spends need BoardEntry to ca
 /// Total public-input count for [`GenesisSpendCircuit`]/[`SpendStepCircuit`]
 /// (both share the same layout):
 /// `output_commitments[0..MAX_OUTPUTS], anchor.size, anchor.board_root,
-/// anchor.nullifier_root, nullifiers[0..MAX_INPUTS], vpk_hashes[0..MAX_INPUTS]`.
+/// anchor.nullifier_root, nullifiers[0..MAX_INPUTS], vpk_hashes[0..MAX_INPUTS],
+/// vk_hash`. `vk_hash` must be last: that's where the wrap circuit looks for it.
 /// `pk_p` and `vpk` are private witnesses, not part of this vector.
-pub const SPEND_PUBLIC_INPUT_COUNT: usize = MAX_OUTPUTS + 3 + 2 * MAX_INPUTS;
+pub const SPEND_PUBLIC_INPUT_COUNT: usize = MAX_OUTPUTS + 4 + 2 * MAX_INPUTS;
 
 /// Index, within a recursively-verified parent spend proof's public-input
 /// chunk groups, of each value — mirrors [`spend_public_inputs`]'s order.
@@ -100,6 +110,7 @@ const PARENT_ANCHOR_BOARD_ROOT: usize = MAX_OUTPUTS + 1;
 const PARENT_ANCHOR_NULLIFIER_ROOT: usize = MAX_OUTPUTS + 2;
 const PARENT_NULLIFIER: usize = MAX_OUTPUTS + 3;
 const PARENT_VPK_HASH: usize = MAX_OUTPUTS + 3 + MAX_INPUTS;
+const PARENT_VK_HASH: usize = SPEND_PUBLIC_INPUT_COUNT - 1;
 
 /// Pads a variable-length list of real output commitments out to `MAX_OUTPUTS`
 /// with zeros, for the proof's fixed-size public inputs. A `BoardEntry` posts
@@ -115,14 +126,16 @@ pub fn pad_outputs(real: &[Fr]) -> [Fr; MAX_OUTPUTS] {
 
 /// The GM17 public-input vector for a spend's public values, in the exact order
 /// [`synthesize_core`] allocates them. Single-input, per the `MAX_INPUTS`
-/// assertion above.
-pub fn spend_public_inputs(pv: &SpendPublicValues) -> [Fr; SPEND_PUBLIC_INPUT_COUNT] {
+/// assertion above. `vk_hash` is `circuit_wrap::inner_vk_hash` of the key the
+/// proof is for.
+pub fn spend_public_inputs(pv: &SpendPublicValues, vk_hash: Fr) -> [Fr; SPEND_PUBLIC_INPUT_COUNT] {
     let mut out = pad_outputs(&pv.output_commitments).to_vec();
     out.push(Fr::from(pv.anchor.size));
     out.push(pv.anchor.board_root);
     out.push(pv.anchor.nullifier_root);
     out.extend([pv.nullifier; MAX_INPUTS]);
     out.extend([pv.vpk_hash; MAX_INPUTS]);
+    out.push(vk_hash);
     out.try_into().expect("the layout above has SPEND_PUBLIC_INPUT_COUNT values")
 }
 
@@ -570,6 +583,7 @@ struct ParentPublicVars {
     anchor_nullifier_root: Fp,
     nullifier: Fp,
     vpk_hash: Fp,
+    vk_hash: Fp,
 }
 
 /// Mirrors `cloakkchain_lib::check_parent`: everything about the entry that
@@ -647,6 +661,9 @@ pub struct SpendCoreWitness {
     pub anchor: Option<Anchor>,
     pub nullifiers: Option<[Fr; MAX_INPUTS]>,
     pub vpk_hashes: Option<[Fr; MAX_INPUTS]>,
+    /// The hash of the VK this proof is for. Not constrained by the circuit
+    /// itself — see the module doc comment for who checks it.
+    pub vk_hash: Option<Fr>,
 
     // Private witnesses.
     pub pk_p: Option<OwnerPk>,
@@ -662,13 +679,15 @@ pub struct SpendCoreWitness {
 }
 
 impl SpendCoreWitness {
-    /// A spend of `input_coin` by `sk`, deriving every public value from it.
+    /// A spend of `input_coin` by `sk`, deriving every public value from it,
+    /// for the circuit whose VK hashes to `vk_hash`.
     pub fn new(
         sk: OwnerScalar,
         input_coin: Coin,
         output_coins: &[Coin],
         anchor: Anchor,
         nonmembership: NonMembershipWitness,
+        vk_hash: Fr,
     ) -> Self {
         let commitment = input_coin.commitment();
         let real_outputs: Vec<Fr> = output_coins.iter().map(Coin::commitment).collect();
@@ -677,6 +696,7 @@ impl SpendCoreWitness {
             anchor: Some(anchor),
             nullifiers: Some([derive_nullifier(commitment, &sk); MAX_INPUTS]),
             vpk_hashes: Some([hash_vpk(&derive_coin_vpk(&sk, commitment)); MAX_INPUTS]),
+            vk_hash: Some(vk_hash),
             pk_p: Some(input_coin.owner_pk),
             sk_p: Some(sk),
             input_coins: std::array::from_fn(|i| (i == 0).then(|| input_coin.clone())),
@@ -699,6 +719,7 @@ impl SpendCoreWitness {
 /// What [`SpendStepCircuit`] needs back from [`synthesize_core`], and
 /// [`GenesisSpendCircuit`] for its fixed-key check.
 struct SpendCoreVars {
+    vk_hash: Fp,
     pk_p_x: Fp,
     pk_p_y: Fp,
     anchor_board_root: Fp,
@@ -724,6 +745,7 @@ fn synthesize_core(cs: ConstraintSystemRef<Fr>, w: &SpendCoreWitness) -> Result<
     let vpk_hashes: Vec<Fp> = (0..MAX_INPUTS)
         .map(|i| Fp::new_input(cs.clone(), || opt(&w.vpk_hashes.map(|a| a[i]))))
         .collect::<Result<_, _>>()?;
+    let vk_hash = Fp::new_input(cs.clone(), || opt(&w.vk_hash))?;
 
     // --- pk_p is a private witness, not a public input: nothing downstream
     // ever needs to read it back out of a spend proof, and its own uses here
@@ -808,7 +830,7 @@ fn synthesize_core(cs: ConstraintSystemRef<Fr>, w: &SpendCoreWitness) -> Result<
     // --- value conservation: Σ active inputs == Σ active outputs ---
     total_in.enforce_equal(&total_out)?;
 
-    Ok(SpendCoreVars { pk_p_x, pk_p_y, anchor_board_root, input_commitments, input_active })
+    Ok(SpendCoreVars { vk_hash, pk_p_x, pk_p_y, anchor_board_root, input_commitments, input_active })
 }
 
 // ---- the circuits --------------------------------------------------------------
@@ -852,6 +874,9 @@ pub struct SpendStepCircuit {
 
     /// Fixed per deployment — not `Option`, a verifying key isn't secret.
     pub wrap_vk: VerifyingKey<MNT6_753>,
+    /// `circuit_wrap::inner_vk_hash` of `GenesisSpendCircuit`'s VK, fixed per
+    /// deployment like `wrap_vk`.
+    pub genesis_vk_hash: Fr,
     /// One wrapped parent spend proof per active input slot (a
     /// `Wrap<SPEND_PUBLIC_INPUT_COUNT>` proof). `None` for a padding slot (still
     /// needs *a* structurally-valid dummy proof — see `circuit-wrap::setup`'s
@@ -861,6 +886,9 @@ pub struct SpendStepCircuit {
     /// spend's anchor. `ParentWitness::public_values` is what's fed to the
     /// recursive verification.
     pub input_parents: [Option<ParentWitness>; MAX_INPUTS],
+    /// The `vk_hash` each parent's proof carries: `genesis_vk_hash` or this
+    /// spend's own.
+    pub input_parent_vk_hashes: [Option<Fr>; MAX_INPUTS],
 }
 
 impl SpendStepCircuit {
@@ -891,7 +919,6 @@ impl ConstraintSynthesizer<Fr> for SpendStepCircuit {
         // --- wrap VK (shared by every active input slot's parent proof) ---
         let wrap_vk_var = VerifyingKeyVar::<MNT6_753, MNT6PairingVar>::new_constant(cs.clone(), &self.wrap_vk)?;
         let pvk = wrap_vk_var.prepare()?;
-        let wrap_bit_len = Fr6::MODULUS_BIT_SIZE as usize;
         let parent_public_len = SPEND_PUBLIC_INPUT_COUNT * chunks_per_value();
         let cpv = chunks_per_value();
 
@@ -904,13 +931,20 @@ impl ConstraintSynthesizer<Fr> for SpendStepCircuit {
             // slot has no real parent — fall back to all-zero chunks (never
             // checked, since every check below is gated by `is_active`; see the
             // module doc comment).
+            //
+            // Each chunk goes in as only the `CHUNK_BITS` the wrap circuit
+            // already bounds it to. Wider would cost more and allow an alias:
+            // the verifier reads the bits mod the wrap field's modulus `r`, so
+            // `x + r` would pass for chunk `x`, while `combine_chunks_var`
+            // would read its low bits as something else.
             let parent_chunks: Vec<Fr6> = parent
-                .map(|p| public_input_chunks(&spend_public_inputs(&p.public_values)))
+                .zip(self.input_parent_vk_hashes[i])
+                .map(|(p, vk_hash)| public_input_chunks(&spend_public_inputs(&p.public_values, vk_hash)))
                 .unwrap_or_else(|| vec![Fr6::from(0u64); parent_public_len]);
             let mut parent_per_chunk_bits: Vec<Vec<Boolean<Fr>>> = Vec::with_capacity(parent_public_len);
             for k in 0..parent_public_len {
                 let value_bits: Vec<bool> = parent_chunks[k].into_bigint().to_bits_le();
-                let bits: Vec<Boolean<Fr>> = (0..wrap_bit_len)
+                let bits: Vec<Boolean<Fr>> = (0..CHUNK_BITS)
                     .map(|j| Boolean::new_witness(cs.clone(), || Ok(value_bits[j])))
                     .collect::<Result<_, _>>()?;
                 parent_per_chunk_bits.push(bits);
@@ -937,7 +971,13 @@ impl ConstraintSynthesizer<Fr> for SpendStepCircuit {
                 anchor_nullifier_root: pgroup(PARENT_ANCHOR_NULLIFIER_ROOT)?,
                 nullifier: pgroup(PARENT_NULLIFIER)?,
                 vpk_hash: pgroup(PARENT_VPK_HASH)?,
+                vk_hash: pgroup(PARENT_VK_HASH)?,
             };
+
+            // The wrap circuit guarantees the parent's proof verifies under
+            // the VK its `vk_hash` names; this pins which VKs those may be.
+            let parent_vk_ok = &pv.vk_hash.is_eq(&Fp::constant(self.genesis_vk_hash))? | &pv.vk_hash.is_eq(&core.vk_hash)?;
+            gate(parent_vk_ok, is_active).enforce_equal(&Boolean::TRUE)?;
 
             let parent_ok = parent_checks(cs.clone(), parent, &pv, &core.input_commitments[i], &core.anchor_board_root)?;
             gate(parent_ok, is_active).enforce_equal(&Boolean::TRUE)?;
@@ -947,18 +987,22 @@ impl ConstraintSynthesizer<Fr> for SpendStepCircuit {
     }
 }
 
+/// One setup serves every generation — see the module doc comment.
 pub fn setup_non_genesis<R: RngCore + CryptoRng>(
     wrap_vk: VerifyingKey<MNT6_753>,
+    genesis_vk_hash: Fr,
     rng: &mut R,
 ) -> Result<(ProvingKey<MNT4_753>, VerifyingKey<MNT4_753>), SynthesisError> {
     let circuit = SpendStepCircuit {
         core: SpendCoreWitness::default(),
         wrap_vk,
+        genesis_vk_hash,
         // See circuit-wrap's `setup` for why every slot needs *some*
         // structurally-valid dummy proof rather than `None` — `ProofVar`'s
         // `AllocVar` impl calls its value closure unconditionally.
         input_parent_proofs: std::array::from_fn(|_| Some(SpendStepCircuit::dummy_wrap_proof())),
         input_parents: std::array::from_fn(|_| None),
+        input_parent_vk_hashes: std::array::from_fn(|_| None),
     };
     GM17::<MNT4_753>::circuit_specific_setup(circuit, rng)
 }
@@ -1056,7 +1100,7 @@ mod tests {
             spend_proof: vec![],
         };
         let entry = encrypt_tx(&tx, cm, &sk, &[[9u8; 32]], [id; 32]);
-        let core = SpendCoreWitness::new(sk, input.clone(), outputs, anchor, nonmembership);
+        let core = SpendCoreWitness::new(sk, input.clone(), outputs, anchor, nonmembership, Fr::from(0u64));
         assert_eq!(core.public_values().as_ref(), Some(&pv), "circuit and oracle must agree on the statement");
         Posted { entry, pv, vpk, core }
     }
@@ -1114,7 +1158,7 @@ mod tests {
     /// circuit must stay satisfiable whatever the answer is.
     fn parent_checks_result(witness: &ParentWitness, commitment: Fr, anchor_board_root: Fr) -> bool {
         let cs = ConstraintSystem::<Fr>::new_ref();
-        let inputs = spend_public_inputs(&witness.public_values);
+        let inputs = spend_public_inputs(&witness.public_values, Fr::from(0u64));
         let vars: Vec<Fp> = inputs.iter().map(|v| Fp::new_witness(cs.clone(), || Ok(*v)).unwrap()).collect();
         let pv = ParentPublicVars {
             output_commitments: vars[PARENT_OUTPUT_COMMITMENTS_START..MAX_OUTPUTS].to_vec(),
@@ -1123,6 +1167,7 @@ mod tests {
             anchor_nullifier_root: vars[PARENT_ANCHOR_NULLIFIER_ROOT].clone(),
             nullifier: vars[PARENT_NULLIFIER].clone(),
             vpk_hash: vars[PARENT_VPK_HASH].clone(),
+            vk_hash: vars[PARENT_VK_HASH].clone(),
         };
         let commitment = Fp::new_witness(cs.clone(), || Ok(commitment)).unwrap();
         let root = Fp::new_witness(cs.clone(), || Ok(anchor_board_root)).unwrap();
@@ -1488,7 +1533,7 @@ mod tests {
         let nonmembership = history
             .nullifier_tree_at(0)
             .prove_non_membership(derive_nullifier(input.commitment(), &alice_sk));
-        let core = SpendCoreWitness::new(alice_sk, input, &[output], anchor, nonmembership);
+        let core = SpendCoreWitness::new(alice_sk, input, &[output], anchor, nonmembership, Fr::from(0u64));
         assert!(!satisfied(GenesisSpendCircuit { core }));
     }
 
@@ -1568,7 +1613,9 @@ mod tests {
     fn constraint_shape_does_not_depend_on_the_witness() {
         fn count(witness: Option<&ParentWitness>, setup: bool) -> usize {
             let cs = if setup { setup_mode_cs() } else { ConstraintSystem::<Fr>::new_ref() };
-            let inputs = witness.map(|w| spend_public_inputs(&w.public_values)).unwrap_or([Fr::from(0u64); SPEND_PUBLIC_INPUT_COUNT]);
+            let inputs = witness
+                .map(|w| spend_public_inputs(&w.public_values, Fr::from(0u64)))
+                .unwrap_or([Fr::from(0u64); SPEND_PUBLIC_INPUT_COUNT]);
             let vars: Vec<Fp> = inputs.iter().map(|v| Fp::new_witness(cs.clone(), || Ok(*v)).unwrap()).collect();
             let pv = ParentPublicVars {
                 output_commitments: vars[..MAX_OUTPUTS].to_vec(),
@@ -1577,6 +1624,7 @@ mod tests {
                 anchor_nullifier_root: vars[PARENT_ANCHOR_NULLIFIER_ROOT].clone(),
                 nullifier: vars[PARENT_NULLIFIER].clone(),
                 vpk_hash: vars[PARENT_VPK_HASH].clone(),
+                vk_hash: vars[PARENT_VK_HASH].clone(),
             };
             let _ = parent_checks(cs.clone(), witness, &pv, &vars[0], &vars[1]).unwrap();
             cs.num_constraints()
@@ -1651,6 +1699,7 @@ mod tests {
             anchor_nullifier_root: zero(),
             nullifier: zero(),
             vpk_hash: zero(),
+            vk_hash: zero(),
         };
         let root = zero();
         let before = parent_cs.num_constraints();
@@ -1664,8 +1713,10 @@ mod tests {
         SpendStepCircuit {
             core: SpendCoreWitness::default(),
             wrap_vk: shaped_wrap_vk(),
+            genesis_vk_hash: Fr::from(0u64),
             input_parent_proofs: std::array::from_fn(|_| Some(SpendStepCircuit::dummy_wrap_proof())),
             input_parents: std::array::from_fn(|_| None),
+            input_parent_vk_hashes: std::array::from_fn(|_| None),
         }
         .generate_constraints(step_cs.clone())
         .unwrap();
@@ -1678,22 +1729,71 @@ mod tests {
         println!("public inputs:          {SPEND_PUBLIC_INPUT_COUNT}");
     }
 
+    /// Phase 4 spike: what the recursive verifier costs with the wrap VK as a
+    /// witness (needed for a universal VK) instead of a constant, and with each
+    /// public-input chunk fed in as its full width or only the 200 bits the wrap
+    /// circuit already guarantees. `cargo test --release report_verifier_costs
+    /// -- --nocapture`. Setup-mode synthesis only.
+    #[test]
+    fn report_verifier_costs() {
+        use ark_crypto_primitives::snark::SNARKGadget;
+        use ark_r1cs_std::alloc::AllocationMode;
+        let chunks = SPEND_PUBLIC_INPUT_COUNT * chunks_per_value();
+        for witness_vk in [false, true] {
+            for bits_per_chunk in [Fr6::MODULUS_BIT_SIZE as usize, cloakkchain_circuit_wrap::CHUNK_BITS] {
+                let cs = setup_mode_cs();
+                let vk = if witness_vk {
+                    GM17VerifierGadget::<MNT6_753, MNT6PairingVar>::new_verification_key_unchecked(
+                        cs.clone(),
+                        || Ok(shaped_wrap_vk()),
+                        AllocationMode::Witness,
+                    )
+                    .unwrap()
+                } else {
+                    VerifyingKeyVar::<MNT6_753, MNT6PairingVar>::new_constant(cs.clone(), shaped_wrap_vk()).unwrap()
+                };
+                let after_vk = cs.num_constraints();
+                let pvk = vk.prepare().unwrap();
+                let after_prepare = cs.num_constraints();
+                let bits: Vec<Vec<Boolean<Fr>>> = (0..chunks)
+                    .map(|_| (0..bits_per_chunk).map(|_| Boolean::new_witness(cs.clone(), || Ok(false)).unwrap()).collect())
+                    .collect();
+                let input = BooleanInputVar::<Fr6, Fr>::new(bits);
+                let proof = ProofVar::<MNT6_753, MNT6PairingVar>::new_witness(cs.clone(), || {
+                    Ok(SpendStepCircuit::dummy_wrap_proof())
+                })
+                .unwrap();
+                let before_verify = cs.num_constraints();
+                let _ = GM17VerifierGadget::<MNT6_753, MNT6PairingVar>::verify_with_processed_vk(&pvk, &input, &proof)
+                    .unwrap();
+                println!(
+                    "vk {:<8} {:>3}-bit chunks: alloc {:>7}  prepare {:>7}  verify {:>8}  total {:>8}",
+                    if witness_vk { "witness" } else { "constant" },
+                    bits_per_chunk,
+                    after_vk,
+                    after_prepare - after_vk,
+                    cs.num_constraints() - before_verify,
+                    cs.num_constraints(),
+                );
+            }
+        }
+    }
+
     // ---- real proving (see the module comment) --------------------------------
 
     struct Wrapped {
-        vk: VerifyingKey<MNT6_753>,
         proof: Proof<MNT6_753>,
     }
 
     fn wrap<R: RngCore + CryptoRng>(
+        wrap_pk: &ProvingKey<MNT6_753>,
         inner_vk: VerifyingKey<MNT4_753>,
         inner_proof: Proof<MNT4_753>,
         public_inputs: [Fr; SPEND_PUBLIC_INPUT_COUNT],
         rng: &mut R,
     ) -> Wrapped {
-        let (pk, vk) = cloakkchain_circuit_wrap::setup::<SPEND_PUBLIC_INPUT_COUNT, _>(inner_vk.clone(), rng).unwrap();
         let proof = cloakkchain_circuit_wrap::prove::<SPEND_PUBLIC_INPUT_COUNT, _>(
-            &pk,
+            wrap_pk,
             cloakkchain_circuit_wrap::WrapCircuit::<SPEND_PUBLIC_INPUT_COUNT> {
                 inner_vk,
                 inner_proof: Some(inner_proof),
@@ -1702,7 +1802,7 @@ mod tests {
             rng,
         )
         .unwrap();
-        Wrapped { vk, proof }
+        Wrapped { proof }
     }
 
     #[test]
@@ -1715,7 +1815,7 @@ mod tests {
         let (pk, vk) = setup(&mut rng).unwrap();
 
         let c = genesis_circuit();
-        let public_inputs = spend_public_inputs(&c.core.public_values().unwrap());
+        let public_inputs = spend_public_inputs(&c.core.public_values().unwrap(), Fr::from(0u64));
         let proof = prove(&pk, c, &mut rng).unwrap();
         assert!(verify(&vk, &public_inputs, &proof).unwrap(), "a genuinely valid genesis-mint proof must verify");
 
@@ -1728,61 +1828,88 @@ mod tests {
     /// genesis mints to Alice, a copy of Alice's serial number lands before her
     /// carrier, and Bob still spends onward to Carol, recursively verifying
     /// Alice's proof at an anchor that predates the copy.
+    ///
+    /// One setup of each circuit for the whole chain: Alice's spend and Bob's
+    /// share a proving key, and Bob's verifies a proof made under that same key.
     #[test]
     fn proving_chain_survives_a_copied_serial_number() {
         use ark_std::rand::{rngs::StdRng, SeedableRng};
+        use cloakkchain_circuit_wrap::inner_vk_hash;
         let mut rng = StdRng::seed_from_u64(20260919);
 
-        let mut w = world();
         let (genesis_pk_data, genesis_vk) = setup(&mut rng).unwrap();
-        let genesis_inputs = spend_public_inputs(&w.genesis.pv);
-        let genesis_proof =
-            prove(&genesis_pk_data, GenesisSpendCircuit { core: w.genesis.core.clone() }, &mut rng).unwrap();
+        let (wrap_pk, wrap_vk) = cloakkchain_circuit_wrap::setup::<SPEND_PUBLIC_INPUT_COUNT, _>(&mut rng).unwrap();
+        let genesis_vk_hash = inner_vk_hash(&genesis_vk);
+        let (step_pk, step_vk) = setup_non_genesis(wrap_vk.clone(), genesis_vk_hash, &mut rng).unwrap();
+        let step_vk_hash = inner_vk_hash(&step_vk);
+
+        let mut w = world();
+        let mut genesis_core = w.genesis.core.clone();
+        genesis_core.vk_hash = Some(genesis_vk_hash);
+        let genesis_inputs = spend_public_inputs(&w.genesis.pv, genesis_vk_hash);
+        let genesis_proof = prove(&genesis_pk_data, GenesisSpendCircuit { core: genesis_core }, &mut rng).unwrap();
         assert!(verify(&genesis_vk, &genesis_inputs, &genesis_proof).unwrap());
-        let wrap_genesis = wrap(genesis_vk, genesis_proof, genesis_inputs, &mut rng);
+        let wrap_genesis = wrap(&wrap_pk, genesis_vk, genesis_proof, genesis_inputs, &mut rng);
+        assert!(cloakkchain_circuit_wrap::verify(&wrap_vk, &public_input_chunks(&genesis_inputs), &wrap_genesis.proof).unwrap());
 
         // Alice proves at anchor 1, then a copy of her SN gets ordered first.
         let alice = w.alice_spends(&w.bob_coin, 1);
+        let mut alice_core = alice.core.clone();
+        alice_core.vk_hash = Some(step_vk_hash);
         let alice_circuit = SpendStepCircuit {
-            core: alice.core.clone(),
-            wrap_vk: wrap_genesis.vk.clone(),
+            core: alice_core,
+            wrap_vk: wrap_vk.clone(),
+            genesis_vk_hash,
             input_parent_proofs: [Some(wrap_genesis.proof.clone())],
             input_parents: [Some(w.history.parent_witness(0, &w.genesis.pv, &w.genesis.vpk, 1))],
+            input_parent_vk_hashes: [Some(genesis_vk_hash)],
         };
         let cs = ConstraintSystem::<Fr>::new_ref();
         alice_circuit.clone().generate_constraints(cs.clone()).unwrap();
         assert!(cs.is_satisfied().unwrap(), "Alice's witness should satisfy every constraint");
-        let alice_inputs = spend_public_inputs(&alice.pv);
-        let (alice_pk_data, alice_vk) = setup_non_genesis(wrap_genesis.vk, &mut rng).unwrap();
-        let alice_proof = prove_non_genesis(&alice_pk_data, alice_circuit, &mut rng).unwrap();
-        assert!(verify_non_genesis(&alice_vk, &alice_inputs, &alice_proof).unwrap());
-        let wrap_alice = wrap(alice_vk, alice_proof, alice_inputs, &mut rng);
+
+        // A spend can't treat a parent's VK as acceptable unless it's genesis's
+        // or its own.
+        let mut wrong_genesis = alice_circuit.clone();
+        wrong_genesis.genesis_vk_hash += Fr::from(1u64);
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        wrong_genesis.generate_constraints(cs.clone()).unwrap();
+        assert!(!cs.is_satisfied().unwrap(), "a parent under an unexpected VK must fail");
+
+        let alice_inputs = spend_public_inputs(&alice.pv, step_vk_hash);
+        let alice_proof = prove_non_genesis(&step_pk, alice_circuit, &mut rng).unwrap();
+        assert!(verify_non_genesis(&step_vk, &alice_inputs, &alice_proof).unwrap());
+        let wrap_alice = wrap(&wrap_pk, step_vk.clone(), alice_proof, alice_inputs, &mut rng);
 
         w.history.append(&junk_copy(w.alice_nullifier(), 1));
         let slot = w.history.append(&alice.entry);
 
-        // Bob spends onward to Carol, opening the copy in Alice's window.
+        // Bob spends onward to Carol under the same key, opening the copy in
+        // Alice's window.
         let (_, carol_pk) = owner(3);
         let size = w.history.len();
         let parent = w.history.parent_witness(slot, &alice.pv, &alice.vpk, size);
         assert_eq!(parent.window.occurrences.len(), 1);
         let bob = post(&w.history, w.bob_sk, &w.bob_coin, &[coin(4, 100, carol_pk)], size, Some(&parent), 2);
+        let mut bob_core = bob.core.clone();
+        bob_core.vk_hash = Some(step_vk_hash);
         let bob_circuit = SpendStepCircuit {
-            core: bob.core.clone(),
-            wrap_vk: wrap_alice.vk.clone(),
+            core: bob_core,
+            wrap_vk,
+            genesis_vk_hash,
             input_parent_proofs: [Some(wrap_alice.proof.clone())],
             input_parents: [Some(parent.clone())],
+            input_parent_vk_hashes: [Some(step_vk_hash)],
         };
         let cs = ConstraintSystem::<Fr>::new_ref();
         bob_circuit.clone().generate_constraints(cs.clone()).unwrap();
         assert!(cs.is_satisfied().unwrap(), "Bob's witness should satisfy every constraint");
-        let bob_inputs = spend_public_inputs(&bob.pv);
-        let (bob_pk_data, bob_vk) = setup_non_genesis(wrap_alice.vk.clone(), &mut rng).unwrap();
-        let bob_proof = prove_non_genesis(&bob_pk_data, bob_circuit.clone(), &mut rng).unwrap();
-        assert!(verify_non_genesis(&bob_vk, &bob_inputs, &bob_proof).unwrap());
+        let bob_inputs = spend_public_inputs(&bob.pv, step_vk_hash);
+        let bob_proof = prove_non_genesis(&step_pk, bob_circuit.clone(), &mut rng).unwrap();
+        assert!(verify_non_genesis(&step_vk, &bob_inputs, &bob_proof).unwrap());
         let mut tampered = bob_inputs;
         tampered[0] += Fr::from(1u64);
-        assert!(!verify_non_genesis(&bob_vk, &tampered, &bob_proof).unwrap());
+        assert!(!verify_non_genesis(&step_vk, &tampered, &bob_proof).unwrap());
 
         // The recursion is really binding: the public values Bob's circuit
         // reads back must be the ones Alice's proof was made for.

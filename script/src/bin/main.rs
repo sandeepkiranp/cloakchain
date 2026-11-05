@@ -20,6 +20,11 @@
 //! Every wallet's view is a [`History`] replayed blindly from the board: the
 //! roots a leaf embeds are computed there, and are never posted.
 //!
+//! One setup per circuit serves the whole chain: Alice's and Bob's spends share
+//! a key, and each recipient checks the proof's `vk_hash` against it. Each step's
+//! subprocess re-runs its setup from the same seed, which reproduces the same
+//! keys; that's what lets the peak-memory column stay per step.
+//!
 //! `--prove` still builds the whole chain once, in order, in this process
 //! (exactly like a non-isolated driver would) — but each step's actual
 //! `setup`+`prove` call is farmed out to a fresh subprocess
@@ -51,7 +56,7 @@ use cloakkchain_circuit_spend::{
     spend_public_inputs, GenesisSpendCircuit, SpendCoreWitness, SpendStepCircuit, MAX_INPUTS, MAX_OUTPUTS,
     SPEND_PUBLIC_INPUT_COUNT,
 };
-use cloakkchain_circuit_wrap::WrapCircuit;
+use cloakkchain_circuit_wrap::{inner_vk_hash, WrapCircuit};
 use cloakkchain_lib::{
     check_receipt, derive_coin_vpk, derive_enc_pk, derive_nullifier, derive_owner_pk, encrypt_tx, genesis_pk,
     genesis_sk, scan_entry, Anchor, BoardEntry, Coin, CoinSignature, Fr, History, OwnerPk, OwnerScalar,
@@ -263,25 +268,29 @@ fn run_internal_step(kind: &str, witness_path: &str, output_path: &str) {
     let mut rng = StdRng::seed_from_u64(0x636c6f616b);
     let output_path = std::path::Path::new(output_path);
 
+    // A proof's `vk_hash` names its own VK, which only exists after setup, so
+    // it's filled in here rather than by the parent process.
     match kind {
         "genesis" => {
-            let circuit = GenesisSpendCircuit::deserialize_compressed(&witness_bytes[..]).expect("deserialize witness");
+            let mut circuit = GenesisSpendCircuit::deserialize_compressed(&witness_bytes[..]).expect("deserialize witness");
             let (pk, vk) = cloakkchain_circuit_spend::setup(&mut rng).unwrap();
+            circuit.core.vk_hash = Some(inner_vk_hash(&vk));
             let proof = cloakkchain_circuit_spend::prove(&pk, circuit, &mut rng).unwrap();
             write_vk_proof::<MNT4_753>(&vk, &proof, output_path);
         }
         "spend_non_genesis" => {
-            let circuit = SpendStepCircuit::deserialize_compressed(&witness_bytes[..]).expect("deserialize witness");
-            let wrap_vk = circuit.wrap_vk.clone();
-            let (pk, vk) = cloakkchain_circuit_spend::setup_non_genesis(wrap_vk, &mut rng).unwrap();
+            let mut circuit = SpendStepCircuit::deserialize_compressed(&witness_bytes[..]).expect("deserialize witness");
+            let (pk, vk) =
+                cloakkchain_circuit_spend::setup_non_genesis(circuit.wrap_vk.clone(), circuit.genesis_vk_hash, &mut rng)
+                    .unwrap();
+            circuit.core.vk_hash = Some(inner_vk_hash(&vk));
             let proof = cloakkchain_circuit_spend::prove_non_genesis(&pk, circuit, &mut rng).unwrap();
             write_vk_proof::<MNT4_753>(&vk, &proof, output_path);
         }
         "wrap" => {
             let circuit = WrapCircuit::<SPEND_PUBLIC_INPUT_COUNT>::deserialize_compressed(&witness_bytes[..])
                 .expect("deserialize witness");
-            let inner_vk = circuit.inner_vk.clone();
-            let (pk, vk) = cloakkchain_circuit_wrap::setup::<SPEND_PUBLIC_INPUT_COUNT, _>(inner_vk, &mut rng).unwrap();
+            let (pk, vk) = cloakkchain_circuit_wrap::setup::<SPEND_PUBLIC_INPUT_COUNT, _>(&mut rng).unwrap();
             let proof = cloakkchain_circuit_wrap::prove::<SPEND_PUBLIC_INPUT_COUNT, _>(&pk, circuit, &mut rng).unwrap();
             write_vk_proof::<MNT6_753>(&vk, &proof, output_path);
         }
@@ -442,6 +451,8 @@ struct ProvenSpend {
     tx: Transaction,
     public_values: SpendPublicValues,
     vk: VerifyingKey<MNT4_753>,
+    /// `inner_vk_hash(&vk)`, the proof's last public input.
+    vk_hash: Fr,
     proof: Proof<MNT4_753>,
 }
 
@@ -451,7 +462,8 @@ struct WrappedSpend {
     proof: Proof<MNT6_753>,
 }
 
-/// The spend relation's witness, anchored at `history`'s current state.
+/// The spend relation's witness, anchored at `history`'s current state. Its
+/// `vk_hash` is a placeholder until the proving subprocess has run setup.
 fn core_witness(history: &History, sender: &Party, input: &Coin, outputs: &[Coin]) -> SpendCoreWitness {
     let size = history.len();
     let nullifier = derive_nullifier(input.commitment(), &sender.sk_p);
@@ -461,13 +473,14 @@ fn core_witness(history: &History, sender: &Party, input: &Coin, outputs: &[Coin
         outputs,
         history.anchor_at(size).expect("the current state exists"),
         history.nullifier_tree_at(size).prove_non_membership(nullifier),
+        Fr::from(0u64),
     )
 }
 
 /// Prove `sender`'s spend at `history`'s current state and build its entry,
 /// without posting it: nothing here depends on where it ends up landing.
-/// `parent` is the coin's creating spend, its slot, and its wrapped proof; `None`
-/// is a genesis mint. Construction order matters: prove, encrypt the proof into
+/// `parent` is the coin's creating spend, its slot, its wrapped proof, and the
+/// genesis VK's hash; `None` is a genesis mint. Construction order matters: prove, encrypt the proof into
 /// the ciphertext, then sign last (inside `encrypt_tx`).
 fn prove_spend(
     name: &str,
@@ -475,13 +488,12 @@ fn prove_spend(
     sender: &Party,
     input: &Coin,
     outputs: &[(Coin, [u8; 32])],
-    parent: Option<(&ProvenSpend, usize, &WrappedSpend)>,
+    parent: Option<(&ProvenSpend, usize, &WrappedSpend, Fr)>,
     stats: &mut Vec<ProveStats>,
 ) -> ProvenSpend {
     let output_coins: Vec<Coin> = outputs.iter().map(|(c, _)| c.clone()).collect();
     let core = core_witness(history, sender, input, &output_coins);
     let public_values = core.public_values().expect("core_witness sets every public value");
-    let public_inputs = spend_public_inputs(&public_values);
 
     let (vk, proof, prove_secs, peak_mem_kb, constraints) = match parent {
         None => {
@@ -489,18 +501,22 @@ fn prove_spend(
             let (vk, proof, secs, mem) = run_step_subprocess::<_, MNT4_753>("genesis", &circuit);
             (vk, proof, secs, mem, count_constraints(&circuit))
         }
-        Some((parent, slot, wrapped)) => {
+        Some((parent, slot, wrapped, genesis_vk_hash)) => {
             let witness = history.parent_witness(slot, &parent.public_values, &parent.tx.vpk, history.len());
             let circuit = SpendStepCircuit {
                 core,
                 wrap_vk: wrapped.vk.clone(),
+                genesis_vk_hash,
                 input_parent_proofs: [Some(wrapped.proof.clone())],
                 input_parents: [Some(witness)],
+                input_parent_vk_hashes: [Some(parent.vk_hash)],
             };
             let (vk, proof, secs, mem) = run_step_subprocess::<_, MNT4_753>("spend_non_genesis", &circuit);
             (vk, proof, secs, mem, count_constraints(&circuit))
         }
     };
+    let vk_hash = inner_vk_hash(&vk);
+    let public_inputs = spend_public_inputs(&public_values, vk_hash);
     let t = Instant::now();
     assert!(cloakkchain_circuit_spend::verify(&vk, &public_inputs, &proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -527,13 +543,13 @@ fn prove_spend(
         entry_bytes: bincode::serialize(&entry).map(|v| v.len()).ok(),
         peak_mem_kb,
     });
-    ProvenSpend { entry, tx, public_values, vk, proof }
+    ProvenSpend { entry, tx, public_values, vk, vk_hash, proof }
 }
 
 /// Wrap `spend`'s proof so the next spend, back on MNT4-753, can recursively
 /// verify it directly — no receipt layer.
 fn wrap_spend(name: &str, spend: &ProvenSpend, history: &History, stats: &mut Vec<ProveStats>) -> WrappedSpend {
-    let public_inputs = spend_public_inputs(&spend.public_values);
+    let public_inputs = spend_public_inputs(&spend.public_values, spend.vk_hash);
     let circuit = WrapCircuit::<SPEND_PUBLIC_INPUT_COUNT> {
         inner_vk: spend.vk.clone(),
         inner_proof: Some(spend.proof.clone()),
@@ -559,14 +575,17 @@ fn wrap_spend(name: &str, spend: &ProvenSpend, history: &History, stats: &mut Ve
 }
 
 /// `recipient` finds its coin in the carrier at `slot` and runs the off-circuit
-/// acceptance check against its own replay, verifying the real proof.
+/// acceptance check against its own replay, verifying the real proof under
+/// `vk` with `vk_hash` naming it — which, by induction, pins every step back to
+/// genesis.
 fn receive(recipient: &Party, coin: &Coin, spend: &ProvenSpend, slot: usize, history: &History) {
+    let vk = &spend.vk;
     println!("\n--- {} scans slot {slot} ---", recipient.name);
     let tx = scan_entry(&recipient.enc_sk, &spend.entry).expect("the recipient must be able to decrypt its carrier");
     assert!(tx.receives_coin(&coin.commitment()), "the carrier must transfer the recipient's coin");
     check_receipt(history, slot, &spend.entry, &tx, |public_values, proof_bytes| {
         let proof = Proof::<MNT4_753>::deserialize_compressed(proof_bytes).expect("deserialize proof");
-        cloakkchain_circuit_spend::verify(&spend.vk, &spend_public_inputs(public_values), &proof).unwrap()
+        cloakkchain_circuit_spend::verify(vk, &spend_public_inputs(public_values, inner_vk_hash(vk)), &proof).unwrap()
     })
     .expect("the recipient must accept its carrier");
     println!("  [{}] accepted coin (value={}) at slot {slot}", recipient.name, coin.value);
@@ -629,7 +648,7 @@ fn run_prove() {
         &alice,
         &alice_coin,
         &[(bob_coin.clone(), bob.enc_pk), (change_coin.clone(), alice.enc_pk)],
-        Some((&mint, mint_slot, &wrapped_mint)),
+        Some((&mint, mint_slot, &wrapped_mint, mint.vk_hash)),
         &mut stats,
     );
 
@@ -658,9 +677,11 @@ fn run_prove() {
         &bob,
         &bob_coin,
         &[(carol_coin.clone(), carol.enc_pk)],
-        Some((&alice_spend, alice_slot, &wrapped_alice)),
+        Some((&alice_spend, alice_slot, &wrapped_alice, mint.vk_hash)),
         &mut stats,
     );
+    assert_eq!(bob_spend.vk_hash, alice_spend.vk_hash, "one spend key for every generation");
+    assert!(wrapped_alice.vk == wrapped_mint.vk, "one wrap key for every generation");
     let bob_slot = history.append(&bob_spend.entry);
     receive(&carol, &carol_coin, &bob_spend, bob_slot, &history);
     println!("  End of chain.");
@@ -722,7 +743,7 @@ fn run_prove_grid_cell() {
         &alice,
         &alice_coin,
         &outputs,
-        Some((&mint, mint_slot, &wrapped_mint)),
+        Some((&mint, mint_slot, &wrapped_mint, mint.vk_hash)),
         &mut stats,
     );
 
