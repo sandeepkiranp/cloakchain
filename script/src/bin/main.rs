@@ -1,19 +1,24 @@
 //! Host driver for the MNT-native cloakkchain relations (Phase 4 of the
-//! MNT-native port, extended with multi-input/output support, the full
-//! genesis->Alice->Bob->Carol chain, and the origin/binding fix below).
+//! MNT-native port, extended with the full genesis->Alice->Bob->Carol chain and
+//! the serial-number copy fix below).
 //!
 //! Demo chain: genesis mints to Alice, Alice spends 1-in/2-out (40 to Bob,
 //! 60 change back to herself — real value conservation over a genuine sum,
 //! not just equality) directly recursively verifying genesis's own wrapped
 //! proof, then Bob spends his 40 units to Carol directly recursively
 //! verifying Alice's own wrapped spend proof. There is no separate
-//! "receipt" proof/step any more: each spend proves, against its own real,
-//! public board root, that the board entry which created its input coin is
-//! genuinely included — and binds the roots/output-commitments embedded in
-//! that entry's leaf to the parent proof's own recursively-verified public
-//! claims. See `circuit-spend`'s module doc comment for why this closes the
-//! gap where a spender could fabricate a never-really-posted "origin" and
-//! have it silently accepted.
+//! "receipt" proof/step: each spend proves, against its own anchor (a state
+//! from before it was posted), that the entry which created its input coin is
+//! genuinely included and that nothing in that entry's window spoils it — see
+//! `circuit-spend`'s module doc comment.
+//!
+//! The chain runs under the reviewers' attack: after Alice has proved but before
+//! her carrier lands, a third party gets a copy of her serial number ordered
+//! first. Her proof stays valid, since it's anchored before the copy; Bob
+//! accepts her carrier regardless, and opens the copy in his own proof.
+//!
+//! Every wallet's view is a [`History`] replayed blindly from the board: the
+//! roots a leaf embeds are computed there, and are never posted.
 //!
 //! `--prove` still builds the whole chain once, in order, in this process
 //! (exactly like a non-isolated driver would) — but each step's actual
@@ -24,8 +29,8 @@
 //! high-water mark. Only the small, already-`CanonicalSerialize`-able
 //! witness circuit struct crosses into the subprocess and only the
 //! resulting `(VerifyingKey, Proof)` crosses back — the parent still holds
-//! every other piece of state (board entries, nullifier tree, prior
-//! proofs) exactly as it always did, so nothing is ever recomputed twice.
+//! every other piece of state (board entries, history, prior proofs) exactly
+//! as it always did, so nothing is ever recomputed twice.
 //!
 //! ```shell
 //! RUST_LOG=info cargo run --release -- --execute   # genesis circuit's constraint check only, no proving
@@ -42,23 +47,16 @@ use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::{rngs::StdRng, SeedableRng};
 use clap::Parser;
-use cloakkchain_circuit_spend::{GenesisSpendCircuit, SpendStepCircuit, MAX_INPUTS, MAX_OUTPUTS};
+use cloakkchain_circuit_spend::{
+    spend_public_inputs, GenesisSpendCircuit, SpendCoreWitness, SpendStepCircuit, MAX_INPUTS, MAX_OUTPUTS,
+    SPEND_PUBLIC_INPUT_COUNT,
+};
 use cloakkchain_circuit_wrap::WrapCircuit;
 use cloakkchain_lib::{
-    append_path_for_next, compute_root_from_path, derive_enc_pk, derive_owner_pk,
-    entry_ciphertext_commitment, fold_owner_scalar, genesis_pk, genesis_sk,
-    poseidon_hash, scan_entry, BoardEntry, Coin, Fr, NonMembershipWitness,
-    NullifierTree, OwnerPk, OwnerScalar, Transaction, EK_SALT,
+    check_receipt, derive_coin_vpk, derive_enc_pk, derive_nullifier, derive_owner_pk, encrypt_tx, genesis_pk,
+    genesis_sk, scan_entry, Anchor, BoardEntry, Coin, CoinSignature, Fr, History, OwnerPk, OwnerScalar,
+    SpendPublicValues, Transaction, EK_SALT,
 };
-
-// MAX_OUTPUTS + 2 (board_root, nullifier_root) — computed from
-// circuit-spend's own MAX_OUTPUTS so this stays correct across the paper's
-// grid-cell experiments (see `run_prove_grid_cell`), which flip that const.
-// pk_p is a private witness, not part of this vector. Used both for
-// GenesisSpendCircuit's/SpendStepCircuit's own public inputs and, now that
-// there's no separate receipt layer, for every recursively-wrapped parent
-// proof a spend verifies (they share the same public-input layout).
-const SPEND_PUBLIC_INPUTS: usize = MAX_OUTPUTS + 2;
 
 // ---- CLI args ---------------------------------------------------------------
 
@@ -121,32 +119,15 @@ fn coin(seed: u8, value: u64, owner_pk: OwnerPk) -> Coin {
     Coin { value, rand: Fr::from(seed as u64 + 1000), owner_pk }
 }
 
-/// Pads a variable-length list of real output commitments out to
-/// `MAX_OUTPUTS` with a zero sentinel — both the spend circuit's fixed-size
-/// public output and any `BoardEntry` built from the same transaction must
-/// agree on this padding, or the entry's leaf hash won't match what the
-/// circuit computed.
-fn pad_outputs(real: &[Fr]) -> [Fr; MAX_OUTPUTS] {
-    let mut out = [Fr::from(0u64); MAX_OUTPUTS];
-    out[..real.len()].copy_from_slice(real);
-    out
-}
-
 /// Build a Transaction using X25519 note encryption derived from a
 /// per-transaction session key. Returns `(tx, session_key, recipient_enc_pks)`
-/// — pass to `encrypt_tx` as
-/// `encrypt_tx(&tx, input_commitment, sender_sk_p, &recipient_enc_pks, session_key, prev_board_root, prev_nullifier_root)`
-/// (neither the nullifier nor the input commitment it's derived from is
-/// carried on `Transaction` itself — see its doc comment).
+/// — pass to `encrypt_tx`, which signs the result. `vpk` and `anchor` go inside
+/// the ciphertext, never on the wire.
 fn make_tx(
     id: u64,
     sender_enc_sk: [u8; 32],
-    // Unused now: nullifier derivation moved to `encrypt_tx`. Kept as a
-    // parameter so every call site stays self-documenting.
-    _sender_sk_p: &OwnerScalar,
-    // Unused now: `Transaction` no longer stores input commitments. Kept
-    // for the same self-documenting reason.
-    _input_coins: &[Coin],
+    vpk: OwnerPk,
+    anchor: Anchor,
     outputs: &[(Coin, [u8; 32])], // (coin, recipient's X25519 enc_pk)
 ) -> (Transaction, [u8; 32], Vec<[u8; 32]>) {
     use sha2::{Digest, Sha256};
@@ -166,7 +147,7 @@ fn make_tx(
         .enumerate()
         .map(|(i, (c, _))| cloakkchain_lib::build_note_enc(&session_key, i, c))
         .collect();
-    let tx = Transaction { id, output_commitments, note_encs, spend_proof: vec![] };
+    let tx = Transaction { id, output_commitments, note_encs, vpk, anchor, spend_proof: vec![] };
     (tx, session_key, recipient_enc_pks)
 }
 
@@ -177,7 +158,7 @@ fn make_tx(
 // same-process running high-water mark carried over from earlier steps.
 // Only the witness circuit struct crosses into the child and only the
 // resulting `(VerifyingKey, Proof)` crosses back — everything else (board
-// state, nullifier tree, prior proofs) stays in this parent process for the
+// state, history, prior proofs) stays in this parent process for the
 // whole run, so no step is ever computed twice.
 
 /// Poll `/proc/<pid>/status` for `VmHWM` (the kernel's own running peak
@@ -297,11 +278,11 @@ fn run_internal_step(kind: &str, witness_path: &str, output_path: &str) {
             write_vk_proof::<MNT4_753>(&vk, &proof, output_path);
         }
         "wrap" => {
-            let circuit = WrapCircuit::<SPEND_PUBLIC_INPUTS>::deserialize_compressed(&witness_bytes[..])
+            let circuit = WrapCircuit::<SPEND_PUBLIC_INPUT_COUNT>::deserialize_compressed(&witness_bytes[..])
                 .expect("deserialize witness");
             let inner_vk = circuit.inner_vk.clone();
-            let (pk, vk) = cloakkchain_circuit_wrap::setup::<SPEND_PUBLIC_INPUTS, _>(inner_vk, &mut rng).unwrap();
-            let proof = cloakkchain_circuit_wrap::prove::<SPEND_PUBLIC_INPUTS, _>(&pk, circuit, &mut rng).unwrap();
+            let (pk, vk) = cloakkchain_circuit_wrap::setup::<SPEND_PUBLIC_INPUT_COUNT, _>(inner_vk, &mut rng).unwrap();
+            let proof = cloakkchain_circuit_wrap::prove::<SPEND_PUBLIC_INPUT_COUNT, _>(&pk, circuit, &mut rng).unwrap();
             write_vk_proof::<MNT6_753>(&vk, &proof, output_path);
         }
         other => panic!("unknown --internal-kind {other}"),
@@ -439,23 +420,9 @@ fn main() {
 fn run_execute(genesis: &Party, genesis_coin: &Coin, alice_coin: &Coin) {
     println!("--execute: checking GenesisSpendCircuit's constraints only (no proving)");
 
-    let output_commitments = pad_outputs(&[alice_coin.commitment()]);
-    let append_path = append_path_for_next(&[]);
-    let board_root = compute_root_from_path(Fr::from(0u64), 0, &append_path);
-    let own_nullifier = poseidon_hash(&[genesis_coin.commitment(), fold_owner_scalar(&genesis.sk_p)]);
-    let tree = NullifierTree::new();
-
+    let history = History::new();
     let circuit = GenesisSpendCircuit {
-        pk_p: Some(genesis.pk_p),
-        output_commitments: Some(output_commitments),
-        board_root: Some(board_root),
-        current_nullifier_root: Some(tree.root()),
-        sk_p: Some(genesis.sk_p),
-        input_coins: [Some(genesis_coin.clone())],
-        output_coins: [Some(alice_coin.clone()), None],
-        entry_position: Some(0),
-        append_path: Some(append_path),
-        own_nullifier_nonmembership: [Some(tree.prove_non_membership(own_nullifier))],
+        core: core_witness(&history, genesis, genesis_coin, std::slice::from_ref(alice_coin)),
     };
 
     let cs = ConstraintSystem::<Fr>::new_ref();
@@ -467,9 +434,160 @@ fn run_execute(genesis: &Party, genesis_coin: &Coin, alice_coin: &Coin) {
     println!("\nRun --prove for the full chain (five real GM17 proofs).");
 }
 
+// ---- One step of the chain ---------------------------------------------------
+
+/// A spend whose proof exists, as both the poster and its recipients see it.
+struct ProvenSpend {
+    entry: BoardEntry,
+    tx: Transaction,
+    public_values: SpendPublicValues,
+    vk: VerifyingKey<MNT4_753>,
+    proof: Proof<MNT4_753>,
+}
+
+/// A spend's proof re-proved on the other curve, for the next spend to verify.
+struct WrappedSpend {
+    vk: VerifyingKey<MNT6_753>,
+    proof: Proof<MNT6_753>,
+}
+
+/// The spend relation's witness, anchored at `history`'s current state.
+fn core_witness(history: &History, sender: &Party, input: &Coin, outputs: &[Coin]) -> SpendCoreWitness {
+    let size = history.len();
+    let nullifier = derive_nullifier(input.commitment(), &sender.sk_p);
+    SpendCoreWitness::new(
+        sender.sk_p,
+        input.clone(),
+        outputs,
+        history.anchor_at(size).expect("the current state exists"),
+        history.nullifier_tree_at(size).prove_non_membership(nullifier),
+    )
+}
+
+/// Prove `sender`'s spend at `history`'s current state and build its entry,
+/// without posting it: nothing here depends on where it ends up landing.
+/// `parent` is the coin's creating spend, its slot, and its wrapped proof; `None`
+/// is a genesis mint. Construction order matters: prove, encrypt the proof into
+/// the ciphertext, then sign last (inside `encrypt_tx`).
+fn prove_spend(
+    name: &str,
+    history: &History,
+    sender: &Party,
+    input: &Coin,
+    outputs: &[(Coin, [u8; 32])],
+    parent: Option<(&ProvenSpend, usize, &WrappedSpend)>,
+    stats: &mut Vec<ProveStats>,
+) -> ProvenSpend {
+    let output_coins: Vec<Coin> = outputs.iter().map(|(c, _)| c.clone()).collect();
+    let core = core_witness(history, sender, input, &output_coins);
+    let public_values = core.public_values().expect("core_witness sets every public value");
+    let public_inputs = spend_public_inputs(&public_values);
+
+    let (vk, proof, prove_secs, peak_mem_kb, constraints) = match parent {
+        None => {
+            let circuit = GenesisSpendCircuit { core };
+            let (vk, proof, secs, mem) = run_step_subprocess::<_, MNT4_753>("genesis", &circuit);
+            (vk, proof, secs, mem, count_constraints(&circuit))
+        }
+        Some((parent, slot, wrapped)) => {
+            let witness = history.parent_witness(slot, &parent.public_values, &parent.tx.vpk, history.len());
+            let circuit = SpendStepCircuit {
+                core,
+                wrap_vk: wrapped.vk.clone(),
+                input_parent_proofs: [Some(wrapped.proof.clone())],
+                input_parents: [Some(witness)],
+            };
+            let (vk, proof, secs, mem) = run_step_subprocess::<_, MNT4_753>("spend_non_genesis", &circuit);
+            (vk, proof, secs, mem, count_constraints(&circuit))
+        }
+    };
+    let t = Instant::now();
+    assert!(cloakkchain_circuit_spend::verify(&vk, &public_inputs, &proof).unwrap());
+    let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+    println!("  Proved in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
+
+    let commitment = input.commitment();
+    let (mut tx, session_key, recipients) = make_tx(
+        stats.len() as u64,
+        sender.enc_sk,
+        derive_coin_vpk(&sender.sk_p, commitment),
+        public_values.anchor.clone(),
+        outputs,
+    );
+    tx.spend_proof = ark_serialize_bytes(&proof);
+    let entry = encrypt_tx(&tx, commitment, &sender.sk_p, &recipients, session_key);
+
+    stats.push(ProveStats {
+        name: name.into(),
+        board_size: history.len(),
+        constraints,
+        prove_secs,
+        verify_ms,
+        proof_bytes: ark_serialize_len(&proof),
+        entry_bytes: bincode::serialize(&entry).map(|v| v.len()).ok(),
+        peak_mem_kb,
+    });
+    ProvenSpend { entry, tx, public_values, vk, proof }
+}
+
+/// Wrap `spend`'s proof so the next spend, back on MNT4-753, can recursively
+/// verify it directly — no receipt layer.
+fn wrap_spend(name: &str, spend: &ProvenSpend, history: &History, stats: &mut Vec<ProveStats>) -> WrappedSpend {
+    let public_inputs = spend_public_inputs(&spend.public_values);
+    let circuit = WrapCircuit::<SPEND_PUBLIC_INPUT_COUNT> {
+        inner_vk: spend.vk.clone(),
+        inner_proof: Some(spend.proof.clone()),
+        inner_public_inputs: Some(public_inputs),
+    };
+    let (vk, proof, prove_secs, peak_mem_kb) = run_step_subprocess::<_, MNT6_753>("wrap", &circuit);
+    let chunks = cloakkchain_circuit_wrap::public_input_chunks(&public_inputs);
+    let t = Instant::now();
+    assert!(cloakkchain_circuit_wrap::verify(&vk, &chunks, &proof).unwrap());
+    let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+    println!("  Wrapped in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
+    stats.push(ProveStats {
+        name: name.into(),
+        board_size: history.len(),
+        constraints: count_constraints(&circuit),
+        prove_secs,
+        verify_ms,
+        proof_bytes: ark_serialize_len(&proof),
+        entry_bytes: None,
+        peak_mem_kb,
+    });
+    WrappedSpend { vk, proof }
+}
+
+/// `recipient` finds its coin in the carrier at `slot` and runs the off-circuit
+/// acceptance check against its own replay, verifying the real proof.
+fn receive(recipient: &Party, coin: &Coin, spend: &ProvenSpend, slot: usize, history: &History) {
+    println!("\n--- {} scans slot {slot} ---", recipient.name);
+    let tx = scan_entry(&recipient.enc_sk, &spend.entry).expect("the recipient must be able to decrypt its carrier");
+    assert!(tx.receives_coin(&coin.commitment()), "the carrier must transfer the recipient's coin");
+    check_receipt(history, slot, &spend.entry, &tx, |public_values, proof_bytes| {
+        let proof = Proof::<MNT4_753>::deserialize_compressed(proof_bytes).expect("deserialize proof");
+        cloakkchain_circuit_spend::verify(&spend.vk, &spend_public_inputs(public_values), &proof).unwrap()
+    })
+    .expect("the recipient must accept its carrier");
+    println!("  [{}] accepted coin (value={}) at slot {slot}", recipient.name, coin.value);
+}
+
+/// What the reviewers' attack posts: someone else's serial number on an entry
+/// of the attacker's own. Needs no secrets, and every wallet inserts it blindly.
+fn copy_of_serial_number(nullifier: Fr) -> BoardEntry {
+    BoardEntry {
+        ciphertext: vec![0xCC; 64],
+        ek_pk: [0xCC; 32],
+        key_encs: vec![[0xCC; 32]],
+        nullifier,
+        output_commitments: vec![Fr::from(999u64)],
+        signature: CoinSignature { c: Fr::from(1u64), s: OwnerScalar::from(1u64) },
+    }
+}
+
 fn run_prove() {
     let mut stats: Vec<ProveStats> = Vec::new();
-    let mut entries: Vec<BoardEntry> = vec![];
+    let mut history = History::new();
 
     let genesis = Party::genesis();
     let alice = Party::new("Alice", 1);
@@ -480,276 +598,72 @@ fn run_prove() {
     // Slot 0: genesis mints 100 units to Alice
     // =========================================================================
     println!("--- Slot 0: Genesis mints 100 units to Alice ---");
-    println!("  Proving: pk_p is the fixed genesis key, the mint's nullifier isn't already spent, and the board root updates correctly for the new coin.");
+    println!("  Proving: pk_p is the fixed genesis key, the mint's serial number and per-coin key are correctly derived, and the serial number is absent at the anchor.");
     let genesis_coin = coin(0xA1, 100, genesis.pk_p);
     let alice_coin = coin(0xA2, 100, alice.pk_p);
-    let genesis_outputs = pad_outputs(&[alice_coin.commitment()]);
-    let genesis_append_path = append_path_for_next(&entries);
-    let genesis_board_root = compute_root_from_path(Fr::from(0u64), entries.len(), &genesis_append_path);
-    let genesis_own_nullifier = poseidon_hash(&[genesis_coin.commitment(), fold_owner_scalar(&genesis.sk_p)]);
-    let empty_tree = NullifierTree::new();
-
-    let genesis_circuit = GenesisSpendCircuit {
-        pk_p: Some(genesis.pk_p),
-        output_commitments: Some(genesis_outputs),
-        board_root: Some(genesis_board_root),
-        current_nullifier_root: Some(empty_tree.root()),
-        sk_p: Some(genesis.sk_p),
-        input_coins: [Some(genesis_coin.clone())],
-        output_coins: [Some(alice_coin.clone()), None],
-        entry_position: Some(entries.len() as u64),
-        append_path: Some(genesis_append_path.clone()),
-        own_nullifier_nonmembership: [Some(empty_tree.prove_non_membership(genesis_own_nullifier))],
-    };
-    let genesis_public_inputs: [Fr; SPEND_PUBLIC_INPUTS] =
-        GenesisSpendCircuit::public_inputs(genesis_outputs, genesis_board_root, empty_tree.root())
-            .try_into()
-            .unwrap();
-
-    let (genesis_vk, genesis_proof, prove_secs, peak_mem_kb) =
-        run_step_subprocess::<_, MNT4_753>("genesis", &genesis_circuit);
-    let t = Instant::now();
-    assert!(cloakkchain_circuit_spend::verify(&genesis_vk, &genesis_public_inputs, &genesis_proof).unwrap());
-    let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  Proved in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
-    stats.push(ProveStats {
-        name: "Genesis mint".into(),
-        board_size: entries.len() + 1,
-        constraints: count_constraints(&genesis_circuit),
-        prove_secs,
-        verify_ms,
-        proof_bytes: ark_serialize_len(&genesis_proof),
-        entry_bytes: None,
-        peak_mem_kb,
-    });
-
-    let (mut tx0, s0, r0) =
-        make_tx(0, genesis.enc_sk, &genesis.sk_p, &[genesis_coin.clone()], &[(alice_coin.clone(), alice.enc_pk)]);
-    tx0.spend_proof = ark_serialize_bytes(&genesis_proof);
-    // Nothing precedes genesis — both roots are the empty ones, which also
-    // happen to equal `genesis_board_root`/`empty_tree.root()` themselves
-    // (first-ever entry). In general an entry's `prev_board_root`/
-    // `prev_nullifier_root` are exactly its own creating spend's public
-    // `board_root`/`current_nullifier_root`.
-    let genesis_entry = cloakkchain_lib::encrypt_tx(
-        &tx0, genesis_coin.commitment(), &genesis.sk_p, &r0, s0, genesis_board_root, empty_tree.root(),
+    let mint = prove_spend(
+        "Genesis mint",
+        &history,
+        &genesis,
+        &genesis_coin,
+        &[(alice_coin.clone(), alice.enc_pk)],
+        None,
+        &mut stats,
     );
-    entries.push(genesis_entry.clone());
-    let entry0_bytes = bincode::serialize(&genesis_entry).map(|v| v.len()).ok();
+    let mint_slot = history.append(&mint.entry);
 
-    // --- wrap the genesis proof so Alice's spend can recursively verify it
-    // (and bind her origin entry's claims to it) directly — no receipt layer.
     println!("  Wrapping the genesis proof: re-verifies it on the other curve (MNT6-753) and re-exposes its public inputs as small chunks, so Alice's spend circuit (back on MNT4-753) can recursively check it.");
-    let wrap_genesis_circuit = WrapCircuit::<SPEND_PUBLIC_INPUTS> {
-        inner_vk: genesis_vk.clone(),
-        inner_proof: Some(genesis_proof),
-        inner_public_inputs: Some(genesis_public_inputs),
-    };
-    let (wrap_genesis_vk, wrap_genesis_proof, prove_secs, peak_mem_kb) =
-        run_step_subprocess::<_, MNT6_753>("wrap", &wrap_genesis_circuit);
-    let wrap_genesis_public_inputs = cloakkchain_circuit_wrap::public_input_chunks(&genesis_public_inputs);
-    let t = Instant::now();
-    assert!(cloakkchain_circuit_wrap::verify(&wrap_genesis_vk, &wrap_genesis_public_inputs, &wrap_genesis_proof).unwrap());
-    let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  Wrapped in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
-    stats.push(ProveStats {
-        name: "Wrap genesis proof".into(),
-        board_size: entries.len(),
-        constraints: count_constraints(&wrap_genesis_circuit),
-        prove_secs,
-        verify_ms,
-        proof_bytes: ark_serialize_len(&wrap_genesis_proof),
-        entry_bytes: entry0_bytes,
-        peak_mem_kb,
-    });
-
-    println!("\n--- Alice scans slot 0 ---");
-    let alice_tx = scan_entry(&alice.enc_sk, &genesis_entry).expect("Alice must be able to decrypt slot 0");
-    assert!(alice_tx.receives_coin(&alice_coin.commitment()), "Alice's tx must transfer her coin");
-    println!("  [{}] discovered coin (value={}) at slot 0", alice.name, alice_coin.value);
+    let wrapped_mint = wrap_spend("Wrap genesis proof", &mint, &history, &mut stats);
+    receive(&alice, &alice_coin, &mint, mint_slot, &history);
 
     // =========================================================================
-    // Slot 1: Alice spends 1-in-2-out — 40 to Bob, 60 change to herself
+    // Alice spends 1-in-2-out — 40 to Bob, 60 change to herself
     // =========================================================================
-    println!("\n--- Slot 1: Alice spends to Bob (40) + change back to herself (60) ---");
-    println!("  Proving: Alice owns the input coin, its nullifier isn't already in the nullifier tree (not a double-spend), value conservation holds (100 in = 40 + 60 out), the two new coins are correctly published, the entry that created her coin is included against this spend's own real board root, and the roots/outputs embedded in that entry match genesis's own recursively-verified proof.");
+    println!("\n--- Alice spends to Bob (40) + change back to herself (60), anchored at the current state ---");
+    println!("  Proving: Alice owns the input coin, its serial number is absent at her anchor, value conservation holds (100 in = 40 + 60 out), and the mint under her anchor is genuine: its anchor is real, its signature valid, and its window clean.");
     let bob_coin = coin(0xB1, 40, bob.pk_p);
     let change_coin = coin(0xB2, 60, alice.pk_p);
-    let alice_spend_outputs = pad_outputs(&[bob_coin.commitment(), change_coin.commitment()]);
-
-    let alice_spend_append_path = append_path_for_next(&entries);
-    let alice_spend_board_root = compute_root_from_path(Fr::from(0u64), entries.len(), &alice_spend_append_path);
-    let alice_own_nullifier = poseidon_hash(&[alice_coin.commitment(), fold_owner_scalar(&alice.sk_p)]);
-    let mut tree_after_genesis = NullifierTree::new();
-    tree_after_genesis.insert(genesis_own_nullifier);
-
-    let alice_spend_circuit = SpendStepCircuit {
-        pk_p: Some(alice.pk_p),
-        output_commitments: Some(alice_spend_outputs),
-        board_root: Some(alice_spend_board_root),
-        current_nullifier_root: Some(tree_after_genesis.root()),
-        sk_p: Some(alice.sk_p),
-        input_coins: [Some(alice_coin.clone())],
-        output_coins: [Some(bob_coin.clone()), Some(change_coin.clone())],
-        entry_position: Some(entries.len() as u64),
-        append_path: Some(alice_spend_append_path.clone()),
-        own_nullifier_nonmembership: [Some(tree_after_genesis.prove_non_membership(alice_own_nullifier))],
-        wrap_vk: wrap_genesis_vk.clone(),
-        input_parent_proofs: [Some(wrap_genesis_proof)],
-        input_parent_public_inputs: [Some(genesis_public_inputs)],
-        origin_received_slot: [Some(0)],
-        origin_entry_nullifier: [Some(genesis_entry.nullifier)],
-        origin_entry_output_commitments: [Some(genesis_outputs)],
-        origin_entry_ciphertext_commitment: [Some(entry_ciphertext_commitment(&genesis_entry))],
-        origin_append_path: [Some(genesis_append_path.clone())],
-        origin_prev_board_root: [Some(genesis_entry.prev_board_root)],
-        origin_prev_nullifier_root: [Some(genesis_entry.prev_nullifier_root)],
-    };
-    let alice_spend_public_inputs: [Fr; SPEND_PUBLIC_INPUTS] = SpendStepCircuit::public_inputs(
-        alice_spend_outputs,
-        alice_spend_board_root,
-        tree_after_genesis.root(),
-    )
-    .try_into()
-    .unwrap();
-
-    let (alice_spend_vk, alice_spend_proof, prove_secs, peak_mem_kb) =
-        run_step_subprocess::<_, MNT4_753>("spend_non_genesis", &alice_spend_circuit);
-    let t = Instant::now();
-    assert!(cloakkchain_circuit_spend::verify_non_genesis(&alice_spend_vk, &alice_spend_public_inputs, &alice_spend_proof).unwrap());
-    let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  Proved in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
-    stats.push(ProveStats {
-        name: "Alice -> Bob + change".into(),
-        board_size: entries.len() + 1,
-        constraints: count_constraints(&alice_spend_circuit),
-        prove_secs,
-        verify_ms,
-        proof_bytes: ark_serialize_len(&alice_spend_proof),
-        entry_bytes: None,
-        peak_mem_kb,
-    });
-
-    let (mut tx1, s1, r1) = make_tx(
-        1,
-        alice.enc_sk,
-        &alice.sk_p,
-        &[alice_coin.clone()],
+    let alice_spend = prove_spend(
+        "Alice -> Bob + change",
+        &history,
+        &alice,
+        &alice_coin,
         &[(bob_coin.clone(), bob.enc_pk), (change_coin.clone(), alice.enc_pk)],
+        Some((&mint, mint_slot, &wrapped_mint)),
+        &mut stats,
     );
-    tx1.spend_proof = ark_serialize_bytes(&alice_spend_proof);
-    let alice_entry = cloakkchain_lib::encrypt_tx(
-        &tx1, alice_coin.commitment(), &alice.sk_p, &r1, s1, alice_spend_board_root, tree_after_genesis.root(),
-    );
-    entries.push(alice_entry.clone());
-    let entry1_bytes = bincode::serialize(&alice_entry).map(|v| v.len()).ok();
 
-    // --- wrap Alice's spend so Bob's spend can recursively verify it directly ---
+    // =========================================================================
+    // The reviewers' attack: a copy of Alice's serial number gets ordered first
+    // =========================================================================
+    println!("\n--- Slot 1: a third party posts a copy of Alice's serial number ---");
+    let copy_slot = history.append(&copy_of_serial_number(alice_spend.entry.nullifier));
+    println!("  Landed at slot {copy_slot}, ahead of Alice's carrier. Her proof doesn't need redoing: it's anchored before the copy.");
+
+    println!("\n--- Slot 2: Alice's carrier lands ---");
+    let alice_slot = history.append(&alice_spend.entry);
     println!("  Wrapping Alice's spend so Bob's spend circuit (back on MNT4-753) can recursively verify it.");
-    let wrap_alice_spend_circuit = WrapCircuit::<SPEND_PUBLIC_INPUTS> {
-        inner_vk: alice_spend_vk.clone(),
-        inner_proof: Some(alice_spend_proof),
-        inner_public_inputs: Some(alice_spend_public_inputs),
-    };
-    let (wrap_alice_spend_vk, wrap_alice_spend_proof, prove_secs, peak_mem_kb) =
-        run_step_subprocess::<_, MNT6_753>("wrap", &wrap_alice_spend_circuit);
-    let wrap_alice_spend_public_inputs = cloakkchain_circuit_wrap::public_input_chunks(&alice_spend_public_inputs);
-    let t = Instant::now();
-    assert!(cloakkchain_circuit_wrap::verify(&wrap_alice_spend_vk, &wrap_alice_spend_public_inputs, &wrap_alice_spend_proof).unwrap());
-    let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  Wrapped in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
-    stats.push(ProveStats {
-        name: "Wrap Alice's spend".into(),
-        board_size: entries.len(),
-        constraints: count_constraints(&wrap_alice_spend_circuit),
-        prove_secs,
-        verify_ms,
-        proof_bytes: ark_serialize_len(&wrap_alice_spend_proof),
-        entry_bytes: entry1_bytes,
-        peak_mem_kb,
-    });
-
-    println!("\n--- Bob scans slot 1 ---");
-    let bob_tx = scan_entry(&bob.enc_sk, &alice_entry).expect("Bob must be able to decrypt slot 1");
-    assert!(bob_tx.receives_coin(&bob_coin.commitment()));
-    println!("  [{}] discovered coin (value={}) at slot 1", bob.name, bob_coin.value);
+    let wrapped_alice = wrap_spend("Wrap Alice's spend", &alice_spend, &history, &mut stats);
+    receive(&bob, &bob_coin, &alice_spend, alice_slot, &history);
 
     // =========================================================================
-    // Slot 2: Bob spends his 40 units to Carol
+    // Slot 3: Bob spends his 40 units to Carol
     // =========================================================================
-    println!("\n--- Slot 2: Bob spends his 40 units to Carol ---");
-    println!("  Proving: Bob owns the input coin, its nullifier isn't already in the nullifier tree (not a double-spend), value conservation holds (40 in = 40 out), the new coin is correctly published, the entry that created his coin is included against this spend's own real board root, and the roots/outputs embedded in that entry match Alice's own recursively-verified spend proof.");
+    println!("\n--- Slot 3: Bob spends his 40 units to Carol ---");
+    println!("  Proving: Bob owns the input coin, its serial number is absent at his anchor, value conservation holds (40 in = 40 out), and Alice's spend under his anchor is genuine: in particular, the copy in her window carries an invalid signature.");
     let carol_coin = coin(0xC1, 40, carol.pk_p);
-    let bob_spend_outputs = pad_outputs(&[carol_coin.commitment()]);
-
-    let bob_spend_append_path = append_path_for_next(&entries);
-    let bob_spend_board_root = compute_root_from_path(Fr::from(0u64), entries.len(), &bob_spend_append_path);
-    let bob_own_nullifier = poseidon_hash(&[bob_coin.commitment(), fold_owner_scalar(&bob.sk_p)]);
-    let mut tree_after_alice_spend = tree_after_genesis.clone();
-    tree_after_alice_spend.insert(alice_own_nullifier);
-
-    let bob_spend_circuit = SpendStepCircuit {
-        pk_p: Some(bob.pk_p),
-        output_commitments: Some(bob_spend_outputs),
-        board_root: Some(bob_spend_board_root),
-        current_nullifier_root: Some(tree_after_alice_spend.root()),
-        sk_p: Some(bob.sk_p),
-        input_coins: [Some(bob_coin.clone())],
-        output_coins: [Some(carol_coin.clone()), None],
-        entry_position: Some(entries.len() as u64),
-        append_path: Some(bob_spend_append_path),
-        own_nullifier_nonmembership: [Some(tree_after_alice_spend.prove_non_membership(bob_own_nullifier))],
-        wrap_vk: wrap_alice_spend_vk.clone(),
-        input_parent_proofs: [Some(wrap_alice_spend_proof)],
-        input_parent_public_inputs: [Some(alice_spend_public_inputs)],
-        origin_received_slot: [Some(1)],
-        origin_entry_nullifier: [Some(alice_entry.nullifier)],
-        origin_entry_output_commitments: [Some(alice_spend_outputs)],
-        origin_entry_ciphertext_commitment: [Some(entry_ciphertext_commitment(&alice_entry))],
-        origin_append_path: [Some(alice_spend_append_path)],
-        origin_prev_board_root: [Some(alice_entry.prev_board_root)],
-        origin_prev_nullifier_root: [Some(alice_entry.prev_nullifier_root)],
-    };
-    let bob_spend_public_inputs = SpendStepCircuit::public_inputs(
-        bob_spend_outputs,
-        bob_spend_board_root,
-        tree_after_alice_spend.root(),
+    let bob_spend = prove_spend(
+        "Bob -> Carol",
+        &history,
+        &bob,
+        &bob_coin,
+        &[(carol_coin.clone(), carol.enc_pk)],
+        Some((&alice_spend, alice_slot, &wrapped_alice)),
+        &mut stats,
     );
-
-    let (bob_spend_vk, bob_spend_proof, prove_secs, peak_mem_kb) =
-        run_step_subprocess::<_, MNT4_753>("spend_non_genesis", &bob_spend_circuit);
-    let t = Instant::now();
-    assert!(cloakkchain_circuit_spend::verify_non_genesis(&bob_spend_vk, &bob_spend_public_inputs, &bob_spend_proof).unwrap());
-    let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  Proved in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
-    stats.push(ProveStats {
-        name: "Bob -> Carol".into(),
-        board_size: entries.len() + 1,
-        constraints: count_constraints(&bob_spend_circuit),
-        prove_secs,
-        verify_ms,
-        proof_bytes: ark_serialize_len(&bob_spend_proof),
-        entry_bytes: None,
-        peak_mem_kb,
-    });
-
-    let (mut tx2, s2, r2) =
-        make_tx(2, bob.enc_sk, &bob.sk_p, &[bob_coin.clone()], &[(carol_coin.clone(), carol.enc_pk)]);
-    tx2.spend_proof = ark_serialize_bytes(&bob_spend_proof);
-    let bob_entry = cloakkchain_lib::encrypt_tx(
-        &tx2, bob_coin.commitment(), &bob.sk_p, &r2, s2, bob_spend_board_root, tree_after_alice_spend.root(),
-    );
-    entries.push(bob_entry.clone());
-    // No further wrap step exists in this demo chain (Carol never spends
-    // onward), so — unlike genesis/Alice's spend, whose entry size rides
-    // along on the *next* row — attach Bob's entry size directly to his own
-    // spend row instead of leaving it blank.
-    stats.last_mut().unwrap().entry_bytes = bincode::serialize(&bob_entry).map(|v| v.len()).ok();
-
-    println!("\n--- Carol scans slot 2 ---");
-    let carol_tx = scan_entry(&carol.enc_sk, &bob_entry).expect("Carol must be able to decrypt slot 2");
-    assert!(carol_tx.receives_coin(&carol_coin.commitment()));
-    println!("  [{}] discovered coin (value={}) at slot 2 — end of chain", carol.name, carol_coin.value);
+    let bob_slot = history.append(&bob_spend.entry);
+    receive(&carol, &carol_coin, &bob_spend, bob_slot, &history);
+    println!("  End of chain.");
 
     print_prove_table(&stats);
 }
@@ -758,292 +672,59 @@ fn run_prove() {
 //
 // Ad hoc scenario for measuring *real* GM17 proving stats (constraints,
 // prove time, verify time, proof size, subprocess-isolated peak memory) at
-// whichever (MAX_INPUTS, MAX_OUTPUTS) shape circuit-spend currently happens
-// to be compiled with. `run_prove`'s demo chain only ever exercises one
-// compiled shape at a time (the committed baseline); this function exists
-// so the same measurement methodology (real proving, subprocess-isolated
-// memory) can be pointed at the other three cells of the 2x2 grid by
-// temporarily editing that crate's MAX_INPUTS/MAX_OUTPUTS consts (never
-// committed) and rerunning `--grid-cell`.
+// whichever MAX_OUTPUTS shape circuit-spend currently happens to be compiled
+// with. `run_prove`'s demo chain only ever exercises one compiled shape at a
+// time (the committed baseline); this function exists so the same measurement
+// methodology (real proving, subprocess-isolated memory) can be pointed at the
+// other cells of the grid by temporarily editing that crate's MAX_OUTPUTS const
+// (never committed) and rerunning `--grid-cell`. MAX_INPUTS stays 1 until
+// `BoardEntry` holds one serial number and signature per input: `circuit-spend`
+// refuses to compile otherwise.
 //
-// Scenario: Alice receives one coin per input slot MAX_INPUTS calls for
-// (via that many independent genesis mints, values summing to 100 — 100
-// alone if MAX_INPUTS==1, else 60+40), then spends all of them at once into
+// Scenario: Alice receives one coin from a genesis mint, then spends it into
 // MAX_OUTPUTS outputs (Bob gets 40 plus change back to herself if
-// MAX_OUTPUTS>1, otherwise Bob gets the full 100). Every input slot is
-// genuinely active — this is the maximal-cost, fully-realistic shape for
-// whatever the compiled MAX_INPUTS/MAX_OUTPUTS is, matching how the
-// committed baseline's own Alice-spend row is exercised.
+// MAX_OUTPUTS>1, otherwise Bob gets the full 100).
 //
-// Deliberately doesn't build/publish a `BoardEntry` for the final spend
-// (unlike the mint steps, which need one so Alice's spend can recursively
-// verify real Merkle inclusion against a real origin) — nothing downstream
-// ever spends Alice's new outputs in this harness, so there's no need for
-// the multi-input nullifier-bookkeeping a real continuation would require
-// (this design only ever publishes one nullifier per `BoardEntry`; a
-// genuine multi-input spend that needs to remain spendable-from later would
-// need a second nullifier slot on `BoardEntry` — out of scope here, since
-// only the proof's own real cost is being measured).
+// Alice's spend isn't posted, since nothing downstream spends her new outputs.
 fn run_prove_grid_cell() {
     println!("=== Grid cell: MAX_INPUTS={MAX_INPUTS} MAX_OUTPUTS={MAX_OUTPUTS} ===");
 
     let mut stats: Vec<ProveStats> = Vec::new();
-    let mut entries: Vec<BoardEntry> = vec![];
-    let mut tree = NullifierTree::new();
+    let mut history = History::new();
 
     let genesis = Party::genesis();
     let alice = Party::new("Alice", 1);
     let bob = Party::new("Bob", 2);
 
-    let input_values: Vec<u64> = match MAX_INPUTS {
-        1 => vec![100],
-        2 => vec![60, 40],
-        n => panic!("grid-cell scenario only supports MAX_INPUTS 1 or 2, got {n}"),
-    };
+    println!("\n--- Genesis mint: 100 units to Alice ---");
+    let alice_coin = coin(0xB0, 100, alice.pk_p);
+    let mint = prove_spend(
+        "Genesis mint",
+        &history,
+        &genesis,
+        &coin(0xA0, 100, genesis.pk_p),
+        &[(alice_coin.clone(), alice.enc_pk)],
+        None,
+        &mut stats,
+    );
+    let mint_slot = history.append(&mint.entry);
+    let wrapped_mint = wrap_spend("Wrap genesis mint", &mint, &history, &mut stats);
 
-    struct AliceInput {
-        coin: Coin,
-        own_nullifier: Fr,
-    }
-    let mut alice_inputs: Vec<AliceInput> = Vec::new();
-    let mut wrap_vk_for_spend: Option<VerifyingKey<MNT6_753>> = None;
-    // (wrapped parent proof, its public inputs, origin entry) per input slot.
-    let mut input_parent_wraps: Vec<(Proof<MNT6_753>, [Fr; SPEND_PUBLIC_INPUTS], BoardEntry, Vec<Fr>, usize)> =
-        Vec::new();
-
-    for (k, &val) in input_values.iter().enumerate() {
-        println!("\n--- Genesis mint #{k}: {val} units to Alice ---");
-        let genesis_coin = coin(0xA0 + k as u8, val, genesis.pk_p);
-        let alice_coin = coin(0xB0 + k as u8, val, alice.pk_p);
-        let genesis_outputs = pad_outputs(&[alice_coin.commitment()]);
-        let g_append_path = append_path_for_next(&entries);
-        let g_board_root = compute_root_from_path(Fr::from(0u64), entries.len(), &g_append_path);
-        let g_own_nullifier = poseidon_hash(&[genesis_coin.commitment(), fold_owner_scalar(&genesis.sk_p)]);
-        let nullifier_root_before = tree.root();
-        let own_nonmembership = tree.prove_non_membership(g_own_nullifier);
-
-        let mut g_input_coins: [Option<Coin>; MAX_INPUTS] = std::array::from_fn(|_| None);
-        g_input_coins[0] = Some(genesis_coin.clone());
-        let mut g_nonmembership: [Option<NonMembershipWitness>; MAX_INPUTS] = std::array::from_fn(|_| None);
-        g_nonmembership[0] = Some(own_nonmembership.clone());
-        let mut g_output_coins: [Option<Coin>; MAX_OUTPUTS] = std::array::from_fn(|_| None);
-        g_output_coins[0] = Some(alice_coin.clone());
-
-        let genesis_circuit = GenesisSpendCircuit {
-            pk_p: Some(genesis.pk_p),
-            output_commitments: Some(genesis_outputs),
-            board_root: Some(g_board_root),
-            current_nullifier_root: Some(nullifier_root_before),
-            sk_p: Some(genesis.sk_p),
-            input_coins: g_input_coins,
-            output_coins: g_output_coins,
-            entry_position: Some(entries.len() as u64),
-            append_path: Some(g_append_path.clone()),
-            own_nullifier_nonmembership: g_nonmembership,
-        };
-        let genesis_public_inputs: [Fr; SPEND_PUBLIC_INPUTS] =
-            GenesisSpendCircuit::public_inputs(genesis_outputs, g_board_root, nullifier_root_before)
-                .try_into()
-                .unwrap();
-
-        let (genesis_vk, genesis_proof, prove_secs, peak_mem_kb) =
-            run_step_subprocess::<_, MNT4_753>("genesis", &genesis_circuit);
-        let t = Instant::now();
-        assert!(cloakkchain_circuit_spend::verify(&genesis_vk, &genesis_public_inputs, &genesis_proof).unwrap());
-        let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-        println!("  Proved in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
-        stats.push(ProveStats {
-            name: format!("Genesis mint #{k}"),
-            board_size: entries.len() + 1,
-            constraints: count_constraints(&genesis_circuit),
-            prove_secs,
-            verify_ms,
-            proof_bytes: ark_serialize_len(&genesis_proof),
-            entry_bytes: None,
-            peak_mem_kb,
-        });
-
-        let (mut tx, s, r) = make_tx(
-            k as u64,
-            genesis.enc_sk,
-            &genesis.sk_p,
-            &[genesis_coin.clone()],
-            &[(alice_coin.clone(), alice.enc_pk)],
-        );
-        tx.spend_proof = ark_serialize_bytes(&genesis_proof);
-        let entry = cloakkchain_lib::encrypt_tx(
-            &tx, genesis_coin.commitment(), &genesis.sk_p, &r, s, g_board_root, nullifier_root_before,
-        );
-        let entry_bytes = bincode::serialize(&entry).map(|v| v.len()).ok();
-        let entry_position = entries.len();
-        entries.push(entry.clone());
-        tree.insert(g_own_nullifier);
-
-        // --- wrap the genesis proof so Alice's eventual spend can
-        // recursively verify it directly (and bind her origin entry's
-        // claims to it) — no separate receipt layer.
-        let wrap_genesis_circuit = WrapCircuit::<SPEND_PUBLIC_INPUTS> {
-            inner_vk: genesis_vk.clone(),
-            inner_proof: Some(genesis_proof),
-            inner_public_inputs: Some(genesis_public_inputs),
-        };
-        let (wrap_genesis_vk, wrap_genesis_proof, prove_secs, peak_mem_kb) =
-            run_step_subprocess::<_, MNT6_753>("wrap", &wrap_genesis_circuit);
-        let wrap_genesis_public_inputs = cloakkchain_circuit_wrap::public_input_chunks(&genesis_public_inputs);
-        let t = Instant::now();
-        assert!(cloakkchain_circuit_wrap::verify(&wrap_genesis_vk, &wrap_genesis_public_inputs, &wrap_genesis_proof).unwrap());
-        let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-        println!("  Wrapped in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
-        stats.push(ProveStats {
-            name: format!("Wrap genesis mint #{k}"),
-            board_size: entries.len(),
-            constraints: count_constraints(&wrap_genesis_circuit),
-            prove_secs,
-            verify_ms,
-            proof_bytes: ark_serialize_len(&wrap_genesis_proof),
-            entry_bytes,
-            peak_mem_kb,
-        });
-
-        wrap_vk_for_spend = Some(wrap_genesis_vk);
-        input_parent_wraps.push((
-            wrap_genesis_proof,
-            genesis_public_inputs,
-            entry,
-            g_append_path,
-            entry_position,
-        ));
-        alice_inputs.push(AliceInput {
-            coin: alice_coin.clone(),
-            own_nullifier: poseidon_hash(&[alice_coin.commitment(), fold_owner_scalar(&alice.sk_p)]),
-        });
-    }
-
-    // =========================================================================
-    // Alice spends all MAX_INPUTS coins into MAX_OUTPUTS outputs
-    // =========================================================================
     println!("\n--- Alice spends {MAX_INPUTS} input(s) into {MAX_OUTPUTS} output(s) ---");
-    let total: u64 = input_values.iter().sum();
-    let bob_val = if MAX_OUTPUTS > 1 { 40 } else { total };
-    let bob_coin = coin(0xC0, bob_val, bob.pk_p);
-    let mut output_coins_vec: Vec<Coin> = vec![bob_coin.clone()];
+    let bob_val = if MAX_OUTPUTS > 1 { 40 } else { 100 };
+    let mut outputs = vec![(coin(0xC0, bob_val, bob.pk_p), bob.enc_pk)];
     if MAX_OUTPUTS > 1 {
-        output_coins_vec.push(coin(0xC1, total - bob_val, alice.pk_p));
+        outputs.push((coin(0xC1, 100 - bob_val, alice.pk_p), alice.enc_pk));
     }
-    let real_output_commitments: Vec<Fr> = output_coins_vec.iter().map(|c| c.commitment()).collect();
-    let spend_outputs = pad_outputs(&real_output_commitments);
-
-    let spend_append_path = append_path_for_next(&entries);
-    let spend_board_root = compute_root_from_path(Fr::from(0u64), entries.len(), &spend_append_path);
-    let nullifier_root_before_spend = tree.root();
-
-    let mut spend_input_coins: [Option<Coin>; MAX_INPUTS] = std::array::from_fn(|_| None);
-    let mut spend_nonmembership: [Option<NonMembershipWitness>; MAX_INPUTS] = std::array::from_fn(|_| None);
-    for (i, ai) in alice_inputs.iter().enumerate() {
-        spend_input_coins[i] = Some(ai.coin.clone());
-        spend_nonmembership[i] = Some(tree.prove_non_membership(ai.own_nullifier));
-    }
-    let mut spend_output_coins: [Option<Coin>; MAX_OUTPUTS] = std::array::from_fn(|_| None);
-    for (i, c) in output_coins_vec.iter().enumerate() {
-        spend_output_coins[i] = Some(c.clone());
-    }
-    let mut input_parent_proofs: [Option<Proof<MNT6_753>>; MAX_INPUTS] =
-        std::array::from_fn(|_| Some(SpendStepCircuit::dummy_wrap_proof()));
-    let mut input_parent_public_inputs: [Option<[Fr; SPEND_PUBLIC_INPUTS]>; MAX_INPUTS] =
-        std::array::from_fn(|_| None);
-    let mut origin_received_slot: [Option<u64>; MAX_INPUTS] = std::array::from_fn(|_| None);
-    let mut origin_entry_nullifier: [Option<Fr>; MAX_INPUTS] = std::array::from_fn(|_| None);
-    let mut origin_entry_output_commitments: [Option<[Fr; MAX_OUTPUTS]>; MAX_INPUTS] = std::array::from_fn(|_| None);
-    let mut origin_entry_ciphertext_commitment: [Option<Fr>; MAX_INPUTS] = std::array::from_fn(|_| None);
-    let mut origin_append_path: [Option<Vec<Fr>>; MAX_INPUTS] = std::array::from_fn(|_| None);
-    let mut origin_prev_board_root: [Option<Fr>; MAX_INPUTS] = std::array::from_fn(|_| None);
-    let mut origin_prev_nullifier_root: [Option<Fr>; MAX_INPUTS] = std::array::from_fn(|_| None);
-    for (i, (proof, pis, entry, append_path, slot)) in input_parent_wraps.into_iter().enumerate() {
-        input_parent_proofs[i] = Some(proof);
-        input_parent_public_inputs[i] = Some(pis);
-        origin_received_slot[i] = Some(slot as u64);
-        origin_entry_nullifier[i] = Some(entry.nullifier);
-        origin_entry_output_commitments[i] = Some(entry.output_commitments.clone().try_into().unwrap());
-        origin_entry_ciphertext_commitment[i] = Some(entry_ciphertext_commitment(&entry));
-        origin_append_path[i] = Some(append_path);
-        origin_prev_board_root[i] = Some(entry.prev_board_root);
-        origin_prev_nullifier_root[i] = Some(entry.prev_nullifier_root);
-    }
-
-    let spend_circuit = SpendStepCircuit {
-        pk_p: Some(alice.pk_p),
-        output_commitments: Some(spend_outputs),
-        board_root: Some(spend_board_root),
-        current_nullifier_root: Some(nullifier_root_before_spend),
-        sk_p: Some(alice.sk_p),
-        input_coins: spend_input_coins,
-        output_coins: spend_output_coins,
-        entry_position: Some(entries.len() as u64),
-        append_path: Some(spend_append_path),
-        own_nullifier_nonmembership: spend_nonmembership,
-        wrap_vk: wrap_vk_for_spend.expect("at least one input coin"),
-        input_parent_proofs,
-        input_parent_public_inputs,
-        origin_received_slot,
-        origin_entry_nullifier,
-        origin_entry_output_commitments,
-        origin_entry_ciphertext_commitment,
-        origin_append_path,
-        origin_prev_board_root,
-        origin_prev_nullifier_root,
-    };
-    let spend_public_inputs: [Fr; SPEND_PUBLIC_INPUTS] = SpendStepCircuit::public_inputs(
-        spend_outputs,
-        spend_board_root,
-        nullifier_root_before_spend,
-    )
-    .try_into()
-    .unwrap();
-
-    let (spend_vk, spend_proof, prove_secs, peak_mem_kb) =
-        run_step_subprocess::<_, MNT4_753>("spend_non_genesis", &spend_circuit);
-    let t = Instant::now();
-    assert!(cloakkchain_circuit_spend::verify_non_genesis(&spend_vk, &spend_public_inputs, &spend_proof).unwrap());
-    let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  Proved in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
-
-    // Build (and size) the real board entry too, even though nothing in
-    // this harness spends it onward — matches how the mint steps report
-    // their entry size, so the paper's entry-size column isn't blank for
-    // the row that matters most (`MAX_OUTPUTS` outputs, at their largest).
-    let mut spend_outputs_for_tx: Vec<(Coin, [u8; 32])> = vec![(output_coins_vec[0].clone(), bob.enc_pk)];
-    if output_coins_vec.len() > 1 {
-        spend_outputs_for_tx.push((output_coins_vec[1].clone(), alice.enc_pk));
-    }
-    let (mut spend_tx, spend_s, spend_r) = make_tx(
-        100,
-        alice.enc_sk,
-        &alice.sk_p,
-        &alice_inputs.iter().map(|ai| ai.coin.clone()).collect::<Vec<_>>(),
-        &spend_outputs_for_tx,
+    prove_spend(
+        &format!("Alice's spend ({MAX_INPUTS}-in-{MAX_OUTPUTS}-out)"),
+        &history,
+        &alice,
+        &alice_coin,
+        &outputs,
+        Some((&mint, mint_slot, &wrapped_mint)),
+        &mut stats,
     );
-    spend_tx.spend_proof = ark_serialize_bytes(&spend_proof);
-    let spend_entry = cloakkchain_lib::encrypt_tx(
-        &spend_tx,
-        alice_inputs[0].coin.commitment(),
-        &alice.sk_p,
-        &spend_r,
-        spend_s,
-        spend_board_root,
-        nullifier_root_before_spend,
-    );
-    let spend_entry_bytes = bincode::serialize(&spend_entry).map(|v| v.len()).ok();
-
-    stats.push(ProveStats {
-        name: format!("Alice's spend ({MAX_INPUTS}-in-{MAX_OUTPUTS}-out)"),
-        board_size: entries.len() + 1,
-        constraints: count_constraints(&spend_circuit),
-        prove_secs,
-        verify_ms,
-        proof_bytes: ark_serialize_len(&spend_proof),
-        entry_bytes: spend_entry_bytes,
-        peak_mem_kb,
-    });
 
     print_prove_table(&stats);
     println!("\n=== Grid cell done: MAX_INPUTS={MAX_INPUTS} MAX_OUTPUTS={MAX_OUTPUTS} ===");

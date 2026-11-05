@@ -102,9 +102,11 @@ const PARENT_NULLIFIER: usize = MAX_OUTPUTS + 3;
 const PARENT_VPK_HASH: usize = MAX_OUTPUTS + 3 + MAX_INPUTS;
 
 /// Pads a variable-length list of real output commitments out to `MAX_OUTPUTS`
-/// with zeros. A spend's public outputs and any `BoardEntry` built from the same
-/// transaction must agree on this padding, or the entry's leaf hash won't match
-/// what the circuit computes.
+/// with zeros, for the proof's fixed-size public inputs. A `BoardEntry` posts
+/// only the real ones, since a zero on the wire would mark it as a carrier. The
+/// two still hash alike: trailing zeros leave a Poseidon sponge's state as it
+/// was, and `H(O)` is what binds them (see
+/// `posted_outputs_need_no_padding`).
 pub fn pad_outputs(real: &[Fr]) -> [Fr; MAX_OUTPUTS] {
     let mut out = [Fr::from(0u64); MAX_OUTPUTS];
     out[..real.len()].copy_from_slice(real);
@@ -1192,6 +1194,31 @@ mod tests {
         let target = Fp::new_witness(cs.clone(), || Ok(absent)).unwrap();
         let w = tree.prove_non_membership(absent);
         assert!(verify_nonmembership_var(cs, &root_var, &target, Some(&w)).unwrap().value().unwrap());
+    }
+
+    /// The wire format posts real outputs only, while the proof pads them. That
+    /// holds up only if a carrier with fewer outputs than `MAX_OUTPUTS` still
+    /// passes every check that hashes them.
+    #[test]
+    fn posted_outputs_need_no_padding() {
+        let a = Fr::from(7u64);
+        assert_eq!(cloakkchain_lib::poseidon_hash(&[a]), cloakkchain_lib::poseidon_hash(&pad_outputs(&[a])));
+
+        let mut w = world();
+        let mut alice = w.alice_spends(&w.bob_coin, 1);
+        let tx = Transaction {
+            id: 1,
+            output_commitments: vec![w.bob_coin.commitment()],
+            note_encs: vec![],
+            vpk: alice.vpk,
+            anchor: alice.pv.anchor.clone(),
+            spend_proof: vec![],
+        };
+        alice.entry = encrypt_tx(&tx, w.alice_coin.commitment(), &w.alice_sk, &[[9u8; 32]], [1u8; 32]);
+        assert_eq!(alice.entry.output_commitments.len(), 1);
+        let slot = w.history.append(&alice.entry);
+        let (witness, root) = w.witness_for(slot, &alice);
+        assert!(parent_checks_result(&witness, w.bob_coin.commitment(), root));
     }
 
     // ---- signatures ---------------------------------------------------------
