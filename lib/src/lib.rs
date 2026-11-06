@@ -235,7 +235,9 @@ pub fn signature_challenge(r: &OwnerPk, vpk: &OwnerPk, msg: Fr) -> Fr {
 /// `s` is posted as one scalar rather than as its two limbs: limbs are
 /// half-empty field elements, which would make carriers recognizable on the
 /// wire. Limbs exist only where `s` enters an `Fr`-native hash.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, CanonicalSerialize, CanonicalDeserialize)]
+///
+/// The all-zero default fills a history leaf's unused input slots.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, CanonicalSerialize, CanonicalDeserialize)]
 pub struct CoinSignature {
     #[serde(with = "field_serde")]
     pub c: Fr,
@@ -306,21 +308,30 @@ impl Coin {
     }
 }
 
-/// A generalised transaction: `S` spends one input coin and creates one or
-/// more output coins for (potentially different) recipients.
+/// Input coins a spend may consume. Fixed per deployment, since it sets the
+/// shape of every history leaf (see [`LeafOpening`]); the `two-inputs` feature
+/// raises it from 1 to 2. Every input needs its own serial number, signature
+/// and window, so each one costs the next spender a full set of parent checks.
+#[cfg(not(feature = "two-inputs"))]
+pub const MAX_INPUTS: usize = 1;
+#[cfg(feature = "two-inputs")]
+pub const MAX_INPUTS: usize = 2;
+
+/// A generalised transaction: `S` spends up to [`MAX_INPUTS`] input coins and
+/// creates one or more output coins for (potentially different) recipients.
 ///
 /// Only **commitments** appear in the transaction body. Sender and recipient
-/// identities are NOT stored — the sender is proven via the nullifier
-/// (published in the clear on `BoardEntry.nullifier`, not duplicated here)
+/// identities are NOT stored — the sender is proven via the nullifiers
+/// (published in the clear on `BoardEntry.nullifiers`, not duplicated here)
 /// and recipient ownership is encoded inside each coin commitment
 /// (`Poseidon(v, r, pk)`). Each output's coin data is encrypted in
 /// `note_encs[i]` per recipient.
 ///
-/// The input coin's commitment isn't stored here either: whoever builds this
-/// transaction already holds the real input `Coin`, so `encrypt_tx` takes it
-/// as a direct parameter instead of reading it back out of a stored field.
+/// The input coins' commitments aren't stored here either: whoever builds this
+/// transaction already holds the real input `Coin`s, so `encrypt_tx` takes them
+/// as a direct parameter instead of reading them back out of a stored field.
 ///
-/// `vpk` and `anchor` stay inside the ciphertext so that nothing posted
+/// `vpks` and `anchor` stay inside the ciphertext so that nothing posted
 /// can be matched against real roots or linked between spends — see
 /// `BoardEntry`. A recipient checks both in [`check_receipt`].
 ///
@@ -333,9 +344,9 @@ pub struct Transaction {
     pub output_commitments: Vec<Fr>,
     /// `note_encs[i]` = `encrypt(output_coin_i, pair_key(sender, recipient_i))`.
     pub note_encs: Vec<Vec<u8>>,
-    /// The input coin's per-coin key, see [`derive_coin_vpk`].
+    /// Each input coin's per-coin key, see [`derive_coin_vpk`], in input order.
     #[serde(with = "field_serde")]
-    pub vpk: OwnerPk,
+    pub vpks: Vec<OwnerPk>,
     /// The history state this transaction's proof is checked against.
     pub anchor: Anchor,
     pub spend_proof: Vec<u8>,
@@ -452,17 +463,19 @@ pub struct BoardEntry {
     /// `key_encs[i] = XOR(H(X25519(ek_sk, recipient_pk_i) || DH_SALT), session_key)`.
     /// Each is exactly 32 bytes, looks random. One per recipient.
     pub key_encs: Vec<[u8; 32]>,
-    /// The serial number, see [`derive_nullifier`] — looks random, used by the
-    /// nullifier accumulator. Copyable by anyone, so it never proves a spend
-    /// on its own.
+    /// One serial number per input coin, see [`derive_nullifier`] — each looks
+    /// random, and goes into the nullifier accumulator. Copyable by anyone, so
+    /// one never proves a spend on its own.
     #[serde(with = "field_serde")]
-    pub nullifier: Fr,
+    pub nullifiers: Vec<Fr>,
     /// `tx.output_commitments` — public, see the struct doc comment above.
     #[serde(with = "field_serde")]
     pub output_commitments: Vec<Fr>,
-    /// `σ` over `signature_message(nullifier, H(output_commitments),
-    /// entry_ciphertext_commitment(self))`, under the input coin's `vpk`.
-    pub signature: CoinSignature,
+    /// `signatures[i]` is `σ` over `signature_message(nullifiers[i],
+    /// H(output_commitments), entry_ciphertext_commitment(self))`, under input
+    /// `i`'s `vpk`. Each input signs separately because each input's copies
+    /// are judged under its own key.
+    pub signatures: Vec<CoinSignature>,
 }
 
 impl BoardEntry {
@@ -470,27 +483,50 @@ impl BoardEntry {
         poseidon_hash(&self.output_commitments)
     }
 
-    /// The message [`BoardEntry::signature`] must verify over.
-    pub fn signature_message(&self) -> Fr {
-        signature_message(self.nullifier, self.outputs_hash(), entry_ciphertext_commitment(self))
+    /// The message `signatures[i]` must verify over.
+    pub fn signature_message(&self, i: usize) -> Fr {
+        signature_message(self.nullifiers[i], self.outputs_hash(), entry_ciphertext_commitment(self))
     }
+
+    /// The inputs a wallet replays from this entry, whatever was posted: at
+    /// most [`MAX_INPUTS`], in order, and a missing signature reads as the
+    /// all-zero junk one. Total, since every host transaction gets replayed and
+    /// none may stall a wallet. Anything past `MAX_INPUTS` is simply not part
+    /// of the board.
+    pub fn posted_inputs(&self) -> Vec<PostedInput> {
+        self.nullifiers
+            .iter()
+            .take(MAX_INPUTS)
+            .enumerate()
+            .map(|(i, sn)| PostedInput { nullifier: *sn, signature: self.signatures.get(i).cloned().unwrap_or_default() })
+            .collect()
+    }
+}
+
+/// One input as it appears on the board: a serial number and the signature
+/// claiming it. Either can be anyone's junk.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, CanonicalSerialize, CanonicalDeserialize)]
+pub struct PostedInput {
+    #[serde(with = "field_serde")]
+    pub nullifier: Fr,
+    pub signature: CoinSignature,
 }
 
 /// Encrypt `tx` for the given `recipient_pks` (X25519 encryption keys — a
 /// separate keyspace from coin-ownership `OwnerPk`s) and `session_key`, then
 /// sign the result. Pass the same `session_key` when re-encrypting after
 /// attaching a spend proof — the deterministic `ek_sk` ensures `ek_pk` and
-/// `key_encs` are unchanged. The signature does change, since it covers the
+/// `key_encs` are unchanged. The signatures do change, since they cover the
 /// ciphertext; signing here, last, is what avoids any circularity with the
-/// proof inside it.
+/// proof inside it. One signature per input coin, under that coin's key.
 pub fn encrypt_tx(
     tx: &Transaction,
-    input_commitment: Fr,
+    input_commitments: &[Fr],
     sender_sk: &OwnerScalar,
     recipient_pks: &[[u8; 32]],
     session_key: [u8; 32],
 ) -> BoardEntry {
-    debug_assert_eq!(tx.vpk, derive_coin_vpk(sender_sk, input_commitment));
+    debug_assert!(input_commitments.iter().map(|cm| derive_coin_vpk(sender_sk, *cm)).eq(tx.vpks.iter().copied()));
 
     // Derive the ephemeral key from the session key (deterministic).
     let ek_sk = ek_secret(&session_key);
@@ -514,21 +550,25 @@ pub fn encrypt_tx(
         enc
     }).collect();
 
-    let nullifier = derive_nullifier(input_commitment, sender_sk);
-    let msg = signature_message(
-        nullifier,
-        poseidon_hash(&tx.output_commitments),
-        ciphertext_commitment(&ciphertext, &ek_pk, &key_encs),
-    );
-    let signature = sign_coin_message(&derive_coin_signing_key(sender_sk, input_commitment), msg);
+    let outputs_hash = poseidon_hash(&tx.output_commitments);
+    let ct_commitment = ciphertext_commitment(&ciphertext, &ek_pk, &key_encs);
+    let nullifiers: Vec<Fr> = input_commitments.iter().map(|cm| derive_nullifier(*cm, sender_sk)).collect();
+    let signatures = input_commitments
+        .iter()
+        .zip(&nullifiers)
+        .map(|(cm, sn)| {
+            let msg = signature_message(*sn, outputs_hash, ct_commitment);
+            sign_coin_message(&derive_coin_signing_key(sender_sk, *cm), msg)
+        })
+        .collect();
 
     BoardEntry {
         ciphertext,
         ek_pk,
         key_encs,
-        nullifier,
+        nullifiers,
         output_commitments: tx.output_commitments.clone(),
-        signature,
+        signatures,
     }
 }
 
@@ -623,11 +663,17 @@ pub fn decrypt_note(session_key: &[u8; 32], index: usize, note_enc: &[u8]) -> Op
 /// Maximum tree depth. Supports up to 2^32 ≈ 4 billion board entries.
 pub const TREE_DEPTH: usize = 32;
 
-/// The preimage of a history leaf `t`: `H(slot, ct_commitment, SN, H(O), σ,
-/// R_{t-1}, A_{t-1})`. Including the slot index prevents permuting entries
-/// while keeping a valid root. Including the preceding roots is what lets a
-/// later spend prove, against its own anchor, that a parent's claimed anchor
-/// is real and what the parent's window looked like.
+/// The preimage of a history leaf `t`: `H(slot, ct_commitment, H(O),
+/// (SN_i, σ_i) for i < MAX_INPUTS, R_{t-1}, A_{t-1})`, with unused input slots
+/// all zero. Including the slot index prevents permuting entries while keeping
+/// a valid root. Including the preceding roots is what lets a later spend
+/// prove, against its own anchor, that a parent's claimed anchor is real and
+/// what the parent's windows looked like.
+///
+/// A zero-padded slot hashes like a posted input `(0, σ = 0)`, so two entries
+/// can share a leaf. That's harmless: the leaf is still fixed by the board, and
+/// a spend reads a zero serial number as "no input here" (see `check_parent`),
+/// which no real coin can have.
 ///
 /// Every field is a native `Fr` value (or, for `ciphertext_commitment`, an
 /// opaque witness the circuit never expands), so `circuit-spend` mirrors
@@ -638,10 +684,9 @@ pub struct LeafOpening {
     #[serde(with = "field_serde")]
     pub ciphertext_commitment: Fr,
     #[serde(with = "field_serde")]
-    pub nullifier: Fr,
-    #[serde(with = "field_serde")]
     pub outputs_hash: Fr,
-    pub signature: CoinSignature,
+    /// [`BoardEntry::posted_inputs`]: at most `MAX_INPUTS`.
+    pub inputs: Vec<PostedInput>,
     #[serde(with = "field_serde")]
     pub prev_board_root: Fr,
     #[serde(with = "field_serde")]
@@ -653,41 +698,52 @@ impl LeafOpening {
         Self {
             slot: slot as u64,
             ciphertext_commitment: entry_ciphertext_commitment(entry),
-            nullifier: entry.nullifier,
             outputs_hash: entry.outputs_hash(),
-            signature: entry.signature.clone(),
+            inputs: entry.posted_inputs(),
             prev_board_root,
             prev_nullifier_root,
         }
     }
 
-    pub fn hash(&self) -> Fr {
-        let (s_lo, s_hi) = self.signature.s_limbs();
-        poseidon_hash(&[
-            Fr::from(self.slot),
-            self.ciphertext_commitment,
-            self.nullifier,
-            self.outputs_hash,
-            self.signature.c,
-            s_lo,
-            s_hi,
-            self.prev_board_root,
-            self.prev_nullifier_root,
-        ])
+    /// Input slot `i`'s serial number, zero if unused.
+    pub fn nullifier(&self, i: usize) -> Fr {
+        self.inputs.get(i).map_or(Fr::from(0u64), |input| input.nullifier)
     }
 
-    /// This leaf's link in its nullifier's occurrence chain.
-    pub fn occurrence(&self) -> Occurrence {
+    /// The serial numbers of every input slot, zero-padded to `MAX_INPUTS`.
+    pub fn nullifiers(&self) -> [Fr; MAX_INPUTS] {
+        std::array::from_fn(|i| self.nullifier(i))
+    }
+
+    pub fn hash(&self) -> Fr {
+        let mut preimage = vec![Fr::from(self.slot), self.ciphertext_commitment, self.outputs_hash];
+        for i in 0..MAX_INPUTS {
+            let signature = self.inputs.get(i).map(|input| input.signature.clone()).unwrap_or_default();
+            let (s_lo, s_hi) = signature.s_limbs();
+            preimage.extend([self.nullifier(i), signature.c, s_lo, s_hi]);
+        }
+        preimage.extend([self.prev_board_root, self.prev_nullifier_root]);
+        poseidon_hash(&preimage)
+    }
+
+    /// Input `i`'s link in its serial number's occurrence chain.
+    pub fn occurrence(&self, i: usize) -> Occurrence {
         Occurrence {
             outputs_hash: self.outputs_hash,
             ciphertext_commitment: self.ciphertext_commitment,
-            signature: self.signature.clone(),
+            signature: self.inputs[i].signature.clone(),
         }
     }
 
-    /// Does `σ` verify as this entry's signature under `vpk`?
-    pub fn signature_valid(&self, vpk: &OwnerPk) -> bool {
-        self.occurrence().signature_valid(self.nullifier, vpk)
+    /// The links this entry adds to `nullifier`'s chain, one per input posting
+    /// it, in order.
+    pub fn occurrences_of(&self, nullifier: Fr) -> impl Iterator<Item = Occurrence> + '_ {
+        (0..self.inputs.len()).filter(move |&i| self.inputs[i].nullifier == nullifier).map(|i| self.occurrence(i))
+    }
+
+    /// Does input `i`'s `σ` verify as this entry's signature under `vpk`?
+    pub fn signature_valid(&self, i: usize, vpk: &OwnerPk) -> bool {
+        self.occurrence(i).signature_valid(self.inputs[i].nullifier, vpk)
     }
 }
 
@@ -1134,6 +1190,13 @@ impl Default for NullifierTree {
     }
 }
 
+/// Replay one leaf's inputs into the accumulator, in input order.
+fn insert_inputs(tree: &mut NullifierTree, opening: &LeafOpening) {
+    for i in 0..opening.inputs.len() {
+        tree.insert(opening.inputs[i].nullifier, &opening.occurrence(i));
+    }
+}
+
 // ---- History ------------------------------------------------------------------
 
 /// A state of the history that a spend proof is checked against. `size` counts
@@ -1194,8 +1257,13 @@ impl History {
         let opening = LeafOpening::new(slot, entry, self.board.root(), self.occurrences.root());
         let leaf = opening.hash();
         self.board.set_leaf(slot, leaf);
-        self.occurrences.insert(entry.nullifier, &opening.occurrence());
-        self.slots_by_nullifier.entry(entry.nullifier).or_default().push(slot);
+        insert_inputs(&mut self.occurrences, &opening);
+        for input in &opening.inputs {
+            let slots = self.slots_by_nullifier.entry(input.nullifier).or_default();
+            if slots.last() != Some(&slot) {
+                slots.push(slot);
+            }
+        }
         self.openings.push(opening);
         self.leaves.push(leaf);
         self.board_roots.push(self.board.root());
@@ -1243,37 +1311,40 @@ impl History {
     pub fn nullifier_tree_at(&self, size: usize) -> NullifierTree {
         let mut tree = NullifierTree::new();
         for opening in &self.openings[..size] {
-            tree.insert(opening.nullifier, &opening.occurrence());
+            insert_inputs(&mut tree, opening);
         }
         tree
     }
 
-    /// Occurrences of `nullifier` at slots in `from_size..before_slot`.
-    pub fn occurrences_between(&self, nullifier: Fr, from_size: usize, before_slot: usize) -> Vec<&LeafOpening> {
+    /// Occurrences of `nullifier` at slots in `from_size..before_slot`, oldest
+    /// first.
+    pub fn occurrences_between(&self, nullifier: Fr, from_size: usize, before_slot: usize) -> Vec<Occurrence> {
         self.slots_by_nullifier
             .get(&nullifier)
             .into_iter()
             .flatten()
             .filter(|&&slot| from_size <= slot && slot < before_slot)
-            .map(|&slot| &self.openings[slot])
+            .flat_map(|&slot| self.openings[slot].occurrences_of(nullifier))
             .collect()
     }
 
     /// Everything a spend anchored at `size` needs to show about the parent
-    /// entry at `parent_slot` — see [`ParentWitness`].
+    /// entry at `parent_slot`, whose inputs have keys `vpks` — see
+    /// [`ParentWitness`].
     pub fn parent_witness(
         &self,
         parent_slot: usize,
         public_values: &SpendPublicValues,
-        vpk: &OwnerPk,
+        vpks: &[OwnerPk],
         size: usize,
     ) -> ParentWitness {
         let leaf = self.openings[parent_slot].clone();
         let anchor_slot = public_values.anchor.size as usize;
+        let before = self.nullifier_tree_at(parent_slot);
         ParentWitness {
             public_values: public_values.clone(),
-            vpk: *vpk,
-            window: self.nullifier_tree_at(parent_slot).prove_window(leaf.nullifier),
+            vpks: vpks.to_vec(),
+            windows: leaf.inputs.iter().map(|input| before.prove_window(input.nullifier)).collect(),
             leaf,
             leaf_path: self.board_path(parent_slot, size),
             anchor_leaf: self.openings[anchor_slot].clone(),
@@ -1302,20 +1373,23 @@ impl Default for History {
 /// next spender verifies this proof recursively and checks its input coin is
 /// listed here — establishing a cryptographic chain of custody.
 ///
-/// The spender's public key is intentionally NOT included. `nullifier`
+/// The spender's public key is intentionally NOT included. A nullifier
 /// reveals nothing about spender identity: it's a one-way hash, useful only for
-/// equality-checking. `vpk_hash` is what ties `vsk` to the coin, so a spender
-/// can't hand a recipient a fake `vpk` under which their double-spend would
-/// pass for junk.
+/// equality-checking. `vpk_hashes` are what tie each `vsk` to its coin, so a
+/// spender can't hand a recipient a fake `vpk` under which their double-spend
+/// would pass for junk.
+///
+/// `nullifiers` and `vpk_hashes` list the real inputs only, one each, in input
+/// order; proofs pad them with zeros.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, CanonicalSerialize, CanonicalDeserialize)]
 pub struct SpendPublicValues {
     #[serde(with = "field_serde")]
     pub output_commitments: Vec<Fr>,
     pub anchor: Anchor,
     #[serde(with = "field_serde")]
-    pub nullifier: Fr,
+    pub nullifiers: Vec<Fr>,
     #[serde(with = "field_serde")]
-    pub vpk_hash: Fr,
+    pub vpk_hashes: Vec<Fr>,
 }
 
 impl SpendPublicValues {
@@ -1353,22 +1427,30 @@ pub fn check_receipt(
         return Err("anchor is not a real state preceding the carrier");
     }
 
+    if opening.inputs.is_empty() || tx.vpks.len() != opening.inputs.len() {
+        return Err("carrier must have one key per posted input");
+    }
+
     let public_values = SpendPublicValues {
         output_commitments: entry.output_commitments.clone(),
         anchor: tx.anchor.clone(),
-        nullifier: entry.nullifier,
-        vpk_hash: hash_vpk(&tx.vpk),
+        nullifiers: opening.inputs.iter().map(|input| input.nullifier).collect(),
+        vpk_hashes: tx.vpks.iter().map(hash_vpk).collect(),
     };
     if !verify_proof(&public_values, &tx.spend_proof) {
         return Err("spend proof does not verify");
     }
-    if !opening.signature_valid(&tx.vpk) {
-        return Err("carrier's signature does not verify under its vpk");
-    }
 
-    let window = history.occurrences_between(entry.nullifier, size, slot);
-    if window.iter().any(|o| !o.occurrence().is_harmless(entry.nullifier, &tx.vpk, opening.outputs_hash)) {
-        return Err("double-spend: a validly signed spend of different outputs came first");
+    // Every input must stand: one input's double-spend spoils the whole
+    // carrier, since its outputs count that input's value.
+    for (i, (input, vpk)) in opening.inputs.iter().zip(&tx.vpks).enumerate() {
+        if !opening.signature_valid(i, vpk) {
+            return Err("carrier's signature does not verify under its vpk");
+        }
+        let window = history.occurrences_between(input.nullifier, size, slot);
+        if window.iter().any(|o| !o.is_harmless(input.nullifier, vpk, opening.outputs_hash)) {
+            return Err("double-spend: a validly signed spend of different outputs came first");
+        }
     }
 
     Ok(public_values)
@@ -1383,8 +1465,9 @@ pub struct ParentWitness {
     /// The parent proof's public values. Stands in for its recursive
     /// verification, which is `circuit-spend`'s job.
     pub public_values: SpendPublicValues,
+    /// One per parent input, in input order.
     #[serde(with = "field_serde")]
-    pub vpk: OwnerPk,
+    pub vpks: Vec<OwnerPk>,
     pub leaf: LeafOpening,
     #[serde(with = "field_serde")]
     pub leaf_path: Vec<Fr>,
@@ -1393,41 +1476,49 @@ pub struct ParentWitness {
     pub anchor_leaf: LeafOpening,
     #[serde(with = "field_serde")]
     pub anchor_leaf_path: Vec<Fr>,
-    pub window: WindowWitness,
+    /// One per parent input: that serial number's window.
+    pub windows: Vec<WindowWitness>,
 }
 
 /// Checks every condition of the spend relation. `circuit-spend` is this same
 /// logic as a `ConstraintSynthesizer`; here it's the plain-Rust reference
 /// implementation used directly by tests and as the correctness oracle circuit
-/// tests are checked against. `parent` is `None` only for a genesis mint.
+/// tests are checked against. `parents` is empty only for a genesis mint, and
+/// otherwise has one entry per input coin.
 ///
-/// `nonmembership` proves the coin's nullifier is absent at `anchor`.
+/// `nonmemberships[i]` proves input `i`'s nullifier is absent at `anchor`.
 /// `anchor` itself is checked by whoever verifies the result, since only they
 /// can compare it against the history they replayed: the recipient in
 /// [`check_receipt`], the next spender through [`ParentWitness::anchor_leaf`].
-///
-/// One input per spend, matching `BoardEntry`'s single nullifier and signature.
 pub fn check_spend(
     sk: &OwnerScalar,
-    input_coin: &Coin,
+    input_coins: &[Coin],
     output_coins: &[Coin],
     output_commitments: &[Fr],
     anchor: &Anchor,
-    nonmembership: &NonMembershipWitness,
-    parent: Option<&ParentWitness>,
+    nonmemberships: &[NonMembershipWitness],
+    parents: &[ParentWitness],
 ) -> Result<SpendPublicValues, &'static str> {
+    if input_coins.is_empty() || input_coins.len() > MAX_INPUTS || nonmemberships.len() != input_coins.len() {
+        return Err("a spend has 1 to MAX_INPUTS inputs, each with a non-membership witness");
+    }
     let pk = derive_owner_pk(sk);
-    if input_coin.owner_pk != pk {
+    if input_coins.iter().any(|coin| coin.owner_pk != pk) {
         return Err("input coin's owner does not match the spender");
     }
 
-    let commitment = input_coin.commitment();
-    let nullifier = derive_nullifier(commitment, sk);
+    let commitments: Vec<Fr> = input_coins.iter().map(Coin::commitment).collect();
+    let nullifiers: Vec<Fr> = commitments.iter().map(|cm| derive_nullifier(*cm, sk)).collect();
+    // The same coin twice would count its value twice, and nothing else
+    // catches it: both copies are absent at the anchor.
+    if (1..nullifiers.len()).any(|k| nullifiers[..k].contains(&nullifiers[k])) {
+        return Err("a spend cannot consume the same coin twice");
+    }
 
     // Double-spend guard, uniform for genesis and non-genesis. This is also
     // what enforces the anchor rule: a later anchor can't pass once a copy of
     // this nullifier has landed.
-    if !verify_nonmembership(anchor.nullifier_root, nullifier, nonmembership) {
+    if nullifiers.iter().zip(nonmemberships).any(|(sn, w)| !verify_nonmembership(anchor.nullifier_root, *sn, w)) {
         return Err("nullifier is already present at this anchor");
     }
 
@@ -1447,23 +1538,30 @@ pub fn check_spend(
     }
 
     // Value conservation: Σ inputs == Σ outputs (no minting, no burning).
+    let total_in: u128 = input_coins.iter().map(|c| c.value as u128).sum();
     let total_out: u128 = output_coins.iter().map(|c| c.value as u128).sum();
-    if input_coin.value as u128 != total_out {
+    if total_in != total_out {
         return Err("transaction violates value conservation: sum(inputs) must equal sum(outputs)");
     }
 
-    match parent {
+    if parents.is_empty() {
         // Genesis creates coins from authority (PoW) — no parent required.
-        None if pk != genesis_pk() => return Err("only the genesis key may mint without provenance"),
-        None => {}
-        Some(parent) => check_parent(parent, commitment, anchor)?,
+        if pk != genesis_pk() {
+            return Err("only the genesis key may mint without provenance");
+        }
+    } else if parents.len() != input_coins.len() {
+        return Err("every input needs its own parent");
+    } else {
+        for (parent, commitment) in parents.iter().zip(&commitments) {
+            check_parent(parent, *commitment, anchor)?;
+        }
     }
 
     Ok(SpendPublicValues {
         output_commitments: output_commitments.to_vec(),
         anchor: anchor.clone(),
-        nullifier,
-        vpk_hash: hash_vpk(&derive_coin_vpk(sk, commitment)),
+        nullifiers,
+        vpk_hashes: commitments.iter().map(|cm| hash_vpk(&derive_coin_vpk(sk, *cm))).collect(),
     })
 }
 
@@ -1474,7 +1572,16 @@ fn check_parent(parent: &ParentWitness, commitment: Fr, anchor: &Anchor) -> Resu
     if compute_root_from_path(leaf.hash(), leaf.slot as usize, &parent.leaf_path) != anchor.board_root {
         return Err("parent entry is not in this spend's anchor state");
     }
-    if pv.nullifier != leaf.nullifier || poseidon_hash(&pv.output_commitments) != leaf.outputs_hash {
+    // Every input slot, not only the first: otherwise the leaf would bind one
+    // input and the others could be double-spent unnoticed. Compared padded,
+    // as the circuit sees them.
+    let padded = |real: &[Fr]| -> Option<[Fr; MAX_INPUTS]> {
+        let mut out = [Fr::from(0u64); MAX_INPUTS];
+        out.get_mut(..real.len())?.copy_from_slice(real);
+        Some(out)
+    };
+    if padded(&pv.nullifiers) != Some(leaf.nullifiers()) || poseidon_hash(&pv.output_commitments) != leaf.outputs_hash
+    {
         return Err("parent proof disagrees with the parent entry");
     }
     if !pv.output_commitments.contains(&commitment) {
@@ -1499,17 +1606,23 @@ fn check_parent(parent: &ParentWitness, commitment: Fr, anchor: &Anchor) -> Resu
         return Err("parent's anchor is not a real state preceding it");
     }
 
-    // Without this binding a dishonest parent could post a broken signature so
-    // that its spend looks like junk, then double-spend the coin.
-    if hash_vpk(&parent.vpk) != pv.vpk_hash {
-        return Err("parent's vpk does not match its proof");
-    }
-    if !leaf.signature_valid(&parent.vpk) {
-        return Err("parent's signature does not verify");
-    }
-
-    if !check_window(leaf.prev_nullifier_root, leaf.nullifier, &parent.vpk, leaf.outputs_hash, &parent.window) {
-        return Err("parent's window is not clean");
+    // Each of the parent's inputs must stand, as in `check_receipt`. A zero
+    // serial number marks an unused slot: no real coin has one.
+    for i in (0..leaf.inputs.len()).filter(|&i| leaf.inputs[i].nullifier != Fr::from(0u64)) {
+        let (Some(vpk), Some(window)) = (parent.vpks.get(i), parent.windows.get(i)) else {
+            return Err("parent witness needs one key and one window per parent input");
+        };
+        // Without this binding a dishonest parent could post a broken signature
+        // so that its spend looks like junk, then double-spend the coin.
+        if pv.vpk_hashes.get(i) != Some(&hash_vpk(vpk)) {
+            return Err("parent's vpk does not match its proof");
+        }
+        if !leaf.signature_valid(i, vpk) {
+            return Err("parent's signature does not verify");
+        }
+        if !check_window(leaf.prev_nullifier_root, leaf.inputs[i].nullifier, vpk, leaf.outputs_hash, window) {
+            return Err("parent's window is not clean");
+        }
     }
     Ok(())
 }
@@ -1566,13 +1679,27 @@ mod tests {
         parent: Option<&ParentWitness>,
         id: u64,
     ) -> Result<Spend, &'static str> {
+        let parents: Vec<ParentWitness> = parent.into_iter().cloned().collect();
+        spend_inputs(history, sk, std::slice::from_ref(input), outputs, anchor_size, &parents, id)
+    }
+
+    /// [`spend`] of several input coins, one parent each (none for genesis).
+    fn spend_inputs(
+        history: &History,
+        sk: OwnerScalar,
+        inputs: &[Coin],
+        outputs: &[Coin],
+        anchor_size: usize,
+        parents: &[ParentWitness],
+        id: u64,
+    ) -> Result<Spend, &'static str> {
         let anchor = history.anchor_at(anchor_size).unwrap();
-        let commitment = input.commitment();
-        let nonmembership = history
-            .nullifier_tree_at(anchor_size)
-            .prove_non_membership(derive_nullifier(commitment, &sk));
+        let commitments: Vec<Fr> = inputs.iter().map(Coin::commitment).collect();
+        let tree = history.nullifier_tree_at(anchor_size);
+        let nonmemberships: Vec<NonMembershipWitness> =
+            commitments.iter().map(|cm| tree.prove_non_membership(derive_nullifier(*cm, &sk))).collect();
         let output_commitments: Vec<Fr> = outputs.iter().map(Coin::commitment).collect();
-        let pv = check_spend(&sk, input, outputs, &output_commitments, &anchor, &nonmembership, parent)?;
+        let pv = check_spend(&sk, inputs, outputs, &output_commitments, &anchor, &nonmemberships, parents)?;
 
         let session_key = {
             let mut h = Sha256::new();
@@ -1586,11 +1713,11 @@ mod tests {
             id,
             note_encs: outputs.iter().enumerate().map(|(i, c)| build_note_enc(&session_key, i, c)).collect(),
             output_commitments,
-            vpk: derive_coin_vpk(&sk, commitment),
+            vpks: commitments.iter().map(|cm| derive_coin_vpk(&sk, *cm)).collect(),
             anchor,
             spend_proof: pv.encode(),
         };
-        let entry = encrypt_tx(&tx, commitment, &sk, &[enc_party(9).1], session_key);
+        let entry = encrypt_tx(&tx, &commitments, &sk, &[enc_party(9).1], session_key);
         Ok(Spend { entry, tx, pv })
     }
 
@@ -1601,9 +1728,9 @@ mod tests {
             ciphertext: vec![seed; 40],
             ek_pk: [seed; 32],
             key_encs: vec![[seed; 32]],
-            nullifier,
+            nullifiers: vec![nullifier],
             output_commitments: vec![Fr::from(seed as u64)],
-            signature: CoinSignature { c: Fr::from(seed as u64), s: OwnerScalar::from(seed as u64) },
+            signatures: vec![CoinSignature { c: Fr::from(seed as u64), s: OwnerScalar::from(seed as u64) }],
         }
     }
 
@@ -1639,7 +1766,7 @@ mod tests {
 
     impl World {
         fn parent_is_genesis(&self, anchor_size: usize) -> ParentWitness {
-            self.history.parent_witness(0, &self.genesis.pv, &self.genesis.tx.vpk, anchor_size)
+            self.history.parent_witness(0, &self.genesis.pv, &self.genesis.tx.vpks, anchor_size)
         }
 
         /// Alice spends her coin to `output`, anchored at `anchor_size`.
@@ -1661,7 +1788,7 @@ mod tests {
         fn bob_spends_onward(&self, slot: usize, carrier: &Spend) -> Result<Spend, &'static str> {
             let (bob_sk, _) = owner_party(2);
             let size = self.history.len();
-            let parent = self.history.parent_witness(slot, &carrier.pv, &carrier.tx.vpk, size);
+            let parent = self.history.parent_witness(slot, &carrier.pv, &carrier.tx.vpks, size);
             spend(&self.history, bob_sk, &self.bob_coin, std::slice::from_ref(&self.carol_coin), size, Some(&parent), 100)
         }
     }
@@ -1733,14 +1860,14 @@ mod tests {
     fn signature_covers_nullifier_outputs_and_ciphertext() {
         let w = world();
         let s = w.alice_spends(&w.bob_coin, 1, 1).unwrap();
-        assert!(verify_coin_signature(&s.tx.vpk, s.entry.signature_message(), &s.entry.signature));
+        assert!(verify_coin_signature(&s.tx.vpks[0], s.entry.signature_message(0), &s.entry.signatures[0]));
 
         let tampered = |edit: &dyn Fn(&mut BoardEntry)| {
             let mut e = s.entry.clone();
             edit(&mut e);
-            verify_coin_signature(&s.tx.vpk, e.signature_message(), &e.signature)
+            verify_coin_signature(&s.tx.vpks[0], e.signature_message(0), &e.signatures[0])
         };
-        assert!(!tampered(&|e| e.nullifier += Fr::from(1u64)));
+        assert!(!tampered(&|e| e.nullifiers[0] += Fr::from(1u64)));
         assert!(!tampered(&|e| e.output_commitments[0] += Fr::from(1u64)));
         assert!(!tampered(&|e| e.ciphertext[0] ^= 1));
         assert!(!tampered(&|e| e.ek_pk[0] ^= 1));
@@ -1761,11 +1888,11 @@ mod tests {
             x.serialize_compressed(&mut out).unwrap();
             out
         };
-        assert!(contains(fr_bytes(s.entry.nullifier)), "sanity: the encoding under test is the right one");
+        assert!(contains(fr_bytes(s.entry.nullifiers[0])), "sanity: the encoding under test is the right one");
         assert!(!contains(fr_bytes(opening.prev_board_root)));
         assert!(!contains(fr_bytes(opening.prev_nullifier_root)));
-        assert!(!contains(fr_bytes(hash_vpk(&s.tx.vpk))));
-        let (vx, _) = owner_pk_to_field_pair(&s.tx.vpk);
+        assert!(!contains(fr_bytes(hash_vpk(&s.tx.vpks[0]))));
+        let (vx, _) = owner_pk_to_field_pair(&s.tx.vpks[0]);
         assert!(!contains(fr_bytes(vx)));
     }
 
@@ -1858,9 +1985,9 @@ mod tests {
             ciphertext: vec![],
             ek_pk: [0; 32],
             key_encs: vec![],
-            nullifier,
+            nullifiers: vec![nullifier],
             output_commitments: vec![],
-            signature: CoinSignature { c: Fr::from(0u64), s: OwnerScalar::from(0u64) },
+            signatures: vec![CoinSignature { c: Fr::from(0u64), s: OwnerScalar::from(0u64) }],
         };
         let sentinel_low = Fr::from(0u64);
         let sentinel_high = max_nullifier();
@@ -1868,6 +1995,14 @@ mod tests {
         for nullifier in [sentinel_low, sentinel_high, sentinel_low, sentinel_high, Fr::from(5u64)] {
             history.append(&empty(nullifier));
         }
+        // Malformed shapes: no inputs, missing signatures, too many inputs.
+        let mut odd = empty(Fr::from(7u64));
+        odd.nullifiers = vec![];
+        history.append(&odd);
+        odd.nullifiers = vec![Fr::from(8u64); MAX_INPUTS + 2];
+        odd.signatures = vec![];
+        history.append(&odd);
+        assert_eq!(history.opening(history.len() - 1).unwrap().inputs.len(), MAX_INPUTS);
 
         let tree = history.nullifier_tree_at(history.len());
         assert_eq!(tree.root(), history.anchor_at(history.len()).unwrap().nullifier_root);
@@ -1881,8 +2016,8 @@ mod tests {
     #[test]
     fn duplicate_insert_extends_the_chain_and_moves_the_root() {
         let sn = Fr::from(5u64);
-        let first = LeafOpening::new(0, &junk_copy(sn, 1), Fr::from(0u64), Fr::from(0u64)).occurrence();
-        let second = LeafOpening::new(0, &junk_copy(sn, 2), Fr::from(0u64), Fr::from(0u64)).occurrence();
+        let first = LeafOpening::new(0, &junk_copy(sn, 1), Fr::from(0u64), Fr::from(0u64)).occurrence(0);
+        let second = LeafOpening::new(0, &junk_copy(sn, 2), Fr::from(0u64), Fr::from(0u64)).occurrence(0);
 
         let mut tree = NullifierTree::new();
         let empty = tree.root();
@@ -1916,7 +2051,7 @@ mod tests {
     #[test]
     fn inserting_a_neighbour_keeps_a_chain_openable() {
         let sn = Fr::from(5u64);
-        let occ = LeafOpening::new(0, &junk_copy(sn, 1), Fr::from(0u64), Fr::from(0u64)).occurrence();
+        let occ = LeafOpening::new(0, &junk_copy(sn, 1), Fr::from(0u64), Fr::from(0u64)).occurrence(0);
         let mut tree = NullifierTree::new();
         tree.insert(sn, &occ);
         // Lands right after `sn`, making `sn`'s leaf the low leaf that gets
@@ -2050,7 +2185,7 @@ mod tests {
         // A recipient ignoring the rejection still can't spend onward.
         let (carol_sk, _) = owner_party(3);
         let size = w.history.len();
-        let parent = w.history.parent_witness(carol_slot, &to_carol.pv, &to_carol.tx.vpk, size);
+        let parent = w.history.parent_witness(carol_slot, &to_carol.pv, &to_carol.tx.vpks, size);
         let err = spend(&w.history, carol_sk, &w.carol_coin, &[coin(0xD1, 100, owner_party(4).1)], size, Some(&parent), 3);
         assert_eq!(err.err(), Some("parent's window is not clean"));
     }
@@ -2073,7 +2208,7 @@ mod tests {
     fn invalid_parent_signature_is_rejected() {
         let mut w = world();
         let mut alice = w.alice_spends(&w.bob_coin, 1, 1).unwrap();
-        alice.entry.signature = CoinSignature { c: Fr::from(1u64), s: OwnerScalar::from(1u64) };
+        alice.entry.signatures[0] = CoinSignature { c: Fr::from(1u64), s: OwnerScalar::from(1u64) };
         let slot = w.history.append(&alice.entry);
 
         assert_eq!(
@@ -2092,7 +2227,7 @@ mod tests {
         let fake_vpk = owner_party(7).1;
 
         let mut lying_tx = alice.tx.clone();
-        lying_tx.vpk = fake_vpk;
+        lying_tx.vpks = vec![fake_vpk];
         assert_eq!(
             check_receipt(&w.history, slot, &alice.entry, &lying_tx, proof_ok).err(),
             Some("spend proof does not verify"),
@@ -2100,8 +2235,8 @@ mod tests {
 
         let (bob_sk, _) = owner_party(2);
         let size = w.history.len();
-        let mut parent = w.history.parent_witness(slot, &alice.pv, &alice.tx.vpk, size);
-        parent.vpk = fake_vpk;
+        let mut parent = w.history.parent_witness(slot, &alice.pv, &alice.tx.vpks, size);
+        parent.vpks = vec![fake_vpk];
         let err = spend(&w.history, bob_sk, &w.bob_coin, &[w.carol_coin.clone()], size, Some(&parent), 3);
         assert_eq!(err.err(), Some("parent's vpk does not match its proof"));
     }
@@ -2147,18 +2282,18 @@ mod tests {
         let onward = |parent: &ParentWitness| {
             spend(&w.history, bob_sk, &w.bob_coin, &[w.carol_coin.clone()], size, Some(parent), 3).err()
         };
-        let parent = w.history.parent_witness(slot, &alice.pv, &alice.tx.vpk, size);
+        let parent = w.history.parent_witness(slot, &alice.pv, &alice.tx.vpks, size);
         assert_eq!(onward(&parent), None);
 
         // Hiding the copy: claim an empty window using the pre-copy tree.
         let mut hiding = parent.clone();
-        hiding.window = w.history.nullifier_tree_at(1).prove_window(w.alice_nullifier());
+        hiding.windows[0] = w.history.nullifier_tree_at(1).prove_window(w.alice_nullifier());
         assert_eq!(onward(&hiding), Some("parent's window is not clean"));
 
         // Dropping the copy from the opened chain.
         let mut dropping = parent;
-        assert!(!dropping.window.occurrences.is_empty());
-        dropping.window.occurrences.clear();
+        assert!(!dropping.windows[0].occurrences.is_empty());
+        dropping.windows[0].occurrences.clear();
         assert_eq!(onward(&dropping), Some("parent's window is not clean"));
     }
 
@@ -2174,12 +2309,12 @@ mod tests {
         };
 
         // The parent's proof claims a nullifier root that never existed.
-        let mut fake_root = w.history.parent_witness(slot, &alice.pv, &alice.tx.vpk, size);
+        let mut fake_root = w.history.parent_witness(slot, &alice.pv, &alice.tx.vpks, size);
         fake_root.public_values.anchor.nullifier_root += Fr::from(1u64);
         assert_eq!(onward(&fake_root), Some("parent's anchor is not a real state preceding it"));
 
         // A real leaf, but the wrong one for the claimed anchor.
-        let mut wrong_leaf = w.history.parent_witness(slot, &alice.pv, &alice.tx.vpk, size);
+        let mut wrong_leaf = w.history.parent_witness(slot, &alice.pv, &alice.tx.vpks, size);
         wrong_leaf.anchor_leaf = w.history.opening(0).unwrap().clone();
         wrong_leaf.anchor_leaf_path = w.history.board_path(0, size);
         assert_eq!(onward(&wrong_leaf), Some("parent's anchor is not a real state preceding it"));
@@ -2189,7 +2324,7 @@ mod tests {
         let later = junk_copy(Fr::from(5u64), 1);
         w.history.append(&later);
         let size = w.history.len();
-        let mut parent = w.history.parent_witness(slot, &alice.pv, &alice.tx.vpk, size);
+        let mut parent = w.history.parent_witness(slot, &alice.pv, &alice.tx.vpks, size);
         parent.public_values.anchor = w.history.anchor_at(2).unwrap();
         parent.anchor_leaf = w.history.opening(2).unwrap().clone();
         parent.anchor_leaf_path = w.history.board_path(2, size);
@@ -2206,12 +2341,12 @@ mod tests {
         let (bob_sk, _) = owner_party(2);
 
         // Anchored at a state from before the parent existed.
-        let parent = w.history.parent_witness(slot, &alice.pv, &alice.tx.vpk, size);
+        let parent = w.history.parent_witness(slot, &alice.pv, &alice.tx.vpks, size);
         let err = spend(&w.history, bob_sk, &w.bob_coin, &[w.carol_coin.clone()], slot, Some(&parent), 3);
         assert_eq!(err.err(), Some("parent entry is not in this spend's anchor state"));
 
         // A coin the parent never created.
-        let parent = w.history.parent_witness(slot, &alice.pv, &alice.tx.vpk, size);
+        let parent = w.history.parent_witness(slot, &alice.pv, &alice.tx.vpks, size);
         let phantom = coin(0xEE, 100, owner_party(2).1);
         let err = spend(&w.history, bob_sk, &phantom, &[w.carol_coin.clone()], size, Some(&parent), 3);
         assert_eq!(err.err(), Some("parent does not create the input coin"));
@@ -2286,16 +2421,189 @@ mod tests {
         let check = |padding: Fr| {
             check_spend(
                 &w.alice_sk,
-                &w.alice_coin,
+                std::slice::from_ref(&w.alice_coin),
                 std::slice::from_ref(&w.bob_coin),
                 &[w.bob_coin.commitment(), padding],
                 &anchor,
-                &nonmembership,
-                Some(&parent),
+                std::slice::from_ref(&nonmembership),
+                std::slice::from_ref(&parent),
             )
         };
         assert!(check(Fr::from(0u64)).is_ok());
         assert_eq!(check(commitment).err(), Some("unused output slots must hold a zero commitment"));
+    }
+
+    // ---- several inputs -------------------------------------------------------
+
+    /// Genesis mints a second coin to Alice at slot 1, so she holds two coins
+    /// from two different parents.
+    #[cfg(feature = "two-inputs")]
+    struct TwoCoins {
+        w: World,
+        second_mint: Spend,
+        second_coin: Coin,
+    }
+
+    #[cfg(feature = "two-inputs")]
+    impl TwoCoins {
+        fn new() -> Self {
+            let mut w = world();
+            let second_coin = coin(0xA3, 50, owner_party(1).1);
+            let second_mint =
+                spend(&w.history, genesis_sk(), &coin(0xA4, 50, genesis_pk()), &[second_coin.clone()], 1, None, 50)
+                    .unwrap();
+            w.history.append(&second_mint.entry);
+            Self { w, second_mint, second_coin }
+        }
+
+        fn second_nullifier(&self) -> Fr {
+            derive_nullifier(self.second_coin.commitment(), &self.w.alice_sk)
+        }
+
+        /// Alice spends both coins (150) to `output`, anchored at `anchor_size`.
+        fn alice_spends_both(&self, output: &Coin, anchor_size: usize, id: u64) -> Result<Spend, &'static str> {
+            let h = &self.w.history;
+            let parents = [
+                h.parent_witness(0, &self.w.genesis.pv, &self.w.genesis.tx.vpks, anchor_size),
+                h.parent_witness(1, &self.second_mint.pv, &self.second_mint.tx.vpks, anchor_size),
+            ];
+            let inputs = [self.w.alice_coin.clone(), self.second_coin.clone()];
+            spend_inputs(h, self.w.alice_sk, &inputs, std::slice::from_ref(output), anchor_size, &parents, id)
+        }
+
+        fn bob_coin(&self) -> Coin {
+            coin(0xB1, 150, owner_party(2).1)
+        }
+
+        /// Bob spends onward from the two-input carrier at `slot`.
+        fn bob_spends_onward(&self, slot: usize, carrier: &Spend) -> Result<Spend, &'static str> {
+            let size = self.w.history.len();
+            let parent = self.w.history.parent_witness(slot, &carrier.pv, &carrier.tx.vpks, size);
+            let to_carol = coin(0xC1, 150, owner_party(3).1);
+            spend(&self.w.history, owner_party(2).0, &self.bob_coin(), &[to_carol], size, Some(&parent), 100)
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "two-inputs")]
+    fn two_input_spend_is_valid_end_to_end() {
+        let mut t = TwoCoins::new();
+        let alice = t.alice_spends_both(&t.bob_coin(), 2, 1).unwrap();
+        assert_eq!(alice.entry.nullifiers.len(), 2);
+        assert_eq!(alice.entry.signatures.len(), 2);
+        let slot = t.w.history.append(&alice.entry);
+        assert_eq!(check_receipt(&t.w.history, slot, &alice.entry, &alice.tx, proof_ok).unwrap(), alice.pv);
+        let bob = t.bob_spends_onward(slot, &alice).unwrap();
+        let bob_slot = t.w.history.append(&bob.entry);
+        check_receipt(&t.w.history, bob_slot, &bob.entry, &bob.tx, proof_ok).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "two-inputs")]
+    fn the_same_coin_twice_is_rejected() {
+        let w = world();
+        let parent = w.parent_is_genesis(1);
+        let inputs = [w.alice_coin.clone(), w.alice_coin.clone()];
+        let err = spend_inputs(&w.history, w.alice_sk, &inputs, &[coin(0xB1, 200, owner_party(2).1)], 1, &[parent.clone(), parent], 1);
+        assert_eq!(err.err(), Some("a spend cannot consume the same coin twice"));
+    }
+
+    #[test]
+    #[cfg(feature = "two-inputs")]
+    fn every_input_needs_its_own_parent() {
+        let t = TwoCoins::new();
+        let h = &t.w.history;
+        let only_one = [h.parent_witness(0, &t.w.genesis.pv, &t.w.genesis.tx.vpks, 2)];
+        let inputs = [t.w.alice_coin.clone(), t.second_coin.clone()];
+        let err = spend_inputs(h, t.w.alice_sk, &inputs, &[t.bob_coin()], 2, &only_one, 1);
+        assert_eq!(err.err(), Some("every input needs its own parent"));
+    }
+
+    /// A double-spend of the *second* input must spoil the carrier as surely as
+    /// one of the first: its outputs count both inputs' value.
+    #[test]
+    #[cfg(feature = "two-inputs")]
+    fn double_spend_of_the_second_input_is_caught() {
+        let mut t = TwoCoins::new();
+        // Both proved at anchor 2, so both pass non-membership.
+        let both = t.alice_spends_both(&t.bob_coin(), 2, 1).unwrap();
+        let parent = t.w.history.parent_witness(1, &t.second_mint.pv, &t.second_mint.tx.vpks, 2);
+        let second_alone =
+            spend(&t.w.history, t.w.alice_sk, &t.second_coin, &[coin(0xC2, 50, owner_party(3).1)], 2, Some(&parent), 2)
+                .unwrap();
+        t.w.history.append(&second_alone.entry);
+        let slot = t.w.history.append(&both.entry);
+
+        assert_eq!(
+            check_receipt(&t.w.history, slot, &both.entry, &both.tx, proof_ok).err(),
+            Some("double-spend: a validly signed spend of different outputs came first"),
+        );
+        assert_eq!(t.bob_spends_onward(slot, &both).err(), Some("parent's window is not clean"));
+    }
+
+    #[test]
+    #[cfg(feature = "two-inputs")]
+    fn copies_of_the_second_inputs_serial_number_are_ignored() {
+        let mut t = TwoCoins::new();
+        let alice = t.alice_spends_both(&t.bob_coin(), 2, 1).unwrap();
+        for seed in 0..3 {
+            t.w.history.append(&junk_copy(t.second_nullifier(), seed + 1));
+        }
+        let slot = t.w.history.append(&alice.entry);
+        check_receipt(&t.w.history, slot, &alice.entry, &alice.tx, proof_ok).unwrap();
+        let bob = t.bob_spends_onward(slot, &alice).unwrap();
+        let bob_slot = t.w.history.append(&bob.entry);
+        check_receipt(&t.w.history, bob_slot, &bob.entry, &bob.tx, proof_ok).unwrap();
+    }
+
+    /// A copy that reposts only the first input, verbatim, with the real
+    /// ciphertext and outputs: harmless as a copy, and useless as a parent,
+    /// since the leaf no longer matches the proof's serial numbers.
+    #[test]
+    #[cfg(feature = "two-inputs")]
+    fn a_carrier_with_an_input_dropped_is_no_parent() {
+        let mut t = TwoCoins::new();
+        let alice = t.alice_spends_both(&t.bob_coin(), 2, 1).unwrap();
+        let mut truncated = alice.entry.clone();
+        truncated.nullifiers.truncate(1);
+        truncated.signatures.truncate(1);
+        let copy_slot = t.w.history.append(&truncated);
+        let slot = t.w.history.append(&alice.entry);
+
+        assert_eq!(
+            check_receipt(&t.w.history, copy_slot, &truncated, &alice.tx, proof_ok).err(),
+            Some("carrier must have one key per posted input"),
+        );
+        assert_eq!(t.bob_spends_onward(copy_slot, &alice).err(), Some("parent proof disagrees with the parent entry"));
+        check_receipt(&t.w.history, slot, &alice.entry, &alice.tx, proof_ok).unwrap();
+        t.bob_spends_onward(slot, &alice).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "two-inputs")]
+    fn parent_witness_must_cover_every_parent_input() {
+        let mut t = TwoCoins::new();
+        let alice = t.alice_spends_both(&t.bob_coin(), 2, 1).unwrap();
+        let slot = t.w.history.append(&alice.entry);
+        let size = t.w.history.len();
+        let onward = |parent: &ParentWitness| {
+            let to_carol = coin(0xC1, 150, owner_party(3).1);
+            spend(&t.w.history, owner_party(2).0, &t.bob_coin(), &[to_carol], size, Some(parent), 3).err()
+        };
+        let parent = t.w.history.parent_witness(slot, &alice.pv, &alice.tx.vpks, size);
+
+        let mut one_key = parent.clone();
+        one_key.vpks.truncate(1);
+        assert_eq!(onward(&one_key), Some("parent witness needs one key and one window per parent input"));
+
+        let mut swapped = parent.clone();
+        swapped.vpks.swap(0, 1);
+        assert_eq!(onward(&swapped), Some("parent's vpk does not match its proof"));
+
+        // A proof claiming only the first input can't stand for this entry.
+        let mut one_input = parent;
+        one_input.public_values.nullifiers.truncate(1);
+        assert_eq!(onward(&one_input), Some("parent proof disagrees with the parent entry"));
     }
 
     #[test]
@@ -2325,7 +2633,7 @@ mod tests {
         fn value(i: u32) -> Fr {
             Fr::from(i as u64 + 1) // keep every value > 0, avoiding the sentinel edge case
         }
-        let occ = LeafOpening::new(0, &junk_copy(value(0), 1), Fr::from(0u64), Fr::from(0u64)).occurrence();
+        let occ = LeafOpening::new(0, &junk_copy(value(0), 1), Fr::from(0u64), Fr::from(0u64)).occurrence(0);
 
         let mut tree = NullifierTree::new();
         let batch = 500u32;

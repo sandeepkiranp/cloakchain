@@ -17,3 +17,8 @@ ark-serialize = { workspace = true }
 ark-crypto-primitives = { workspace = true, features = ["sponge"] }
 ark-mnt4-753 = { workspace = true, features = ["curve"] }
 ark-mnt6-753 = { workspace = true }
+
+[features]
+# Spends of up to two input coins instead of one. Fixes the history leaf's
+# shape, so every wallet and circuit in a deployment must agree on it.
+two-inputs = []

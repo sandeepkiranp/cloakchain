@@ -62,8 +62,8 @@ use cloakkchain_circuit_spend::{
 use cloakkchain_circuit_wrap::{inner_vk_hash, WrapCircuit};
 use cloakkchain_lib::{
     check_receipt, derive_coin_vpk, derive_enc_pk, derive_nullifier, derive_owner_pk, encrypt_tx, genesis_pk,
-    genesis_sk, scan_entry, Anchor, BoardEntry, Coin, CoinSignature, Fr, History, OwnerPk, OwnerScalar,
-    Transaction, EK_SALT,
+    genesis_sk, scan_entry, Anchor, BoardEntry, Coin, CoinSignature, Fr, History, NonMembershipWitness, OwnerPk,
+    OwnerScalar, Transaction, EK_SALT,
 };
 
 // ---- CLI args ---------------------------------------------------------------
@@ -138,12 +138,12 @@ fn coin(seed: u8, value: u64, owner_pk: OwnerPk) -> Coin {
 
 /// Build a Transaction using X25519 note encryption derived from a
 /// per-transaction session key. Returns `(tx, session_key, recipient_enc_pks)`
-/// — pass to `encrypt_tx`, which signs the result. `vpk` and `anchor` go inside
-/// the ciphertext, never on the wire.
+/// — pass to `encrypt_tx`, which signs the result. `vpks` and `anchor` go
+/// inside the ciphertext, never on the wire.
 fn make_tx(
     id: u64,
     sender_enc_sk: [u8; 32],
-    vpk: OwnerPk,
+    vpks: Vec<OwnerPk>,
     anchor: Anchor,
     outputs: &[(Coin, [u8; 32])], // (coin, recipient's X25519 enc_pk)
 ) -> (Transaction, [u8; 32], Vec<[u8; 32]>) {
@@ -164,7 +164,7 @@ fn make_tx(
         .enumerate()
         .map(|(i, (c, _))| cloakkchain_lib::build_note_enc(&session_key, i, c))
         .collect();
-    let tx = Transaction { id, output_commitments, note_encs, vpk, anchor, spend_proof: vec![] };
+    let tx = Transaction { id, output_commitments, note_encs, vpks, anchor, spend_proof: vec![] };
     (tx, session_key, recipient_enc_pks)
 }
 
@@ -396,6 +396,7 @@ impl Keys {
             wrap_vk: wrap.clone(),
             previous: None,
             previous_proof: Some(SpendStepCircuit::dummy_wrap_proof()),
+            input: 0,
             vpk: None,
             occurrences: Vec::new(),
             vk_hash: None,
@@ -410,9 +411,9 @@ impl Keys {
             wrap_vk: wrap.clone(),
             genesis_vk_hash: genesis_hash,
             fold_vk_hash: fold_hash,
-            input_parent_proofs: [Some(SpendStepCircuit::dummy_wrap_proof())],
-            input_parent_statements: [None],
-            input_parents: [None],
+            input_parent_proofs: std::array::from_fn(|_| Some(SpendStepCircuit::dummy_wrap_proof())),
+            input_parent_statements: std::array::from_fn(|_| None),
+            input_parents: std::array::from_fn(|_| None),
         };
         record("SpendStepCircuit", count_constraints(&spend_shape), secs, mem);
 
@@ -602,7 +603,7 @@ fn run_execute(genesis: &Party, genesis_coin: &Coin, alice_coin: &Coin) {
 
     let history = History::new();
     let circuit = GenesisSpendCircuit {
-        core: core_witness(&history, genesis, genesis_coin, std::slice::from_ref(alice_coin), Fr::from(0u64)),
+        core: core_witness(&history, genesis, std::slice::from_ref(genesis_coin), std::slice::from_ref(alice_coin), Fr::from(0u64)),
     };
 
     let cs = ConstraintSystem::<Fr>::new_ref();
@@ -649,79 +650,85 @@ struct Parent<'a> {
 
 /// The spend relation's witness, anchored at `history`'s current state, for
 /// the circuit whose key hashes to `vk_hash`.
-fn core_witness(history: &History, sender: &Party, input: &Coin, outputs: &[Coin], vk_hash: Fr) -> SpendCoreWitness {
+fn core_witness(history: &History, sender: &Party, inputs: &[Coin], outputs: &[Coin], vk_hash: Fr) -> SpendCoreWitness {
     let size = history.len();
-    let nullifier = derive_nullifier(input.commitment(), &sender.sk_p);
+    let tree = history.nullifier_tree_at(size);
+    let nonmemberships: Vec<NonMembershipWitness> = inputs
+        .iter()
+        .map(|input| tree.prove_non_membership(derive_nullifier(input.commitment(), &sender.sk_p)))
+        .collect();
     SpendCoreWitness::new(
         sender.sk_p,
-        input.clone(),
+        inputs,
         outputs,
         history.anchor_at(size).expect("the current state exists"),
-        history.nullifier_tree_at(size).prove_non_membership(nullifier),
+        &nonmemberships,
         vk_hash,
     )
 }
 
 /// Prove `sender`'s spend at `history`'s current state and build its entry,
 /// without posting it: nothing here depends on where it ends up landing.
-/// `parent` is `None` for a genesis mint. Construction order matters: prove,
-/// encrypt the proof into the ciphertext, then sign last (inside `encrypt_tx`).
+/// `parents` has one entry per input, and is empty for a genesis mint.
+/// Construction order matters: prove, encrypt the proof into the ciphertext,
+/// then sign last (inside `encrypt_tx`).
 #[allow(clippy::too_many_arguments)]
 fn prove_spend(
     name: &str,
     keys: &Keys,
     history: &History,
     sender: &Party,
-    input: &Coin,
+    inputs: &[Coin],
     outputs: &[(Coin, [u8; 32])],
-    parent: Option<Parent>,
+    parents: &[Parent],
     stats: &mut Vec<ProveStats>,
 ) -> ProvenSpend {
     let output_coins: Vec<Coin> = outputs.iter().map(|(c, _)| c.clone()).collect();
-    let (vk, vk_hash) = match parent {
-        None => (&keys.genesis, keys.genesis_hash),
-        Some(_) => (&keys.spend, keys.spend_hash),
-    };
-    let core = core_witness(history, sender, input, &output_coins, vk_hash);
+    let genesis = parents.is_empty();
+    let (vk, vk_hash) = if genesis { (&keys.genesis, keys.genesis_hash) } else { (&keys.spend, keys.spend_hash) };
+    let core = core_witness(history, sender, inputs, &output_coins, vk_hash);
     let statement = StepStatement::of_spend(core.public_values().expect("core_witness sets every public value"), vk_hash);
 
-    let (proof, prove_secs, peak_mem_kb, constraints) = match parent {
-        None => {
-            let circuit = GenesisSpendCircuit { core };
-            let (proof, secs, mem) = prove_subprocess::<_, MNT4_753>("genesis", &circuit);
-            (proof, secs, mem, count_constraints(&circuit))
-        }
-        Some(parent) => {
+    let (proof, prove_secs, peak_mem_kb, constraints) = if genesis {
+        let circuit = GenesisSpendCircuit { core };
+        let (proof, secs, mem) = prove_subprocess::<_, MNT4_753>("genesis", &circuit);
+        (proof, secs, mem, count_constraints(&circuit))
+    } else {
+        assert_eq!(parents.len(), inputs.len(), "one parent per input");
+        let witness = |parent: &Parent| {
             let created_by = &parent.spend.proven.statement.public_values;
-            let witness = history.parent_witness(parent.slot, created_by, &parent.spend.tx.vpk, history.len());
-            let circuit = SpendStepCircuit {
-                core,
-                wrap_vk: keys.wrap.clone(),
-                genesis_vk_hash: keys.genesis_hash,
-                fold_vk_hash: keys.fold_hash,
-                input_parent_proofs: [Some(parent.wrapped.proof.clone())],
-                input_parent_statements: [Some(parent.latest.statement.clone())],
-                input_parents: [Some(witness)],
-            };
-            let (proof, secs, mem) = prove_subprocess::<_, MNT4_753>("spend", &circuit);
-            (proof, secs, mem, count_constraints(&circuit))
-        }
+            history.parent_witness(parent.slot, created_by, &parent.spend.tx.vpks, history.len())
+        };
+        let circuit = SpendStepCircuit {
+            core,
+            wrap_vk: keys.wrap.clone(),
+            genesis_vk_hash: keys.genesis_hash,
+            fold_vk_hash: keys.fold_hash,
+            // An unused slot still needs a structurally valid proof.
+            input_parent_proofs: std::array::from_fn(|i| {
+                Some(parents.get(i).map_or_else(SpendStepCircuit::dummy_wrap_proof, |p| p.wrapped.proof.clone()))
+            }),
+            input_parent_statements: std::array::from_fn(|i| parents.get(i).map(|p| p.latest.statement.clone())),
+            input_parents: std::array::from_fn(|i| parents.get(i).map(witness)),
+        };
+        let (proof, secs, mem) = prove_subprocess::<_, MNT4_753>("spend", &circuit);
+        (proof, secs, mem, count_constraints(&circuit))
     };
     let t = Instant::now();
     assert!(cloakkchain_circuit_spend::verify(vk, &statement.public_inputs(), &proof).unwrap());
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
     println!("  Proved in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
 
-    let commitment = input.commitment();
+    let commitments: Vec<Fr> = inputs.iter().map(Coin::commitment).collect();
     let (mut tx, session_key, recipients) = make_tx(
         stats.len() as u64,
         sender.enc_sk,
-        derive_coin_vpk(&sender.sk_p, commitment),
+        commitments.iter().map(|cm| derive_coin_vpk(&sender.sk_p, *cm)).collect(),
         statement.public_values.anchor.clone(),
         outputs,
     );
     tx.spend_proof = ark_serialize_bytes(&proof);
-    let entry = encrypt_tx(&tx, commitment, &sender.sk_p, &recipients, session_key);
+    let entry = encrypt_tx(&tx, &commitments, &sender.sk_p, &recipients, session_key);
 
     stats.push(ProveStats {
         name: name.into(),
@@ -736,10 +743,11 @@ fn prove_spend(
     ProvenSpend { entry, tx, proven: Proven { statement, vk: vk.clone(), proof } }
 }
 
-/// Fold every occurrence in the window of `parent`'s entry into the statement of
-/// its spend proof, `FOLD_BATCH` at a time — one fold proof and one wrap per
-/// batch — as the next spender must before spending. Returns the last fold and
-/// its wrap, or the spend's own when the window is empty.
+/// Fold every occurrence in the windows of `parent`'s entry — one window per
+/// input it spent — into the statement of its spend proof, `FOLD_BATCH` at a
+/// time: one fold proof and one wrap per batch, as the next spender must before
+/// spending. Returns the last fold and its wrap, or the spend's own when every
+/// window is empty.
 fn fold_window(
     keys: &Keys,
     history: &History,
@@ -749,43 +757,48 @@ fn fold_window(
     stats: &mut Vec<ProveStats>,
 ) -> (Proven, WrappedSpend) {
     let created_by = &parent.proven.statement.public_values;
-    let window = history.parent_witness(slot, created_by, &parent.tx.vpk, history.len()).window;
+    let windows = history.parent_witness(slot, created_by, &parent.tx.vpks, history.len()).windows;
     let mut latest = parent.proven.clone();
     let mut wrapped = wrapped;
-    let mut folded = 0;
-    for batch in window.occurrences.chunks(FOLD_BATCH) {
-        let range = format!("{}-{}", folded + 1, folded + batch.len());
-        println!("  Folding occurrences {range} of {} into the spend's statement.", window.occurrences.len());
-        let circuit = FoldCircuit {
-            wrap_vk: keys.wrap.clone(),
-            previous: Some(latest.statement.clone()),
-            previous_proof: Some(wrapped.proof.clone()),
-            vpk: Some(parent.tx.vpk),
-            occurrences: batch.to_vec(),
-            vk_hash: Some(keys.fold_hash),
-        };
-        let statement = circuit.statement().expect("every field is set");
-        let constraints = count_constraints(&circuit);
-        let (proof, prove_secs, peak_mem_kb) = prove_subprocess::<_, MNT4_753>("fold", &circuit);
-        let t = Instant::now();
-        assert!(cloakkchain_circuit_spend::verify(&keys.fold, &statement.public_inputs(), &proof).unwrap());
-        let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-        println!("  Folded in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
-        stats.push(ProveStats {
-            name: format!("Fold copies {range}"),
-            board_size: history.len(),
-            constraints,
-            prove_secs,
-            verify_ms,
-            proof_bytes: ark_serialize_len(&proof),
-            entry_bytes: None,
-            peak_mem_kb,
-        });
-        latest = Proven { statement, vk: keys.fold.clone(), proof };
-        wrapped = wrap_spend(&format!("Wrap fold {range}"), keys, &latest, history, stats);
-        folded += batch.len();
+    for (input, window) in windows.iter().enumerate() {
+        let label = if windows.len() > 1 { format!(" of input {}", input + 1) } else { String::new() };
+        let mut folded = 0;
+        for batch in window.occurrences.chunks(FOLD_BATCH) {
+            let range = format!("{}-{}{label}", folded + 1, folded + batch.len());
+            println!("  Folding occurrences {range} of {} into the spend's statement.", window.occurrences.len());
+            let circuit = FoldCircuit {
+                wrap_vk: keys.wrap.clone(),
+                previous: Some(latest.statement.clone()),
+                previous_proof: Some(wrapped.proof.clone()),
+                input,
+                vpk: Some(parent.tx.vpks[input]),
+                occurrences: batch.to_vec(),
+                vk_hash: Some(keys.fold_hash),
+            };
+            let statement = circuit.statement().expect("every field is set");
+            let constraints = count_constraints(&circuit);
+            let (proof, prove_secs, peak_mem_kb) = prove_subprocess::<_, MNT4_753>("fold", &circuit);
+            let t = Instant::now();
+            assert!(cloakkchain_circuit_spend::verify(&keys.fold, &statement.public_inputs(), &proof).unwrap());
+            let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
+            println!("  Folded in {prove_secs:.1}s, verified in {verify_ms:.1}ms.");
+            stats.push(ProveStats {
+                name: format!("Fold copies {range}"),
+                board_size: history.len(),
+                constraints,
+                prove_secs,
+                verify_ms,
+                proof_bytes: ark_serialize_len(&proof),
+                entry_bytes: None,
+                peak_mem_kb,
+            });
+            latest = Proven { statement, vk: keys.fold.clone(), proof };
+            wrapped = wrap_spend(&format!("Wrap fold {range}"), keys, &latest, history, stats);
+            folded += batch.len();
+        }
+        let head = if window.occurrences.is_empty() { Fr::from(0u64) } else { window.leaf.occ };
+        assert_eq!(latest.statement.window_heads[input], head);
     }
-    assert_eq!(latest.statement.window_head, if window.occurrences.is_empty() { Fr::from(0u64) } else { window.leaf.occ });
     (latest, wrapped)
 }
 
@@ -829,7 +842,7 @@ fn receive(recipient: &Party, coin: &Coin, spend: &ProvenSpend, slot: usize, his
     assert!(tx.receives_coin(&coin.commitment()), "the carrier must transfer the recipient's coin");
     check_receipt(history, slot, &spend.entry, &tx, |public_values, proof_bytes| {
         let proof = Proof::<MNT4_753>::deserialize_compressed(proof_bytes).expect("deserialize proof");
-        let inputs = spend_public_inputs(public_values, Fr::from(0u64), Fr::from(0u64), inner_vk_hash(vk));
+        let inputs = spend_public_inputs(public_values, &[Fr::from(0u64); MAX_INPUTS], Fr::from(0u64), inner_vk_hash(vk));
         cloakkchain_circuit_spend::verify(vk, &inputs, &proof).unwrap()
     })
     .expect("the recipient must accept its carrier");
@@ -844,9 +857,9 @@ fn copy_of_serial_number(nullifier: Fr, seed: u32) -> BoardEntry {
         ciphertext: vec![byte; 64],
         ek_pk: [byte; 32],
         key_encs: vec![[byte; 32]],
-        nullifier,
+        nullifiers: vec![nullifier],
         output_commitments: vec![Fr::from(999u64 + seed as u64)],
-        signature: CoinSignature { c: Fr::from(seed as u64 + 1), s: OwnerScalar::from(seed as u64 + 1) },
+        signatures: vec![CoinSignature { c: Fr::from(seed as u64 + 1), s: OwnerScalar::from(seed as u64 + 1) }],
     }
 }
 
@@ -874,9 +887,9 @@ fn run_prove(copies: u32) {
         &keys,
         &history,
         &genesis,
-        &genesis_coin,
+        std::slice::from_ref(&genesis_coin),
         &[(alice_coin.clone(), alice.enc_pk)],
-        None,
+        &[],
         &mut stats,
     );
     let mint_slot = history.append(&mint.entry);
@@ -897,9 +910,9 @@ fn run_prove(copies: u32) {
         &keys,
         &history,
         &alice,
-        &alice_coin,
+        std::slice::from_ref(&alice_coin),
         &[(bob_coin.clone(), bob.enc_pk), (change_coin.clone(), alice.enc_pk)],
-        Some(Parent { spend: &mint, slot: mint_slot, latest: &mint.proven, wrapped: &wrapped_mint }),
+        &[Parent { spend: &mint, slot: mint_slot, latest: &mint.proven, wrapped: &wrapped_mint }],
         &mut stats,
     );
 
@@ -909,7 +922,7 @@ fn run_prove(copies: u32) {
     if copies > 0 {
         let first = history.len();
         for seed in 0..copies {
-            history.append(&copy_of_serial_number(alice_spend.entry.nullifier, seed));
+            history.append(&copy_of_serial_number(alice_spend.entry.nullifiers[0], seed));
         }
         println!(
             "\n--- Slots {first}-{}: a third party posts {copies} copies of Alice's serial number ---",
@@ -939,9 +952,9 @@ fn run_prove(copies: u32) {
         &keys,
         &history,
         &bob,
-        &bob_coin,
+        std::slice::from_ref(&bob_coin),
         &[(carol_coin.clone(), carol.enc_pk)],
-        Some(Parent { spend: &alice_spend, slot: alice_slot, latest: &latest_alice, wrapped: &wrapped_latest }),
+        &[Parent { spend: &alice_spend, slot: alice_slot, latest: &latest_alice, wrapped: &wrapped_latest }],
         &mut stats,
     );
     let bob_slot = history.append(&bob_spend.entry);
@@ -957,18 +970,16 @@ fn run_prove(copies: u32) {
 //
 // Ad hoc scenario for measuring *real* proving stats (constraints, prove time,
 // verify time, proof size, subprocess-isolated peak memory) at whichever
-// MAX_OUTPUTS shape circuit-spend currently happens to be compiled with.
-// `run_prove`'s demo chain only ever exercises one compiled shape at a time
-// (the committed baseline); this function exists so the same measurement
-// methodology (real proving, subprocess-isolated memory) can be pointed at the
-// other cells of the grid: build with `--features single-output` for the
-// 1-output row (add `groth16` for Groth16). MAX_INPUTS stays 1 until
-// `BoardEntry` holds one serial number and signature per input: `circuit-spend`
-// refuses to compile otherwise.
+// MAX_INPUTS/MAX_OUTPUTS shape this binary is compiled with. `run_prove`'s demo
+// chain only ever spends one input; this function exists so the same
+// measurement methodology (real proving, subprocess-isolated memory) can be
+// pointed at every cell of the grid: `--features two-inputs` for the 2-input
+// rows, `--features single-output` for the 1-output ones (add `groth16` for
+// Groth16).
 //
-// Scenario: Alice receives one coin from a genesis mint, then spends it into
-// MAX_OUTPUTS outputs (Bob gets 40 plus change back to herself if
-// MAX_OUTPUTS>1, otherwise Bob gets the full 100).
+// Scenario: genesis mints MAX_INPUTS coins of 100 to Alice, one mint each, then
+// Alice spends all of them at once into MAX_OUTPUTS outputs (40 to Bob plus the
+// change back to herself if MAX_OUTPUTS>1, otherwise everything to Bob).
 //
 // Alice's spend isn't posted, since nothing downstream spends her new outputs.
 fn run_prove_grid_cell() {
@@ -983,35 +994,46 @@ fn run_prove_grid_cell() {
     let alice = Party::new("Alice", 1);
     let bob = Party::new("Bob", 2);
 
-    println!("\n--- Genesis mint: 100 units to Alice ---");
-    let alice_coin = coin(0xB0, 100, alice.pk_p);
-    let mint = prove_spend(
-        "Genesis mint",
-        &keys,
-        &history,
-        &genesis,
-        &coin(0xA0, 100, genesis.pk_p),
-        &[(alice_coin.clone(), alice.enc_pk)],
-        None,
-        &mut stats,
-    );
-    let mint_slot = history.append(&mint.entry);
-    let wrapped_mint = wrap_spend("Wrap genesis mint", &keys, &mint.proven, &history, &mut stats);
+    let mut alice_coins = Vec::new();
+    let mut mints = Vec::new();
+    for i in 0..MAX_INPUTS as u8 {
+        println!("\n--- Genesis mint {}: 100 units to Alice ---", i + 1);
+        let alice_coin = coin(0xB0 + i, 100, alice.pk_p);
+        let mint = prove_spend(
+            &format!("Genesis mint {}", i + 1),
+            &keys,
+            &history,
+            &genesis,
+            &[coin(0xA0 + i, 100, genesis.pk_p)],
+            &[(alice_coin.clone(), alice.enc_pk)],
+            &[],
+            &mut stats,
+        );
+        let slot = history.append(&mint.entry);
+        let wrapped = wrap_spend(&format!("Wrap genesis mint {}", i + 1), &keys, &mint.proven, &history, &mut stats);
+        alice_coins.push(alice_coin);
+        mints.push((mint, slot, wrapped));
+    }
 
     println!("\n--- Alice spends {MAX_INPUTS} input(s) into {MAX_OUTPUTS} output(s) ---");
-    let bob_val = if MAX_OUTPUTS > 1 { 40 } else { 100 };
+    let total = 100 * MAX_INPUTS as u64;
+    let bob_val = if MAX_OUTPUTS > 1 { 40 } else { total };
     let mut outputs = vec![(coin(0xC0, bob_val, bob.pk_p), bob.enc_pk)];
     if MAX_OUTPUTS > 1 {
-        outputs.push((coin(0xC1, 100 - bob_val, alice.pk_p), alice.enc_pk));
+        outputs.push((coin(0xC1, total - bob_val, alice.pk_p), alice.enc_pk));
     }
+    let parents: Vec<Parent> = mints
+        .iter()
+        .map(|(mint, slot, wrapped)| Parent { spend: mint, slot: *slot, latest: &mint.proven, wrapped })
+        .collect();
     prove_spend(
         &format!("Alice's spend ({MAX_INPUTS}-in-{MAX_OUTPUTS}-out)"),
         &keys,
         &history,
         &alice,
-        &alice_coin,
+        &alice_coins,
         &outputs,
-        Some(Parent { spend: &mint, slot: mint_slot, latest: &mint.proven, wrapped: &wrapped_mint }),
+        &parents,
         &mut stats,
     );
 

@@ -30,3 +30,4 @@ hex = "0.4.3"
 # Prove with Groth16 instead of GM17 — see `circuit-wrap/src/snark.rs`.
 groth16 = ["cloakkchain-circuit-spend/groth16"]
 single-output = ["cloakkchain-circuit-spend/single-output"]
+two-inputs = ["cloakkchain-circuit-spend/two-inputs"]

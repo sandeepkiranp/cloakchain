@@ -24,3 +24,5 @@ ark-mnt6-753 = { workspace = true, features = ["r1cs"] }
 groth16 = ["cloakkchain-circuit-wrap/groth16"]
 # Build spends with one output instead of two (paper table rows only).
 single-output = []
+# Spends of up to two input coins (see `cloakkchain-lib`'s feature).
+two-inputs = ["cloakkchain-lib/two-inputs"]
